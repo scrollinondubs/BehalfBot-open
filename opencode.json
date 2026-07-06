@@ -11,13 +11,18 @@
         "apiKey": "{env:ANTHROPIC_API_KEY}"
       }
     },
-    "venice-ai": {
+    "venice": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Venice AI",
       "options": {
+        "baseURL": "https://api.venice.ai/api/v1",
         "apiKey": "{env:VENICE_API_KEY}"
       },
       "models": {
+        "zai-org-glm-5-2": { "name": "GLM 5.2" },
         "zai-org-glm-5-1": {},
-        "kimi-k2-7-code": {}
+        "kimi-k2-7-code": {},
+        "deepseek-v4-pro": {}
       }
     },
     "openrouter": {
