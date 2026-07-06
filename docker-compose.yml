@@ -1,0 +1,79 @@
+# BehalfBot-open compose stack - the containerized open-weight lane (Jill).
+#
+#   Discord -> discord-bridge -> opencode-serve (compose network) -> Venice GLM-5.2
+#
+# Isolation posture (issue #9): no /Users mounts, no Docker socket, no host
+# home, non-root user, private compose network. The only host exposure is
+# opencode's HTTP API on 127.0.0.1:4848 (loopback only, for smoke tests and
+# local tooling; the host launchd stack keeps 4747).
+#
+# Secrets: compose interpolates ${VARS} from the gitignored .env in this
+# directory. Deliberately NOT `env_file:` on both services - per-service
+# `environment:` blocks mean the serve container never sees the Discord
+# token and the bridge container never sees the Venice key. Least privilege.
+#
+# BRIDGE_DRY_RUN defaults to 1 (bridge validates config + resolves serve,
+# never opens a Discord gateway session - the host bridge holds the single
+# Jill token). docker/cutover.sh flips it to 0 in .env at cutover time.
+
+services:
+  opencode-serve:
+    build: .
+    image: behalfbot-open:latest
+    container_name: behalfbot-opencode-serve
+    command: ["opencode", "serve", "--port", "4747", "--hostname", "0.0.0.0"]
+    working_dir: /app
+    environment:
+      VENICE_API_KEY: ${VENICE_API_KEY:?set VENICE_API_KEY in .env}
+      BEHALFBOT_MEMORY_FILE: /data/memory.jsonl
+    ports:
+      # Loopback-only on the host. 4848 avoids the host launchd serve on 4747.
+      - "127.0.0.1:4848:4747"
+    volumes:
+      - opencode-data:/home/node/.local/share/opencode
+      - serve-data:/data
+    networks: [behalfbot]
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4747/global/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  discord-bridge:
+    build: .
+    image: behalfbot-open:latest
+    container_name: behalfbot-discord-bridge
+    command: ["python3", "bridge/discord_bridge.py"]
+    working_dir: /app
+    environment:
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in .env}
+      JAX_OPEN_CHANNEL_ID: ${JAX_OPEN_CHANNEL_ID:?set JAX_OPEN_CHANNEL_ID in .env}
+      PRINCIPAL_USER_ID: ${PRINCIPAL_USER_ID:-925210608310312991}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-venice/zai-org-glm-5-2}
+      # Service name, not localhost: the bridge reaches serve over the
+      # private compose network.
+      OPENCODE_SERVER_URL: http://opencode-serve:4747
+      BRIDGE_SESSIONS_FILE: /data/sessions.json
+      BRIDGE_DRY_RUN: ${BRIDGE_DRY_RUN:-1}
+    volumes:
+      - bridge-state:/data
+    depends_on:
+      opencode-serve:
+        condition: service_healthy
+    networks: [behalfbot]
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  behalfbot:
+    driver: bridge
+
+volumes:
+  opencode-data:   # opencode serve state + session history
+  serve-data:      # memory MCP jsonl
+  bridge-state:    # bridge/.sessions.json successor (channel -> session map)

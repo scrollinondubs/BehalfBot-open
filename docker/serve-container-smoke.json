@@ -1,0 +1,69 @@
+{
+  "test": "containerized opencode serve end-to-end smoke (issue #9 Docker isolation)",
+  "date": "2026-07-06T15:13:10+01:00",
+  "environment": {
+    "runtime": "Colima (docker 29.2.1 arm64), compose stack from docker-compose.yml",
+    "image": "behalfbot-open:latest (node:22-bookworm-slim, opencode-ai@1.17.13, non-root user node)",
+    "endpoint": "http://127.0.0.1:4848 -> container 4747 (host launchd serve on 4747 untouched)",
+    "bridge": "discord-bridge container up in BRIDGE_DRY_RUN=1 (resolved http://opencode-serve:4747, no Discord gateway session)"
+  },
+  "request": {
+    "session_id": "ses_0c839ad1bffe0I1iz26mQIlfIo",
+    "model": {
+      "providerID": "venice",
+      "modelID": "zai-org-glm-5-2"
+    },
+    "prompt": "One-sentence sanity check: which model are you and what is 17*23? You are running inside a Docker container as part of the BehalfBot-open smoke test."
+  },
+  "response": {
+    "http_status": 200,
+    "providerID": "venice",
+    "modelID": "zai-org-glm-5-2",
+    "text": "I'm GLM 5.2, and 17*23 = 391.",
+    "tokens": {
+      "total": 11301,
+      "input": 11276,
+      "output": 25,
+      "reasoning": 0,
+      "cache": {
+        "write": 0,
+        "read": 0
+      }
+    },
+    "cost": 0.0158964,
+    "time": {
+      "created": 1783347172218,
+      "completed": 1783347177786
+    }
+  },
+  "raw_message_info": {
+    "parentID": "msg_f37c65311001ocO8FrYjbfp8y9",
+    "role": "assistant",
+    "mode": "build",
+    "agent": "build",
+    "path": {
+      "cwd": "/app",
+      "root": "/app"
+    },
+    "cost": 0.0158964,
+    "tokens": {
+      "total": 11301,
+      "input": 11276,
+      "output": 25,
+      "reasoning": 0,
+      "cache": {
+        "write": 0,
+        "read": 0
+      }
+    },
+    "modelID": "zai-org-glm-5-2",
+    "providerID": "venice",
+    "time": {
+      "created": 1783347172218,
+      "completed": 1783347177786
+    },
+    "finish": "stop",
+    "id": "msg_f37c6537a001EmXR3LLMBOngGG",
+    "sessionID": "ses_0c839ad1bffe0I1iz26mQIlfIo"
+  }
+}

@@ -1,0 +1,31 @@
+# Secrets - never enter the build context.
+.env
+.env.*
+!.env.example
+
+# Host-only runtime state and junk.
+.git
+logs/
+memory/
+temp/
+tmp/
+node_modules/
+.local/
+.DS_Store
+*.log
+
+# Bridge host-side state.
+bridge/.venv/
+bridge/__pycache__/
+bridge/.sessions.json
+__pycache__/
+
+# opencode host-side auth/state (container gets its own named volume).
+.opencode/auth.json
+.opencode/state/
+.opencode/node_modules/
+
+# Not needed at runtime.
+mvp-run-output.json
+docker/
+docs/

@@ -14,9 +14,16 @@ Env config (see .env.example):
   PRINCIPAL_USER_ID     the ONLY user whose messages are obeyed
                         (default 925210608310312991 - Sean; matched by ID,
                         never by username)
-  OPENCODE_SERVER_URL   default http://127.0.0.1:4747
+  OPENCODE_SERVER_URL   default http://127.0.0.1:4747 (in Docker the compose
+                        file sets http://opencode-serve:4747 - service name)
   DEFAULT_MODEL         default venice/zai-org-glm-5-2 (provider/model)
   OPENCODE_HTTP_TIMEOUT seconds to wait for a model reply (default 300)
+  BRIDGE_SESSIONS_FILE  where the channel->session map persists
+                        (default bridge/.sessions.json; Docker: /data/sessions.json)
+  BRIDGE_DRY_RUN        "1" = validate config + resolve the opencode server,
+                        then idle WITHOUT opening a Discord gateway session.
+                        Used to test the container while the host bridge
+                        still holds the single Jill bot token.
 
 Commands (principal only, in the allowlisted channel):
   /reset  - drop the current opencode session and start fresh next message
@@ -35,13 +42,19 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import aiohttp
 import discord
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SESSIONS_FILE = Path(__file__).resolve().parent / ".sessions.json"
+SESSIONS_FILE = Path(
+    os.environ.get(
+        "BRIDGE_SESSIONS_FILE",
+        str(Path(__file__).resolve().parent / ".sessions.json"),
+    )
+)
 
 log = logging.getLogger("discord-bridge")
 
@@ -69,6 +82,9 @@ OPENCODE_SERVER_URL = os.environ.get(
 ).rstrip("/")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "venice/zai-org-glm-5-2")
 HTTP_TIMEOUT = float(os.environ.get("OPENCODE_HTTP_TIMEOUT", "300"))
+BRIDGE_DRY_RUN = os.environ.get("BRIDGE_DRY_RUN", "0").strip().lower() in (
+    "1", "true", "yes",
+)
 
 PROVIDER_ID, _, MODEL_ID = DEFAULT_MODEL.partition("/")
 
@@ -269,7 +285,7 @@ async def on_message(message: discord.Message):
             if not healthy:
                 await message.channel.send(
                     "opencode server is unreachable at {} - is the "
-                    "com.jax.opencode-serve agent running?".format(OPENCODE_SERVER_URL)
+                    "opencode-serve service running?".format(OPENCODE_SERVER_URL)
                 )
             else:
                 await message.channel.send(
@@ -279,6 +295,31 @@ async def on_message(message: discord.Message):
 
     for chunk in chunk_message(reply):
         await message.channel.send(chunk)
+
+
+async def _dry_run_check(retries: int = 15, delay: float = 2.0) -> bool:
+    """Resolve + health-check the opencode server without touching Discord."""
+    try:
+        for attempt in range(1, retries + 1):
+            if await opencode.health():
+                log.info(
+                    "DRY RUN: opencode server resolved and healthy at %s "
+                    "(attempt %d)", OPENCODE_SERVER_URL, attempt,
+                )
+                return True
+            log.info(
+                "DRY RUN: waiting for opencode server at %s (attempt %d/%d)",
+                OPENCODE_SERVER_URL, attempt, retries,
+            )
+            await asyncio.sleep(delay)
+        log.error(
+            "DRY RUN FAILED: opencode server unreachable at %s after %d attempts",
+            OPENCODE_SERVER_URL, retries,
+        )
+        return False
+    finally:
+        if opencode._http is not None and not opencode._http.closed:
+            await opencode._http.close()
 
 
 def main() -> int:
@@ -307,6 +348,22 @@ def main() -> int:
         len(DISCORD_BOT_TOKEN), DISCORD_BOT_TOKEN[:4],
         JAX_OPEN_CHANNEL_ID, DEFAULT_MODEL,
     )
+
+    if BRIDGE_DRY_RUN:
+        log.info("BRIDGE_DRY_RUN=1: config validated; Discord gateway DISABLED")
+        if not asyncio.run(_dry_run_check()):
+            return 1
+        log.info(
+            "DRY RUN OK: config loaded, opencode server reachable, no Discord "
+            "gateway session opened. Idling until stopped (flip BRIDGE_DRY_RUN "
+            "to 0 via docker/cutover.sh to go live)."
+        )
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            return 0
+
     client.run(DISCORD_BOT_TOKEN, log_handler=None)
     return 0
 

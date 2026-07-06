@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Single boot agent for the Dockerized stack. Replaces BOTH legacy agents
+     (com.jax.opencode-serve + com.jax.discord-bridge): it only ensures Colima
+     is up and runs `docker compose up -d`; Docker's restart policy does the
+     actual supervision. Install via docker/boot.sh header instructions. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jax.behalfbot-docker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__REPO_ROOT__/docker/boot.sh</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__REPO_ROOT__/logs/docker-boot.log</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO_ROOT__/logs/docker-boot.log</string>
+</dict>
+</plist>

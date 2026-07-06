@@ -1,8 +1,18 @@
 # Discord bridge wiring - 10 minutes
 
-Puts the open-weight OpenCode "Jax" (GLM-5.2 via Venice) one Discord message away.
+Puts the open-weight OpenCode "Jill" (GLM-5.2 via Venice) one Discord message away.
 
-Architecture: `Discord -> bridge/discord_bridge.py -> opencode serve (localhost:4747) -> venice/zai-org-glm-5-2`.
+Architecture (Docker, the canonical run mode):
+
+```
+Discord -> discord-bridge container -> opencode-serve container -> venice/zai-org-glm-5-2
+              (compose network: http://opencode-serve:4747)
+```
+
+The containers are the security isolation (issue #9): no host home mount, no
+Docker socket, non-root user - the model process structurally cannot reach the
+macOS Keychain, Vaultwarden, or /Users files. Host port 127.0.0.1:4848 maps to
+serve for local smoke tests only.
 
 ## 1. Discord app setup (one time, ~3 min)
 
@@ -43,29 +53,85 @@ In the repo root `.env` (gitignored - never commit it):
 VENICE_API_KEY=...            # already present if the provider works
 DISCORD_BOT_TOKEN=...
 JAX_OPEN_CHANNEL_ID=...
+BRIDGE_DRY_RUN=1              # 1 = bridge never opens a Discord gateway
+                              # session (safe default); docker/cutover.sh
+                              # flips it to 0 at go-live
 # optional overrides:
 # PRINCIPAL_USER_ID=925210608310312991
-# OPENCODE_SERVER_URL=http://127.0.0.1:4747
 # DEFAULT_MODEL=venice/zai-org-glm-5-2
 ```
 
-## 4. Python venv for the bridge (~2 min)
+Compose interpolates these per service (least privilege: serve only gets
+`VENICE_API_KEY`, the bridge only gets the Discord vars). Secrets are never
+baked into the image - `.dockerignore` excludes `.env` from the build context.
+
+## 4. Run it (Docker - canonical)
+
+Colima is the Docker runtime on this Mac. One command, idempotent:
+
+```
+bash docker/boot.sh        # starts Colima if needed, then: docker compose up -d
+```
+
+or by hand:
+
+```
+colima start               # if not already running
+docker compose up -d
+```
+
+What comes up:
+
+| Service | Container | Notes |
+|---|---|---|
+| `opencode-serve` | `behalfbot-opencode-serve` | binds 0.0.0.0:4747 in-container; host sees 127.0.0.1:4848 only |
+| `discord-bridge` | `behalfbot-discord-bridge` | reaches serve at `http://opencode-serve:4747` over the compose network |
+
+State lives in named volumes (`opencode-data`, `bridge-state`, `serve-data`),
+so sessions survive container restarts. Logs: `docker compose logs -f`.
+
+Boot persistence: install the single launchd agent (replaces BOTH legacy
+`com.jax.opencode-serve` + `com.jax.discord-bridge` agents):
+
+```
+sed "s|__REPO_ROOT__|$(pwd)|g" docker/com.jax.behalfbot-docker.plist \
+  > ~/Library/LaunchAgents/com.jax.behalfbot-docker.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jax.behalfbot-docker.plist
+```
+
+If Colima autostart is ever flaky, the fallback is simply running
+`bash docker/boot.sh` after login - the compose `restart: unless-stopped`
+policy handles everything else.
+
+### Dry run vs live
+
+With `BRIDGE_DRY_RUN=1` (the default) the bridge container starts, validates
+its config, resolves + health-checks `opencode-serve` over the compose
+network, logs `DRY RUN OK`, and idles WITHOUT connecting to Discord. That
+makes the stack safe to run while a host bridge still holds the bot token
+(one token = one gateway session).
+
+Going live is the cutover script, which retires the host launchd agents
+first, flips the flag, and verifies (with automatic rollback on failure):
+
+```
+bash docker/cutover.sh             # host launchd -> Docker
+bash docker/cutover.sh --rollback  # back to host launchd
+```
+
+## 5. Legacy host run (pre-Docker, kept for rollback)
+
+<details>
+<summary>launchd/venv instructions (superseded by Docker)</summary>
 
 ```
 python3 -m venv bridge/.venv
 bridge/.venv/bin/pip install -U discord.py
+bash bridge/opencode-serve.sh                      # terminal 1
+bridge/.venv/bin/python bridge/discord_bridge.py   # terminal 2
 ```
 
-## 5. Run it
-
-By hand (two terminals), from the repo root:
-
-```
-bash bridge/opencode-serve.sh
-bridge/.venv/bin/python bridge/discord_bridge.py
-```
-
-Or survive-reboot via launchd (~2 min):
+Or survive-reboot via launchd:
 
 ```
 REPO=$(pwd)   # run from the repo root
@@ -76,6 +142,8 @@ done
 ```
 
 Logs land in `logs/opencode-serve.log` and `logs/discord-bridge.log`.
+
+</details>
 
 ## 6. Smoke test
 
@@ -92,7 +160,9 @@ fresh opencode session (context wipe) for that channel.
 
 | Symptom | Fix |
 |---|---|
-| Bot online but never replies | MESSAGE CONTENT INTENT not enabled, wrong `JAX_OPEN_CHANNEL_ID`, or you are not `PRINCIPAL_USER_ID` |
-| "opencode server is unreachable" reply | `opencode serve` not running - check `logs/opencode-serve.log`, reload the com.jax.opencode-serve agent |
-| Model errors mentioning auth | `VENICE_API_KEY` missing/expired in `.env` |
-| Bridge exits immediately | check `logs/discord-bridge.log` - it validates env vars on startup and says which one is missing |
+| Bot online but never replies | MESSAGE CONTENT INTENT not enabled, wrong `JAX_OPEN_CHANNEL_ID`, you are not `PRINCIPAL_USER_ID`, or `BRIDGE_DRY_RUN` is still 1 (check `docker compose logs discord-bridge` for "DRY RUN OK") |
+| "opencode server is unreachable" reply | `docker compose ps` - is `behalfbot-opencode-serve` healthy? `docker compose logs opencode-serve` |
+| Model errors mentioning auth | `VENICE_API_KEY` missing/expired in `.env`; `docker compose up -d` again to re-read it |
+| Bridge exits immediately / restart loop | `docker compose logs discord-bridge` - it validates env vars on startup and says which one is missing |
+| Two bots fighting / bot flapping online-offline | two gateway sessions on one token - make sure the host launchd bridge is booted out (`docker/cutover.sh` does this) |
+| Nothing starts after reboot | `colima status` - if down, `bash docker/boot.sh` (or install the boot launchd agent, section 4) |

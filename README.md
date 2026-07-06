@@ -41,7 +41,31 @@ bash scripts/run.sh --model openrouter/z-ai/glm-5.2 "your prompt"
 
 Provisioning tracked in **issue #8**. Verify exact model IDs against `opencode models venice-ai` / `opencode models openrouter` once keyed - IDs staged here come from the porting research and need confirmation against models.dev.
 
-## Quick start
+## Quick start (Docker - canonical)
+
+The stack is Docker-native. The container boundary IS the security isolation
+for the open-weight lane (issue #9): no host home mount, no Docker socket,
+non-root user - the model process structurally cannot reach the macOS
+Keychain, Vaultwarden, or /Users files.
+
+```bash
+cp .env.example .env        # fill VENICE_API_KEY, DISCORD_BOT_TOKEN, JAX_OPEN_CHANNEL_ID
+bash docker/boot.sh         # ensures Colima is up, then docker compose up -d
+```
+
+Two services on a private compose network:
+
+- `opencode-serve` - headless opencode v1.17.13, GLM-5.2 via Venice; host
+  sees it on 127.0.0.1:4848 only
+- `discord-bridge` - principal-only Discord relay, reaches serve at
+  `http://opencode-serve:4747`; ships with `BRIDGE_DRY_RUN=1` (no Discord
+  gateway session) until `bash docker/cutover.sh` flips it live
+
+Proof the containerized serve answers GLM-5.2 end to end:
+`docker/serve-container-smoke.json`. Full wiring + cutover + rollback:
+[bridge/WIRING.md](bridge/WIRING.md).
+
+## Quick start (bare host, legacy)
 
 ```bash
 curl -fsSL https://opencode.ai/install | bash   # install opencode
@@ -61,22 +85,31 @@ opencode.json                      # providers (anthropic active, venice/openrou
   instructions/response-style.md   # loaded via the instructions array
 config/security-allowlist.json     # authorized security-scan targets
 scripts/run.sh                     # headless wrapper (claude -p analog)
+Dockerfile                         # one image, two services, non-root, no baked secrets
+docker-compose.yml                 # opencode-serve + discord-bridge on a private network
+docker/
+  boot.sh                          # ensure Colima up + compose up (single boot entrypoint)
+  com.jax.behalfbot-docker.plist   # optional single launchd agent replacing both legacy agents
+  cutover.sh                       # host launchd -> Docker cutover with verify + rollback
+  serve-container-smoke.json       # proof: containerized serve answering GLM-5.2
 docs/PORTING.md                    # 6-phase plan + hardest gaps + issue links
 mvp-run-output.json                # captured proof-of-loop JSON output
 ```
 
 ## Discord bridge (channel layer, Phase 4)
 
-`bridge/` makes the open-weight Jax reachable from Discord:
+`bridge/` makes the open-weight Jill reachable from Discord:
 
-- `bridge/opencode-serve.sh` - headless `opencode serve` on `127.0.0.1:4747`
 - `bridge/discord_bridge.py` - discord.py relay: principal-only, single
   allowlisted channel, one persistent opencode session per channel,
-  `/reset` for a fresh session, replies chunked to Discord's 2000-char limit
-- `bridge/com.jax.opencode-serve.plist` + `bridge/com.jax.discord-bridge.plist` -
-  launchd templates so both survive reboot
-- `bridge/serve-smoke.json` - captured proof: `POST /session/:id/message`
-  routed to `venice/zai-org-glm-5-2` answering over the serve API
+  `/reset` for a fresh session, replies chunked to Discord's 2000-char limit;
+  `BRIDGE_DRY_RUN=1` starts it without a Discord gateway session
+- Canonical run mode is the Docker stack above; sessions persist in the
+  `bridge-state` named volume
+- Legacy host artifacts kept for rollback: `bridge/opencode-serve.sh` plus
+  the two launchd plists
+- `bridge/serve-smoke.json` - original host proof; `docker/serve-container-smoke.json` -
+  containerized proof of `venice/zai-org-glm-5-2` over the serve API
 
 Setup in under 10 minutes: [bridge/WIRING.md](bridge/WIRING.md).
 
