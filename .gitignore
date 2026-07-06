@@ -1,0 +1,17 @@
+# secrets - never commit values
+.env
+.env.*
+!.env.example
+
+# runtime state
+memory/
+node_modules/
+*.log
+tmp/
+temp/
+
+# opencode local auth/state (never commit)
+.opencode/auth.json
+.opencode/state/
+.local/
+.DS_Store
