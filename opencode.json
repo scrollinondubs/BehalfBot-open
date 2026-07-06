@@ -92,7 +92,7 @@
         "-y",
         "@modelcontextprotocol/server-brave-search"
       ],
-      "enabled": false,
+      "enabled": true,
       "environment": {
         "BRAVE_API_KEY": "{env:BRAVE_API_KEY}"
       }
@@ -151,7 +151,7 @@
         "-y",
         "siyuan-mcp@1.0.4"
       ],
-      "enabled": false,
+      "enabled": true,
       "environment": {
         "SIYUAN_URL": "{env:SIYUAN_URL}",
         "SIYUAN_TOKEN": "{env:SIYUAN_TOKEN}"
