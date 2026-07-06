@@ -2,7 +2,9 @@
   "$schema": "https://opencode.ai/config.json",
   "model": "anthropic/claude-sonnet-4-5",
   "small_model": "anthropic/claude-haiku-4-5",
-  "instructions": [".opencode/instructions/response-style.md"],
+  "instructions": [
+    ".opencode/instructions/response-style.md"
+  ],
   "autoupdate": false,
   "share": "disabled",
   "provider": {
@@ -19,7 +21,9 @@
         "apiKey": "{env:VENICE_API_KEY}"
       },
       "models": {
-        "zai-org-glm-5-2": { "name": "GLM 5.2" },
+        "zai-org-glm-5-2": {
+          "name": "GLM 5.2"
+        },
         "zai-org-glm-5-1": {},
         "kimi-k2-7-code": {},
         "deepseek-v4-pro": {}
@@ -45,7 +49,24 @@
       "git push --force*": "deny",
       "git push -f*": "deny",
       "git reset --hard*": "deny",
-      "git clean -f*": "deny"
+      "git clean -f*": "deny",
+      "*bw-unlock*": "deny",
+      "*bw-fetch*": "deny",
+      "bw *": "deny",
+      "*bitwarden*": "deny",
+      "*vaultwarden*": "deny",
+      "*security find-generic-password*": "deny",
+      "*security add-generic-password*": "deny",
+      "*/.behalfbot/scripts/*": "deny",
+      "*/.behalfbot/.env*": "deny",
+      "*/jax-private/*": "deny",
+      "*jax-private*": "deny",
+      "cat *.env*": "deny",
+      "* .env": "deny",
+      "*/.env": "deny",
+      "*.env)": "deny",
+      "*wacli*": "deny",
+      "*whatsapp*": "deny"
     },
     "skill": {
       "*": "allow"
@@ -54,7 +75,11 @@
   "mcp": {
     "memory": {
       "type": "local",
-      "command": ["npx", "-y", "@modelcontextprotocol/server-memory"],
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
       "enabled": true,
       "environment": {
         "MEMORY_FILE_PATH": "{env:BEHALFBOT_MEMORY_FILE}"
@@ -62,7 +87,11 @@
     },
     "brave-search": {
       "type": "local",
-      "command": ["npx", "-y", "@modelcontextprotocol/server-brave-search"],
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-brave-search"
+      ],
       "enabled": false,
       "environment": {
         "BRAVE_API_KEY": "{env:BRAVE_API_KEY}"
@@ -70,7 +99,11 @@
     },
     "github": {
       "type": "local",
-      "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
       "enabled": false,
       "environment": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "{env:GITHUB_PAT}"
@@ -78,7 +111,11 @@
     },
     "tavily": {
       "type": "local",
-      "command": ["npx", "-y", "tavily-mcp"],
+      "command": [
+        "npx",
+        "-y",
+        "tavily-mcp"
+      ],
       "enabled": false,
       "environment": {
         "TAVILY_API_KEY": "{env:TAVILY_API_KEY}"
@@ -97,7 +134,11 @@
     },
     "oura": {
       "type": "local",
-      "command": ["npx", "-y", "@daveremy/oura-mcp"],
+      "command": [
+        "npx",
+        "-y",
+        "@daveremy/oura-mcp"
+      ],
       "enabled": false,
       "environment": {
         "OURA_TOKEN": "{env:OURA_TOKEN}"
@@ -105,7 +146,11 @@
     },
     "siyuan": {
       "type": "local",
-      "command": ["npx", "-y", "siyuan-mcp@1.0.4"],
+      "command": [
+        "npx",
+        "-y",
+        "siyuan-mcp@1.0.4"
+      ],
       "enabled": false,
       "environment": {
         "SIYUAN_URL": "{env:SIYUAN_URL}",
@@ -114,7 +159,11 @@
     },
     "turso": {
       "type": "local",
-      "command": ["npx", "-y", "mcp-turso-cloud"],
+      "command": [
+        "npx",
+        "-y",
+        "mcp-turso-cloud"
+      ],
       "enabled": false,
       "environment": {
         "TURSO_API_TOKEN": "{env:TURSO_API_TOKEN}",
@@ -124,7 +173,12 @@
     },
     "loom": {
       "type": "local",
-      "command": ["npx", "-y", "loom-dl@latest", "--mcp"],
+      "command": [
+        "npx",
+        "-y",
+        "loom-dl@latest",
+        "--mcp"
+      ],
       "enabled": false
     },
     "amplitude": {
@@ -134,12 +188,20 @@
     },
     "context7": {
       "type": "local",
-      "command": ["npx", "-y", "@upstash/context7-mcp@latest"],
+      "command": [
+        "npx",
+        "-y",
+        "@upstash/context7-mcp@latest"
+      ],
       "enabled": false
     },
     "n8n": {
       "type": "local",
-      "command": ["npx", "-y", "n8n-mcp"],
+      "command": [
+        "npx",
+        "-y",
+        "n8n-mcp"
+      ],
       "enabled": false,
       "environment": {
         "N8N_API_URL": "{env:N8N_API_URL}",
@@ -150,7 +212,10 @@
     },
     "remarkable": {
       "type": "local",
-      "command": ["uvx", "remarkable-mcp"],
+      "command": [
+        "uvx",
+        "remarkable-mcp"
+      ],
       "enabled": false,
       "environment": {
         "REMARKABLE_TOKEN": "{env:REMARKABLE_TOKEN}",
@@ -159,7 +224,11 @@
     },
     "frame0": {
       "type": "local",
-      "command": ["npx", "-y", "frame0-mcp-server"],
+      "command": [
+        "npx",
+        "-y",
+        "frame0-mcp-server"
+      ],
       "enabled": false
     }
   }
