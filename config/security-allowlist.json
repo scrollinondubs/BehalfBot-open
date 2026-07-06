@@ -1,0 +1,15 @@
+{
+  "domains": [
+    "vibecodelisboa.com",
+    "microad.ventures",
+    "prep.training",
+    "allbets.dev"
+  ],
+  "hostnames_internal": [],
+  "ips_internal": [
+    "127.0.0.1",
+    "localhost",
+    "::1"
+  ],
+  "_notes": "Sean-owned targets only. The guardrails.ts plugin reads this before allowing any security tool (nmap, subfinder, httpx, naabu, nuclei, trivy remote, trufflehog/gitleaks remote, shannon) to run. Tailscale-internal hostnames intentionally omitted from this public-of-record file; add per install."
+}
