@@ -65,6 +65,21 @@ docs/PORTING.md                    # 6-phase plan + hardest gaps + issue links
 mvp-run-output.json                # captured proof-of-loop JSON output
 ```
 
+## Discord bridge (channel layer, Phase 4)
+
+`bridge/` makes the open-weight Jax reachable from Discord:
+
+- `bridge/opencode-serve.sh` - headless `opencode serve` on `127.0.0.1:4747`
+- `bridge/discord_bridge.py` - discord.py relay: principal-only, single
+  allowlisted channel, one persistent opencode session per channel,
+  `/reset` for a fresh session, replies chunked to Discord's 2000-char limit
+- `bridge/com.jax.opencode-serve.plist` + `bridge/com.jax.discord-bridge.plist` -
+  launchd templates so both survive reboot
+- `bridge/serve-smoke.json` - captured proof: `POST /session/:id/message`
+  routed to `venice/zai-org-glm-5-2` answering over the serve API
+
+Setup in under 10 minutes: [bridge/WIRING.md](bridge/WIRING.md).
+
 ## Porting plan
 
 Six phases, tracked as issues #1-#6, gaps in #7-#8. Full detail in [docs/PORTING.md](docs/PORTING.md).

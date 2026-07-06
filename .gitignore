@@ -15,3 +15,10 @@ temp/
 .opencode/state/
 .local/
 .DS_Store
+
+# discord bridge runtime state
+bridge/.venv/
+bridge/.sessions.json
+logs/
+bridge/__pycache__/
+__pycache__/

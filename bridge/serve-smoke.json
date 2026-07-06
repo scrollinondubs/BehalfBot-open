@@ -1,0 +1,110 @@
+{
+  "endpoint": "POST /session/{id}/message",
+  "server": "opencode serve 1.17.13 @ http://127.0.0.1:4747",
+  "session": {
+    "id": "ses_0c8cca534ffegwkPO2e9EH8bXj",
+    "slug": "shiny-knight",
+    "projectID": "d48c2f9dd5cfcc2edd9c0f74d95991c63b33a8b8",
+    "directory": "/Users/jax/.behalfbot/temp/BehalfBot-open",
+    "path": "",
+    "cost": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "title": "serve-smoke",
+    "version": "1.17.13",
+    "time": {
+      "created": 1783337540299,
+      "updated": 1783337540299
+    }
+  },
+  "request_body": {
+    "model": {
+      "providerID": "venice",
+      "modelID": "zai-org-glm-5-2"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "Reply with exactly one sentence: what model are you and what is 17*23?"
+      }
+    ]
+  },
+  "response": {
+    "info": {
+      "parentID": "msg_f373375f6001Leajdrx5brUEAe",
+      "role": "assistant",
+      "mode": "build",
+      "agent": "build",
+      "path": {
+        "cwd": "/Users/jax/.behalfbot/temp/BehalfBot-open",
+        "root": "/Users/jax/.behalfbot/temp/BehalfBot-open"
+      },
+      "cost": 0.0187656,
+      "tokens": {
+        "total": 13359,
+        "input": 13338,
+        "output": 21,
+        "reasoning": 0,
+        "cache": {
+          "write": 0,
+          "read": 0
+        }
+      },
+      "modelID": "zai-org-glm-5-2",
+      "providerID": "venice",
+      "time": {
+        "created": 1783337547324,
+        "completed": 1783337550304
+      },
+      "finish": "stop",
+      "id": "msg_f3733763c001fbVjSJYIU6nhT0",
+      "sessionID": "ses_0c8cca534ffegwkPO2e9EH8bXj"
+    },
+    "parts": [
+      {
+        "snapshot": "7294fe37541dd253cd1d5479c241a5a88a5be61c",
+        "type": "step-start",
+        "id": "prt_f373380d2001BpaE2YJPJzkw6I",
+        "sessionID": "ses_0c8cca534ffegwkPO2e9EH8bXj",
+        "messageID": "msg_f3733763c001fbVjSJYIU6nhT0"
+      },
+      {
+        "type": "text",
+        "text": "I'm GLM 5.2, and 17*23 = 391.",
+        "time": {
+          "start": 1783337550039,
+          "end": 1783337550242
+        },
+        "id": "prt_f373380d7001tD3m6FwZopHO0U",
+        "sessionID": "ses_0c8cca534ffegwkPO2e9EH8bXj",
+        "messageID": "msg_f3733763c001fbVjSJYIU6nhT0"
+      },
+      {
+        "reason": "stop",
+        "snapshot": "7294fe37541dd253cd1d5479c241a5a88a5be61c",
+        "type": "step-finish",
+        "tokens": {
+          "total": 13359,
+          "input": 13338,
+          "output": 21,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 0
+          }
+        },
+        "cost": 0.0187656,
+        "id": "prt_f373381cb001H3iqiDYo81Ztnm",
+        "sessionID": "ses_0c8cca534ffegwkPO2e9EH8bXj",
+        "messageID": "msg_f3733763c001fbVjSJYIU6nhT0"
+      }
+    ]
+  }
+}
