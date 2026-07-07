@@ -85,16 +85,38 @@ opencode.json                      # providers (anthropic active, venice/openrou
   instructions/response-style.md   # loaded via the instructions array
 config/security-allowlist.json     # authorized security-scan targets
 scripts/run.sh                     # headless wrapper (claude -p analog)
-Dockerfile                         # one image, two services, non-root, no baked secrets
-docker-compose.yml                 # opencode-serve + discord-bridge on a private network
+scripts/dispatch-trigger.sh        # deterministic keyword-trigger dispatcher (+ scripts/parsers/)
+scripts/validate-heartbeats.sh     # HEARTBEATS.md linter
+scripts/gather-template.sh         # starting point for heartbeat gather scripts
+scheduled-tasks/
+  heartbeat-dispatcher.sh          # gather-first scheduled-work engine (Phase 3, issue #4)
+HEARTBEATS.md.template             # heartbeat schema + template (copy to HEARTBEATS.md)
+triggers.yaml.template             # trigger registry template (copy to triggers.yaml)
+memory/                            # file-based memory templates (MEMORY.md.template, WRITING_RULES.md)
+Dockerfile                         # one image, three services, non-root, no baked secrets
+docker-compose.yml                 # opencode-serve + discord-bridge (+ opt-in heartbeat-dispatcher)
 docker/
   boot.sh                          # ensure Colima up + compose up (single boot entrypoint)
   com.jax.behalfbot-docker.plist   # optional single launchd agent replacing both legacy agents
   cutover.sh                       # host launchd -> Docker cutover with verify + rollback
   serve-container-smoke.json       # proof: containerized serve answering GLM-5.2
 docs/PORTING.md                    # 6-phase plan + hardest gaps + issue links
+docs/heartbeat-dispatcher.md       # dispatcher architecture + claude-p -> opencode-run mapping
 mvp-run-output.json                # captured proof-of-loop JSON output
 ```
+
+## Heartbeat dispatcher (Phase 3)
+
+The chassis's gather-first scheduled-work engine, ported to OpenCode (issue #4). Declarative heartbeats in `HEARTBEATS.md` fire `opencode run` only when a cheap gather script says there is work - ~96 ticks/day translate to ~4 model invocations. Supports schedule matching (interval/daily/weekly + jitter), threshold and Ollama-judged conditions, per-run telemetry (cost + tokens parsed from the JSON event stream), retry + circuit-breaker resilience, conservation mode, an opt-in Five Failure Modes output validator, and Discord webhook notifications.
+
+```bash
+cp HEARTBEATS.md.template HEARTBEATS.md      # register heartbeats here
+bash scripts/validate-heartbeats.sh          # lint before commit
+DRY_RUN=true bash scheduled-tasks/heartbeat-dispatcher.sh   # host one-shot
+docker compose --profile dispatcher up -d    # containerized 15-min loop
+```
+
+Full writeup: [docs/heartbeat-dispatcher.md](docs/heartbeat-dispatcher.md). The companion `scripts/dispatch-trigger.sh` routes keyword-prefixed inbound messages (registered in `triggers.yaml`) to shell handlers deterministically, without a model round trip.
 
 ## Discord bridge (channel layer, Phase 4)
 

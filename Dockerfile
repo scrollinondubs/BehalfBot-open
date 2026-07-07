@@ -11,10 +11,11 @@
 FROM node:22-bookworm-slim
 
 # python3 for the bridge, curl for the compose healthcheck, git because
-# opencode prefers running inside a repo, ca-certificates for TLS.
+# opencode prefers running inside a repo, ca-certificates for TLS, jq for the
+# heartbeat dispatcher's JSON parsing.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-pip curl git ca-certificates \
+        python3 python3-pip curl git ca-certificates jq \
     && rm -rf /var/lib/apt/lists/*
 
 # opencode pinned to the version validated on the host.

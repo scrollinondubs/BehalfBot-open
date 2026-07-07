@@ -3,12 +3,27 @@
 .env.*
 !.env.example
 
-# runtime state
-memory/
+# runtime state (memory templates stay tracked; the store + rendered index do not)
+memory/*
+!memory/*.md
+!memory/MEMORY.md.template
+memory/MEMORY.md
 node_modules/
 *.log
 tmp/
 temp/
+
+# per-install renders of tracked templates
+HEARTBEATS.md
+triggers.yaml
+
+# heartbeat dispatcher state + artifacts
+scheduled-tasks/heartbeat-state.json
+scheduled-tasks/conservation-mode.json
+scheduled-tasks/example-state.json
+scheduled-tasks/dispatcher-hooks.sh
+scheduled-tasks/recovery-hooks.d/
+briefings/
 
 # opencode local auth/state (never commit)
 .opencode/auth.json
