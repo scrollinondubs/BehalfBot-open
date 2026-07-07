@@ -9,10 +9,21 @@
  * Throwing an Error denies the call and surfaces the message to the agent,
  * which is the analog of the PreToolUse permissionDecision: "deny" JSON.
  *
+ * MCP tool naming (issue #3, RESOLVED - verified against opencode v1.17.13
+ * source, the pinned version of this install):
+ *   runtime tool name = sanitize(serverName) + "_" + sanitize(toolName)
+ *   sanitize = (s) => s.replace(/[^a-zA-Z0-9_-]/g, "_")
+ * (packages/opencode/src/mcp/catalog.ts toolName/sanitize; the registry key
+ * is passed verbatim to this hook as input.tool in session/tools.ts.)
+ * Hyphens and case are PRESERVED - only characters outside [a-zA-Z0-9_-]
+ * become "_". So server "brave-search" + tool "brave_web_search" yields
+ * "brave-search_brave_web_search" (hyphen intact, NOT "brave_search_..."),
+ * and server "siyuan" yields "siyuan_sql_query" etc. The existing
+ * /^turso_/ and /^remarkable_/ prefixes are correct because those server
+ * names contain no hyphen.
+ *
  * TODO(parity): payload shapes differ from Claude Code hooks. Each guard
- * below needs an explicit parity test in Phase 2 (issue #3) - especially
- * tool naming for MCP tools (opencode exposes them as `<server>_<tool>`
- * lowercase, not `mcp__<server>__<tool>`).
+ * below still wants a live parity test once real keys land (issue #3).
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
@@ -141,6 +152,49 @@ function targetAuthorized(target: string, allowlist: string[]): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// SiYuan read-only guard (Jill) - shared 2nd brain, writes gated
+// ---------------------------------------------------------------------------
+// Sean's decision (Phase B): SiYuan is the SHARED 2nd brain. Jill gets READ
+// access only - no writes to the canonical notes on day one. She is an
+// unproven open-weight model and a prompt injection must not be able to
+// alter Sean's authoritative knowledge base.
+//
+// Modeled on the reMarkable /Sean Private/ guard below, but implemented as
+// DEFAULT-DENY with an explicit read allowlist: any siyuan tool not proven
+// read-only is blocked, so new tools from a future siyuan-mcp version bump
+// fail closed instead of open.
+//
+// Runtime names per the confirmed rule above: server "siyuan" exposes
+// "siyuan_<tool>". We strip the server prefix and match on the tool SUFFIX
+// so the guard survives a server rename (e.g. "siyuan-notes_<tool>" would
+// still be caught, and an unrecognized suffix stays denied).
+//
+// Allowed (read/query only), full inventory of siyuan-mcp@1.0.4 reads:
+//   sql_query, get_* (attrs/kramdown/child_blocks/file/hpath/ids/path/
+//   notebook_conf/version/workspace_info/boot_progress/current_time),
+//   list_notebooks, export_md_content, read_dir, check_siyuan_status,
+//   render_sprig, render_template.
+// Denied (state-changing), explicitly including Sean's list:
+//   create_doc, create_notebook, insert_block, prepend_block, append_block,
+//   update_block, delete_block, move_block, move_docs, move_docs_by_id,
+//   set_block_attrs, put_file, remove_file, remove_doc, remove_doc_by_id,
+//   rename_doc, rename_doc_by_id, rename_file, rename_notebook,
+//   remove_notebook, upload_asset, transfer_block_ref, flush_transaction,
+//   plus everything else default-denied: open_notebook, close_notebook,
+//   set_notebook_conf, fold_block, unfold_block, push_msg, push_err_msg,
+//   export_resources, pandoc_convert (the last two write server-side files).
+const SIYUAN_TOOL_PREFIX = /^siyuan[a-z0-9-]*_/i
+const SIYUAN_READ_ALLOW =
+  /^(sql_query|get_[a-z0-9_]+|list_[a-z0-9_]+|export_md_content|read_dir|check_siyuan_status|render_sprig|render_template)$/
+
+/** True when `tool` is a SiYuan MCP tool that Jill must not run (non-read). */
+export function siyuanWriteDenied(tool: string): boolean {
+  if (!SIYUAN_TOOL_PREFIX.test(tool)) return false
+  const suffix = tool.replace(SIYUAN_TOOL_PREFIX, "")
+  return !SIYUAN_READ_ALLOW.test(suffix)
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
 
@@ -232,6 +286,13 @@ export const GuardrailsPlugin: Plugin = async ({ worktree }) => {
             )
           }
         }
+      }
+
+      // ---- SiYuan read-only guard (Jill) ---------------------------------
+      if (siyuanWriteDenied(tool)) {
+        throw new Error(
+          "Blocked: SiYuan writes are gated for Jill. The SiYuan workspace is Sean's shared 2nd brain and Jill has read-only access on day one (unproven open-weight model - injection must not reach the canonical notes). Read/query tools are allowed: sql_query, get_*, list_*, export_md_content, read_dir, check_siyuan_status, render_sprig, render_template. TODO: a future Jill-owned subtree (dedicated notebook) could relax this to scoped writes once she is proven.",
+        )
       }
 
       // ---- reMarkable private-folder guard -------------------------------
