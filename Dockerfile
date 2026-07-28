@@ -23,7 +23,7 @@ RUN npm install -g opencode-ai@1.17.13 && npm cache clean --force
 # Bridge deps (Debian bookworm is PEP 668, hence --break-system-packages;
 # this is a single-purpose container, not a shared host).
 RUN pip3 install --no-cache-dir --break-system-packages \
-        "discord.py>=2.4,<3" "aiohttp>=3.9,<4"
+        "discord.py>=2.4,<3" "aiohttp>=3.9,<4" "pypdf>=5,<7"
 
 WORKDIR /app
 

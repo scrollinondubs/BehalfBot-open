@@ -104,6 +104,13 @@ mvp-run-output.json                # captured proof-of-loop JSON output
   allowlisted channel, one persistent opencode session per channel,
   `/reset` for a fresh session, replies chunked to Discord's 2000-char limit;
   `BRIDGE_DRY_RUN=1` starts it without a Discord gateway session
+- Attachments: PDF and `text/*` uploads are extracted to plain text and
+  prepended to the prompt inside fenced UNTRUSTED DOCUMENT blocks, so a bill
+  or a log can be asked about directly. Discord native forwards are read from
+  `message_snapshots`. Other types are skipped with a note; a PDF with no text
+  layer (a scan or photo) is rejected with an explanation rather than sent
+  empty - there is no OCR in the container. Caps: `BRIDGE_MAX_ATTACHMENT_BYTES`
+  (default 10000000) and `BRIDGE_MAX_DOC_CHARS` (default 40000)
 - Canonical run mode is the Docker stack above; sessions persist in the
   `bridge-state` named volume
 - Legacy host artifacts kept for rollback: `bridge/opencode-serve.sh` plus
