@@ -1,0 +1,67 @@
+# Heartbeats - BehalfBot-open template
+
+**This file is a template.** The dispatcher does NOT read it. Copy it to `HEARTBEATS.md` (gitignored, per-install) and register your heartbeats there:
+
+```bash
+cp HEARTBEATS.md.template HEARTBEATS.md
+```
+
+Declarative work queue for the heartbeat dispatcher (`scheduled-tasks/heartbeat-dispatcher.sh`). Each `##` section defines a heartbeat: when to check, how to gather data, when to fire the model.
+
+> Lessons carried over from the chassis:
+>
+> - Scaffolding a heartbeat (script + prompt + state file) without registering it here means the dispatcher never invokes it. Silent dormancy. **Register every new heartbeat in this file in the same PR as the supporting scripts.**
+> - The gather script is the right place for expensive checks to no-op cheaply. Every dispatcher tick (~96/day on the default 15-min cadence) is fine IF the gather short-circuits on trivial conditions before any paid API call.
+> - Validate this file's YAML blocks with `bash scripts/validate-heartbeats.sh` before commit. A malformed block silently disables the heartbeat without erroring.
+
+---
+
+## Heartbeat schema
+
+Each heartbeat is one `##` heading + a fenced ` ```yaml ` block. The dispatcher parser uses these fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `schedule` | yes | When to check. Formats: `every 15m`, `every 1h`, `daily 08:00`, `weekly sunday 18:00`, or `disabled` to park it |
+| `gather` | yes | Path (relative to the repo root) to a shell script that emits JSON on stdout. Either `{"count": N}` for threshold conditions, or any structured JSON for `ask_model` / `always` |
+| `condition` | yes | One of: `always`, `threshold <field> <op> <value>` (e.g. `threshold count > 0`), `ask_model` (requires Ollama) |
+| `prompt` | yes | Path (relative to the repo root) to a markdown file the model reads on fire |
+| `model` | yes | An OpenCode `provider/model` string (e.g. `venice/zai-org-glm-5-2`, `anthropic/claude-sonnet-4-5`) or a chassis alias: `opus`, `sonnet`, `haiku` (mapped via `HEARTBEAT_MODEL_*` env vars) |
+| `budget` | yes | Advisory max USD per invocation. OpenCode has no hard budget cap; the dispatcher logs a WARN when the summed run cost exceeds this |
+| `criticality` | yes | `critical` (runs in conservation mode), `normal`, `background` |
+| `cwd` | no | Working directory for the run (passed as `opencode run --dir`). Defaults to the repo root |
+| `output_validator` | no | `true` to run the Five Failure Modes small-model check on the output |
+| `condition_prompt` | no | Required when condition=ask_model. Question to send to Ollama |
+| `jitter` | no | Random offset added to daily schedules (e.g. `30m`, `1h`). Deterministic per day+name |
+
+---
+
+## Format example (commented out - copy, rename, and uncomment to activate)
+
+```yaml
+# schedule: daily 08:00
+# gather: scripts/gather-template.sh
+# condition: threshold count > 0
+# prompt: scheduled-tasks/example-prompt.md
+# model: sonnet
+# budget: 1
+# criticality: normal
+```
+
+---
+
+## Active heartbeats
+
+<!--
+This template ships with no active heartbeats. After copying to HEARTBEATS.md,
+add yours below. Hold to the schema above plus the lessons baked into the
+dispatcher (gather-first, register-or-die, cheap-no-op gates). Remember:
+
+- Keep gather scripts cheap; the dispatcher fires every 15 min
+- Each gather script must emit JSON (the dispatcher rejects bare key=value text)
+- The model only fires when the condition evaluates true, so a "fail safe"
+  gather that errors out should emit {"count": 0}, not non-JSON, to avoid
+  surprise fires
+
+Reference: docs/heartbeat-dispatcher.md for the full architecture writeup.
+-->

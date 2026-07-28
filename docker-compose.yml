@@ -95,11 +95,52 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Opt-in scheduled-work engine (docs/heartbeat-dispatcher.md). Start with:
+  #   cp HEARTBEATS.md.template HEARTBEATS.md   # compose bind-mounts this file
+  #   docker compose --profile dispatcher up -d
+  # Runs attach to opencode-serve over the private network, so this container
+  # needs no provider keys of its own (least privilege, same as the bridge).
+  heartbeat-dispatcher:
+    build: .
+    image: behalfbot-open:latest
+    container_name: behalfbot-heartbeat-dispatcher
+    profiles: [dispatcher]
+    command:
+      - bash
+      - -c
+      - 'while true; do bash scheduled-tasks/heartbeat-dispatcher.sh || true; sleep "$${DISPATCHER_INTERVAL_SECONDS:-900}"; done'
+    working_dir: /app
+    environment:
+      BEHALFBOT_HOME: /app
+      BEHALFBOT_STATE_HOME: /data
+      OPENCODE_ATTACH_URL: http://opencode-serve:4747
+      DISPATCHER_INTERVAL_SECONDS: ${DISPATCHER_INTERVAL_SECONDS:-900}
+      HEARTBEAT_MODEL_OPUS: ${HEARTBEAT_MODEL_OPUS:-}
+      HEARTBEAT_MODEL_SONNET: ${HEARTBEAT_MODEL_SONNET:-}
+      HEARTBEAT_MODEL_HAIKU: ${HEARTBEAT_MODEL_HAIKU:-}
+      OLLAMA_URL: ${OLLAMA_URL:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      DISCORD_OPS_WEBHOOK_URL: ${DISCORD_OPS_WEBHOOK_URL:-}
+      INSTANCE_NAME: ${INSTANCE_NAME:-}
+    volumes:
+      - ./HEARTBEATS.md:/app/HEARTBEATS.md:ro
+      - ./scheduled-tasks:/app/scheduled-tasks:ro
+      - ./scripts:/app/scripts:ro
+      - dispatcher-state:/data
+    depends_on:
+      opencode-serve:
+        condition: service_healthy
+    networks: [behalfbot]
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
 networks:
   behalfbot:
     driver: bridge
 
 volumes:
-  opencode-data:   # opencode serve state + session history
-  serve-data:      # memory MCP jsonl
-  bridge-state:    # bridge/.sessions.json successor (channel -> session map)
+  opencode-data:    # opencode serve state + session history
+  serve-data:       # memory MCP jsonl
+  bridge-state:     # bridge/.sessions.json successor (channel -> session map)
+  dispatcher-state: # heartbeat state, logs, telemetry, briefings

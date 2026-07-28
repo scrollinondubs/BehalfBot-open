@@ -1,0 +1,45 @@
+# BehalfBot-open trigger registry - template
+#
+# Copy to triggers.yaml (gitignored, per-install) and register your triggers:
+#
+#   cp triggers.yaml.template triggers.yaml
+#
+# This file is the deterministic dispatch registry read by
+# scripts/dispatch-trigger.sh. Known-shape inbound messages (keyword-prefixed
+# commands) are pattern-matched here in milliseconds instead of burning model
+# tokens on an LLM round trip.
+#
+# Schema (one entry per `- name:`):
+#
+#   name           required  unique trigger identifier (kebab-case)
+#   plugin         required  plugin id or "core"
+#   keyword_regex  required  regex, matched case-insensitively against message body
+#   channel_filter optional  exact channel id, or "*" for any channel.
+#                            Supports ${ENV_VAR} expansion (e.g. ${HEALTH_CHANNEL_ID}).
+#                            Default: "*"
+#   parser         optional  Bare name (resolves to scripts/parsers/<name>.sh)
+#                            or absolute path. Default: "passthrough"
+#                            Built-in parsers: passthrough, url-extract
+#   handler        required  Path to the handler script (absolute, or
+#                            ${BEHALFBOT_HOME}-prefixed). Handler receives
+#                            parsed args via env vars:
+#                              TRIGGER_NAME, TRIGGER_PLUGIN, TRIGGER_CHANNEL_ID,
+#                              TRIGGER_MESSAGE_ID, TRIGGER_MESSAGE_BODY,
+#                              TRIGGER_PARSED_ARGS_JSON
+#   react_emoji    optional  Unicode emoji to react with on match. "" to skip.
+#
+# First-match wins. Order entries by specificity (most specific keyword_regex
+# first) if you have overlapping patterns.
+
+triggers: []
+
+# --- Example entries (commented out; remove the # to activate) ---
+#
+# triggers:
+#   - name: fetch-links
+#     plugin: core
+#     keyword_regex: '^Fetch[\s:]+'
+#     channel_filter: ${PRIMARY_CHANNEL_ID}
+#     parser: url-extract
+#     handler: ${BEHALFBOT_HOME}/scripts/triggers/fetch-links.sh
+#     react_emoji: '🔗'
