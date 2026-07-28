@@ -11,8 +11,9 @@ Discord -> discord-bridge container -> opencode-serve container -> venice/zai-or
 
 The containers are the security isolation (issue #9): no host home mount, no
 Docker socket, non-root user - the model process structurally cannot reach the
-macOS Keychain, Vaultwarden, or /Users files. Host port 127.0.0.1:4848 maps to
-serve for local smoke tests only.
+macOS Keychain, Vaultwarden, or /Users files. The opencode API is not
+published to the host at all - see the `docker-compose.yml` header for why.
+Reach it with `docker compose exec opencode-serve` when you need a smoke test.
 
 ## 1. Discord app setup (one time, ~3 min)
 
@@ -42,8 +43,9 @@ If the bot app already exists, skip to inviting it.
 2. Right-click the channel the bridge should live in > Copy Channel ID.
 3. Put it in `.env` as `JAX_OPEN_CHANNEL_ID=...`.
 
-The bridge responds ONLY in this channel and ONLY to `PRINCIPAL_USER_ID`
-(defaults to Sean's Discord ID). Everyone and everywhere else is ignored.
+The bridge responds ONLY in this channel and ONLY to `PRINCIPAL_USER_ID`,
+which you must set to your own Discord user ID. There is no default: the
+bridge refuses to start without it. Everyone and everywhere else is ignored.
 
 ## 3. Fill .env (~1 min)
 
@@ -53,11 +55,14 @@ In the repo root `.env` (gitignored - never commit it):
 VENICE_API_KEY=...            # already present if the provider works
 DISCORD_BOT_TOKEN=...
 JAX_OPEN_CHANNEL_ID=...
+PRINCIPAL_USER_ID=...         # YOUR Discord user ID - the one person this
+                              # bridge obeys. Required, no default. Enable
+                              # Developer Mode, then right-click your own
+                              # name > Copy User ID
 BRIDGE_DRY_RUN=1              # 1 = bridge never opens a Discord gateway
                               # session (safe default); docker/cutover.sh
                               # flips it to 0 at go-live
 # optional overrides:
-# PRINCIPAL_USER_ID=925210608310312991
 # DEFAULT_MODEL=venice/zai-org-glm-5-2
 ```
 
@@ -84,7 +89,7 @@ What comes up:
 
 | Service | Container | Notes |
 |---|---|---|
-| `opencode-serve` | `behalfbot-opencode-serve` | binds 0.0.0.0:4747 in-container; host sees 127.0.0.1:4848 only |
+| `opencode-serve` | `behalfbot-opencode-serve` | binds 0.0.0.0:4747 in-container; no host port published |
 | `discord-bridge` | `behalfbot-discord-bridge` | reaches serve at `http://opencode-serve:4747` over the compose network |
 
 State lives in named volumes (`opencode-data`, `bridge-state`, `serve-data`),

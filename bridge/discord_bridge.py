@@ -11,9 +11,10 @@ Everything else is ignored: other channels, other users, all bots.
 Env config (see .env.example):
   DISCORD_BOT_TOKEN     required - Discord bot token
   JAX_OPEN_CHANNEL_ID   required - the ONLY channel the bridge responds in
-  PRINCIPAL_USER_ID     the ONLY user whose messages are obeyed
-                        (default 925210608310312991 - Sean; matched by ID,
-                        never by username)
+  PRINCIPAL_USER_ID     required - the ONLY user whose messages are obeyed,
+                        matched by ID, never by username. Deliberately has no
+                        default: a fallback would hand a fresh clone someone
+                        else's principal and silently ignore its own operator.
   OPENCODE_SERVER_URL   default http://127.0.0.1:4747 (in Docker the compose
                         file sets http://opencode-serve:4747 - service name)
   DEFAULT_MODEL         default venice/zai-org-glm-5-2 (provider/model)
@@ -97,9 +98,23 @@ def load_dotenv(path: Path) -> None:
 
 load_dotenv(REPO_ROOT / ".env")
 
+def _env_id(name: str) -> int:
+    """A Discord snowflake from the environment, or 0.
+
+    0 means unset or unparseable; main() turns that into a readable config
+    error. Parsing here would raise a ValueError traceback at import instead.
+    """
+    try:
+        return int(os.environ.get(name, "").strip() or 0)
+    except ValueError:
+        return 0
+
+
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-JAX_OPEN_CHANNEL_ID = int(os.environ.get("JAX_OPEN_CHANNEL_ID", "0"))
-PRINCIPAL_USER_ID = int(os.environ.get("PRINCIPAL_USER_ID", "925210608310312991"))
+JAX_OPEN_CHANNEL_ID = _env_id("JAX_OPEN_CHANNEL_ID")
+# No default. A fallback principal would give anyone who clones this a bridge
+# that obeys a stranger and silently ignores its own operator.
+PRINCIPAL_USER_ID = _env_id("PRINCIPAL_USER_ID")
 OPENCODE_SERVER_URL = os.environ.get(
     "OPENCODE_SERVER_URL", "http://127.0.0.1:4747"
 ).rstrip("/")
@@ -534,7 +549,13 @@ def main() -> int:
     elif not re.match(r"^[A-Za-z0-9_\-\.]+$", DISCORD_BOT_TOKEN):
         problems.append("DISCORD_BOT_TOKEN looks malformed")
     if not JAX_OPEN_CHANNEL_ID:
-        problems.append("JAX_OPEN_CHANNEL_ID is not set")
+        problems.append("JAX_OPEN_CHANNEL_ID is not set (or is not a numeric ID)")
+    if not PRINCIPAL_USER_ID:
+        problems.append(
+            "PRINCIPAL_USER_ID is not set (or is not a numeric ID) - set it to "
+            "the Discord user ID of the one person this bridge obeys. There is "
+            "no default on purpose; see .env.example."
+        )
     if not PROVIDER_ID or not MODEL_ID:
         problems.append("DEFAULT_MODEL must look like provider/model")
     if problems:
