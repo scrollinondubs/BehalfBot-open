@@ -55,8 +55,11 @@ bash docker/boot.sh         # ensures Colima is up, then docker compose up -d
 
 Two services on a private compose network:
 
-- `opencode-serve` - headless opencode v1.17.13, GLM-5.2 via Venice; host
-  sees it on 127.0.0.1:4848 only
+- `opencode-serve` - headless opencode v1.17.13, GLM-5.2 via Venice. Not
+  published to the host at all: it is reachable only from inside the compose
+  network, by service name. The API has no auth layer, so the publish was
+  removed on 2026-07-27; the `docker-compose.yml` header is the source of
+  truth on why. For a host-side smoke test use `docker compose exec`.
 - `discord-bridge` - principal-only Discord relay, reaches serve at
   `http://opencode-serve:4747`; ships with `BRIDGE_DRY_RUN=1` (no Discord
   gateway session) until `bash docker/cutover.sh` flips it live

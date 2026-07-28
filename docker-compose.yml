@@ -3,9 +3,32 @@
 #   Discord -> discord-bridge -> opencode-serve (compose network) -> Venice GLM-5.2
 #
 # Isolation posture (issue #9): no /Users mounts, no Docker socket, no host
-# home, non-root user, private compose network. The only host exposure is
-# opencode's HTTP API on 127.0.0.1:4848 (loopback only, for smoke tests and
-# local tooling; the host launchd stack keeps 4747).
+# home, non-root user, private compose network. As of 2026-07-27 there is NO
+# host port exposure at all - see below.
+#
+# WHY THE PORT PUBLISH WAS REMOVED (Fable red-team, 2026-07-27)
+#
+# This file used to publish the opencode API on 127.0.0.1:4948 and describe it
+# as "loopback only". Under Colima that description is false. Every container
+# on the box resolves host.docker.internal - Colima injects it regardless of
+# extra_hosts - so a loopback-published port is reachable from ANY container,
+# including Jax's chassis.
+#
+# The API has no auth layer. Verified from inside the chassis container:
+#   GET  http://host.docker.internal:4948/session              -> 200, session list
+#   GET  http://host.docker.internal:4948/session/<id>/message -> 200, full transcript
+# and the surface includes POST /session/{id}/shell, /pty, prompt_async and
+# PATCH /config. So Jax could read Jill's transcripts and make Jill run
+# arbitrary shell commands - a confused deputy that defeats any trust boundary
+# built on top of it, since Jill holds the private-side credentials.
+#
+# Nothing functional needed the publish: discord-bridge reaches serve over the
+# compose network at http://opencode-serve:4747, and the healthcheck runs
+# inside the container against 127.0.0.1:4747. Only ad-hoc host smoke tests
+# used it, and those can use `docker compose exec opencode-serve` instead.
+#
+# If a host port is ever genuinely needed again, add an auth token FIRST.
+# Removing the publish is the boundary; it is not defence in depth.
 #
 # Secrets: compose interpolates ${VARS} from the gitignored .env in this
 # directory. Deliberately NOT `env_file:` on both services - per-service
@@ -26,9 +49,12 @@ services:
     environment:
       VENICE_API_KEY: ${VENICE_API_KEY:?set VENICE_API_KEY in .env}
       BEHALFBOT_MEMORY_FILE: /data/memory.jsonl
-    ports:
-      # Loopback-only on the host. 4848 avoids the host launchd serve on 4747.
-      - "127.0.0.1:4848:4747"
+    # NO ports: stanza. Deliberate - see the header. The API is reachable only
+    # from inside the `behalfbot` compose network, by service name. Publishing
+    # it to host loopback exposes it to every container on the box via
+    # host.docker.internal, and it has no authentication.
+    expose:
+      - "4747"
     volumes:
       - opencode-data:/home/node/.local/share/opencode
       - serve-data:/data
@@ -52,7 +78,7 @@ services:
     environment:
       DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in .env}
       JAX_OPEN_CHANNEL_ID: ${JAX_OPEN_CHANNEL_ID:?set JAX_OPEN_CHANNEL_ID in .env}
-      PRINCIPAL_USER_ID: ${PRINCIPAL_USER_ID:-925210608310312991}
+      PRINCIPAL_USER_ID: ${PRINCIPAL_USER_ID:?set PRINCIPAL_USER_ID in .env}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-venice/zai-org-glm-5-2}
       # Service name, not localhost: the bridge reaches serve over the
       # private compose network.

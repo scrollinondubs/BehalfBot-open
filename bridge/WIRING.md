@@ -11,8 +11,9 @@ Discord -> discord-bridge container -> opencode-serve container -> venice/zai-or
 
 The containers are the security isolation (issue #9): no host home mount, no
 Docker socket, non-root user - the model process structurally cannot reach the
-macOS Keychain, Vaultwarden, or /Users files. Host port 127.0.0.1:4848 maps to
-serve for local smoke tests only.
+macOS Keychain, Vaultwarden, or /Users files. The opencode API is not
+published to the host at all - see the `docker-compose.yml` header for why.
+Reach it with `docker compose exec opencode-serve` when you need a smoke test.
 
 ## 1. Discord app setup (one time, ~3 min)
 
@@ -84,7 +85,7 @@ What comes up:
 
 | Service | Container | Notes |
 |---|---|---|
-| `opencode-serve` | `behalfbot-opencode-serve` | binds 0.0.0.0:4747 in-container; host sees 127.0.0.1:4848 only |
+| `opencode-serve` | `behalfbot-opencode-serve` | binds 0.0.0.0:4747 in-container; no host port published |
 | `discord-bridge` | `behalfbot-discord-bridge` | reaches serve at `http://opencode-serve:4747` over the compose network |
 
 State lives in named volumes (`opencode-data`, `bridge-state`, `serve-data`),
