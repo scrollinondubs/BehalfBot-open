@@ -159,3 +159,5 @@ Six phases, tracked as issues #1-#6, gaps in #7-#8. Full detail in [docs/PORTING
 ## Hard rules carried over
 
 Same as the chassis: no pushes to main, no self-merged PRs, no secrets in commits, no em dashes (use " - "), DMs off-limits, security scans only against allowlisted Sean-owned targets. See `AGENTS.md`.
+
+<!-- deadlock verification 2026-07-29 - never merged -->
