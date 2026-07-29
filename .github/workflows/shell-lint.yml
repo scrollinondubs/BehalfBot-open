@@ -1,11 +1,23 @@
 name: Shell scripts lint
 
+# NO `paths:` filter on pull_request, and that is deliberate.
+#
+# `shellcheck` is the ONLY required status check on main here, so a path
+# filter on it is worse in this repo than anywhere else: a PR that touches no
+# `.sh` has zero required checks that can ever report, and GitHub blocks it
+# forever on "Expected — Waiting for status to be reported". Not a failure -
+# a deadlock with no red X, no log, and nothing for a first-time contributor
+# to click on.
+#
+# The likeliest first outside PR is a README or docs fix, which is exactly the
+# case that deadlocks. The job takes about 6 seconds and finds nothing to do
+# when no shell changed.
+#
+# The `push` trigger keeps its filter: nothing is gated on it, so there is no
+# reason to re-lint main on a docs commit.
 on:
   pull_request:
     branches: [main]
-    paths:
-      - '**/*.sh'
-      - '.github/workflows/shell-lint.yml'
   push:
     branches: [main]
     paths:
