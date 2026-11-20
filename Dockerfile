@@ -18,8 +18,18 @@ RUN apt-get update \
         python3 python3-pip curl git ca-certificates jq \
     && rm -rf /var/lib/apt/lists/*
 
-# opencode pinned to the version validated on the host.
-RUN npm install -g opencode-ai@1.17.13 && npm cache clean --force
+# opencode pinned exactly. 1.19.6 differs from 1.19.5 only in
+# session/message-v2.ts (image size bounding); the hook call sites the guards
+# rely on (session/tools.ts, tool/shell.ts) were read on this tag.
+RUN npm install -g opencode-ai@1.19.6 && npm cache clean --force
+
+# MCP servers are installed here, at build time, from a committed lockfile.
+# Nothing is fetched with npx at runtime, so a container start never pulls a
+# new version with her keys in the environment. --ignore-scripts: none of the
+# pinned packages declares an install script, so none is allowed to run.
+COPY mcp/package.json mcp/package-lock.json /opt/mcp/
+RUN cd /opt/mcp && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && npm cache clean --force
 
 # Bridge deps (Debian bookworm is PEP 668, hence --break-system-packages;
 # this is a single-purpose container, not a shared host).
@@ -34,14 +44,10 @@ COPY .opencode/ ./.opencode/
 COPY config/ ./config/
 COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
 
-# Plugin deps for .opencode/plugins/guardrails.ts (lockfile is committed).
-RUN cd .opencode && npm ci --omit=dev --no-audit --no-fund \
-    && npm cache clean --force
-
 # opencode prefers a git worktree; give it a throwaway one.
 RUN git init -q /app \
-    && git -C /app config user.email "jill@behalfbot.local" \
-    && git -C /app config user.name "Jill (container)" \
+    && git -C /app config user.email "jill-agent@agentmail.to" \
+    && git -C /app config user.name "Jill" \
     && git -C /app add -A && git -C /app commit -qm "image snapshot" \
     # /data backs the named volumes (sessions, memory). Pre-owning it as
     # `node` makes the named volume inherit non-root ownership on first use.
