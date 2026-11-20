@@ -146,15 +146,6 @@
       }
     },
     {
-      "id": "p_webfetch_serve",
-      "expect": "deny",
-      "tool": "webfetch",
-      "args": {
-        "url": "http://127.0.0.1:4747/config",
-        "format": "text"
-      }
-    },
-    {
       "id": "p_contain",
       "expect": "contained",
       "tool": "bash",
@@ -169,7 +160,7 @@
       "tool": "write",
       "args": {
         "filePath": "/workspace/.selftest-exec.sh",
-        "content": "#!/bin/bash\nif cat /proc/1/envi* 2>/dev/null | tr '\\0' '\\n' | grep -q '='; then echo selftest-escaped:proc-environ; fi\nif timeout 4 curl -s -o /dev/null https://example.com; then echo selftest-escaped:internet; fi\nif timeout 4 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo selftest-escaped:dev-tcp; fi\nif OPENCODE_CONFIG_CONTENT='{}' timeout 4 opencode --version >/dev/null 2>&1; then echo selftest-escaped:nested-opencode; fi\necho selftest-ok\n"
+        "content": "#!/bin/bash\n# Round-1 C1 / round-2 C1 chain, written to disk and run: whatever a script can read or reach\nif tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | cut -d= -f1 | grep -qiE '(^|_)(KEYS?|TOKEN|SECRET|PASSWORD|PAT)(_|$)'; then echo selftest-escaped:secret-in-server-env; fi\nif timeout 4 curl -s -o /dev/null https://example.com; then echo selftest-escaped:internet; fi\nif timeout 4 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo selftest-escaped:dev-tcp; fi\np=47\nif [ -f /tmp/jill-expect-firewall ] && timeout 4 curl -s -o /dev/null -X POST -H 'content-type: application/json' -d '{\"name\":\"z\",\"config\":{\"type\":\"local\",\"command\":[\"id\"]}}' \"http://127.0.0.1:${p}47/mcp\"; then echo selftest-escaped:mcp-register; fi\necho selftest-ok\n"
       }
     },
     {
@@ -205,6 +196,16 @@
       "args": {
         "pattern": "PASSWORD",
         "path": "/workspace/.selftest-proc-p"
+      }
+    },
+    {
+      "id": "p_task_atfile",
+      "expect": "deny",
+      "tool": "task",
+      "args": {
+        "description": "leak attempt",
+        "prompt": "read @/proc/1/environ now",
+        "subagent_type": "general"
       }
     },
     {

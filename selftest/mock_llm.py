@@ -63,7 +63,18 @@ def record(messages):
         os.replace(tmp, RESULTS_PATH)
 
 
+def log_shape(req):
+    """Names only: which request fields and content-part types the client sends."""
+    if not os.environ.get("MOCK_LOG_SHAPE"):
+        return
+    parts = sorted({p.get("type", "?") for m in req.get("messages", []) if isinstance(m.get("content"), list)
+                    for p in m["content"] if isinstance(p, dict)})
+    vp = sorted((req.get("venice_parameters") or {}).keys())
+    sys.stderr.write(f"[mock] keys={sorted(req.keys())} venice_parameters={vp} part_types={parts}\n")
+
+
 def next_action(req):
+    log_shape(req)
     messages = req.get("messages", [])
     record(messages)
     if not req.get("tools"):
