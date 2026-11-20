@@ -87,7 +87,7 @@ const deny = (msg: string) => `${TAG} ${msg}`
  * newlines. Command substitution ($( and backticks) also starts a new
  * command, inside double quotes too, because the shell runs it there.
  */
-export function segments(cmd: string): string[] {
+export function segments(cmd: string, keepPipes = false): string[] {
   const out: string[] = []
   let cur = ""
   let q: string | null = null
@@ -121,6 +121,13 @@ export function segments(cmd: string): string[] {
       cur += c
       continue
     }
+    if (c === "|" && keepPipes) {
+      if (cmd[i + 1] === "|") {
+        i++
+        push()
+      } else cur += c
+      continue
+    }
     if (";&|()\n".includes(c)) {
       push()
       continue
@@ -128,6 +135,52 @@ export function segments(cmd: string): string[] {
     cur += c
   }
   push()
+  return out
+}
+
+/** Split one simple command on unquoted single pipes. */
+function pipeline(seg: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  let q: string | null = null
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i]
+    if (q) {
+      if (c === q) q = null
+      cur += c
+      continue
+    }
+    if (c === "'" || c === '"') q = c
+    if (c === "|" && !q) {
+      out.push(cur.trim())
+      cur = ""
+      continue
+    }
+    cur += c
+  }
+  out.push(cur.trim())
+  return out.filter(Boolean)
+}
+
+/** The command line with quoted text blanked out, for structural checks. */
+function unquoted(cmd: string): string {
+  let out = ""
+  let q: string | null = null
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]
+    if (q) {
+      if (c === q) q = null
+      out += c === q || q === null ? c : " "
+      continue
+    }
+    if (c === "\\" && i + 1 < cmd.length) {
+      out += "  "
+      i++
+      continue
+    }
+    if (c === "'" || c === '"') q = c
+    out += c
+  }
   return out
 }
 
@@ -164,22 +217,73 @@ export function tokens(s: string): string[] {
   return out
 }
 
-const PREFIX_WORDS = new Set(["sudo", "command", "builtin", "exec", "nohup", "time", "nice", "env", "doas", "xargs"])
+const SHELL_KEYWORDS = new Set(["if", "then", "else", "elif", "fi", "do", "done", "while", "until", "for", "case", "esac", "!", "{", "}", "time", "select", "coproc"])
 
-/** The command word of a simple command, skipping sudo/env/VAR=x prefixes. */
+// Commands that run another command: options that take a value, and how many
+// positional arguments they consume before the wrapped command starts.
+const WRAPPERS: Record<string, { valued: string[]; positionals: number }> = {
+  sudo: { valued: ["-u", "-g", "-C", "-h", "-p", "-U", "-r", "-t", "-D"], positionals: 0 },
+  doas: { valued: ["-u", "-C"], positionals: 0 },
+  env: { valued: ["-u", "--unset", "-C", "--chdir"], positionals: 0 },
+  nice: { valued: ["-n", "--adjustment"], positionals: 0 },
+  ionice: { valued: ["-c", "-n", "-p", "-t", "--class", "--classdata"], positionals: 0 },
+  timeout: { valued: ["-s", "--signal", "-k", "--kill-after"], positionals: 1 },
+  stdbuf: { valued: ["-i", "-o", "-e"], positionals: 0 },
+  xargs: { valued: ["-I", "-n", "-P", "-d", "-L", "-s", "-E", "-a", "--max-args", "--max-procs", "--delimiter", "--arg-file", "--replace"], positionals: 0 },
+  watch: { valued: ["-n", "--interval"], positionals: 0 },
+  flock: { valued: ["-w", "--timeout", "-E"], positionals: 1 },
+  exec: { valued: ["-a"], positionals: 0 },
+  nohup: { valued: [], positionals: 0 },
+  setsid: { valued: [], positionals: 0 },
+  command: { valued: [], positionals: 0 },
+  builtin: { valued: [], positionals: 0 },
+  chronic: { valued: [], positionals: 0 },
+  unbuffer: { valued: [], positionals: 0 },
+  caffeinate: { valued: ["-t", "-w"], positionals: 0 },
+}
+
+const base = (t: string) => t.split("/").pop() ?? t
+
+/**
+ * The command a simple command actually runs: shell keywords, VAR=x
+ * assignments and wrapper commands (sudo, env, timeout, nice, xargs, ...)
+ * with their options are skipped. A bare wrapper (`env`) is its own command.
+ */
 function commandWord(toks: string[]): { word: string; index: number; viaXargs: boolean } | null {
   let viaXargs = false
-  for (let i = 0; i < toks.length; i++) {
+  let lastWrapper: { word: string; index: number } | null = null
+  let i = 0
+  while (i < toks.length) {
     const t = toks[i]
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) continue
-    const base = t.split("/").pop() ?? t
-    if (PREFIX_WORDS.has(base)) {
-      if (base === "xargs") viaXargs = true
+    if (SHELL_KEYWORDS.has(t) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+      i++
       continue
     }
-    if (t.startsWith("-") && i > 0) continue
-    return { word: base, index: i, viaXargs }
+    const b = base(t)
+    const w = WRAPPERS[b]
+    if (!w) return { word: b, index: i, viaXargs }
+    if (b === "xargs") viaXargs = true
+    lastWrapper = { word: b, index: i }
+    i++
+    while (i < toks.length && toks[i].startsWith("-") && toks[i] !== "-") {
+      if (w.valued.includes(toks[i])) i++
+      i++
+    }
+    for (let p = 0; p < w.positionals && i < toks.length; p++) i++
   }
+  return lastWrapper ? { ...lastWrapper, viaXargs } : null
+}
+
+/**
+ * Index of the first token that runs one of `names`: the effective command
+ * if it matches, else any later token with that basename (an unknown wrapper,
+ * `find -exec`, and so on). Conservative: `echo rm -rf ~` counts as rm.
+ */
+function findCommand(toks: string[], names: Set<string>): { word: string; index: number; viaXargs: boolean } | null {
+  const cw = commandWord(toks)
+  if (cw && names.has(cw.word)) return cw
+  const start = cw ? cw.index + 1 : 0
+  for (let i = start; i < toks.length; i++) if (names.has(base(toks[i]))) return { word: base(toks[i]), index: i, viaXargs: !!cw?.viaXargs || toks.slice(0, i).some((t) => base(t) === "xargs") }
   return null
 }
 
@@ -187,12 +291,15 @@ function commandWord(toks: string[]): { word: string; index: number; viaXargs: b
 // Recursive delete (ported from the reference install, new-jaxity#526)
 // ---------------------------------------------------------------------------
 
+const RM = new Set(["rm", "rmdir", "unlink", "shred"])
+
 function rmDenied(cmd: string, ctx: GuardContext): string | null {
   for (const seg of segments(cmd)) {
     const toks = tokens(seg)
-    const cw = commandWord(toks)
-    if (!cw || cw.word !== "rm") continue
-    if (/^\s*(sudo|doas)\b/.test(seg)) return deny("Blocked: sudo rm is prohibited. Use 'trash', or ask Sean.")
+    const cw = findCommand(toks, RM)
+    if (!cw) continue
+    if (toks.slice(0, cw.index).some((t) => base(t) === "sudo" || base(t) === "doas"))
+      return deny("Blocked: sudo rm is prohibited. Use 'trash', or ask Sean.")
     const args = toks.slice(cw.index + 1)
     let recursive = false
     const operands: string[] = []
@@ -203,7 +310,7 @@ function rmDenied(cmd: string, ctx: GuardContext): string | null {
         continue
       }
       if (!endOfFlags && a.startsWith("-")) {
-        if (a === "--recursive" || /^-[A-Za-z]*[rR]/.test(a)) recursive = true
+        if (a === "--recursive" || /^-[A-Za-z]*[rR]/.test(a) || cw.word === "shred") recursive = true
         continue
       }
       operands.push(a)
@@ -213,7 +320,8 @@ function rmDenied(cmd: string, ctx: GuardContext): string | null {
       return deny("Blocked: recursive delete whose targets come from stdin cannot be checked. Expand the paths, or use 'trash'.")
     // The raw segment (pre-tokenising) shows expansions the tokenizer kept as text.
     for (const raw of operands) {
-      if (/[$`]/.test(raw))
+      if (raw === "+" || raw === ";") continue
+      if (/[$`]|\{\}/.test(raw))
         return deny(
           `Blocked: recursive delete of an unexpanded target (${raw}). A guard cannot see what a variable holds, and a stale one wiped a live install tree once (new-jaxity#526). Expand the path to a literal, or use 'trash'.`,
         )
@@ -238,11 +346,13 @@ function rmDenied(cmd: string, ctx: GuardContext): string | null {
 // git, SQL, mail CLIs, WhatsApp, DM URLs (ported, boundary-anchored)
 // ---------------------------------------------------------------------------
 
+const GIT = new Set(["git"])
+
 function gitDenied(cmd: string): string | null {
   for (const seg of segments(cmd)) {
     const toks = tokens(seg)
-    const cw = commandWord(toks)
-    if (!cw || cw.word !== "git") continue
+    const cw = findCommand(toks, GIT)
+    if (!cw) continue
     const rest = toks.slice(cw.index + 1)
     const GIT_ARG_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"])
     const subIdx = rest.findIndex((t, i) => !t.startsWith("-") && !(i > 0 && GIT_ARG_OPTS.has(rest[i - 1])))
@@ -306,16 +416,26 @@ export function isSecretVarName(name: string): boolean {
 function secretBashDenied(cmd: string): string | null {
   if (/\/proc\b/.test(cmd) && /\b(environ|cmdline)\b/.test(cmd))
     return deny("secret-print-guard: reading another process's environment or command line prints its secrets. Name the one variable you need instead.")
-  for (const seg of cmd.split(/;|&&|\|\||\n/)) {
-    const s = seg.trim()
-    if (!s) continue
-    const pipes = s.split("|").map((p) => p.trim())
-    const first = pipes[0]
+  for (const seg of segments(cmd, true)) {
+    const s = seg
+    const pipes = pipeline(s)
+    const first = pipes[0] ?? ""
     const rest = pipes.slice(1).join("|")
     const namesOnly = /(^|\s)(wc|cut\s+-d\s*=?\s*-f\s*1|cut\s+-d=\s+-f1)\b|grep\s+-[A-Za-z]*[clq]/.test(rest)
-    // Environment dumps.
-    if (/^(sudo\s+)?(env|printenv|export\s+-p|set|declare\s+-[xp]|compgen\s+-v)\s*$/.test(first) && !namesOnly)
-      return deny("secret-print-guard: dumping the environment prints every secret in it. List names only (env | cut -d= -f1).")
+    {
+      const t = tokens(first)
+      const c = commandWord(t)
+      const a = c ? t.slice(c.index + 1) : []
+      const dump =
+        !!c &&
+        (((c.word === "env" || c.word === "printenv") && a.filter((x) => !x.startsWith("-")).length === 0) ||
+          (c.word === "export" && a.includes("-p")) ||
+          (c.word === "set" && a.length === 0) ||
+          (c.word === "declare" && a.some((x) => /^-[A-Za-z]*[xp]/.test(x))) ||
+          (c.word === "compgen" && a.includes("-v")))
+      if (dump && !namesOnly)
+        return deny("secret-print-guard: dumping the environment prints every secret in it. List names only (env | cut -d= -f1).")
+    }
     const toks = tokens(first)
     const cw = commandWord(toks)
     if (!cw) continue
@@ -337,7 +457,7 @@ function secretBashDenied(cmd: string): string | null {
           `secret-print-guard: this prints the contents of ${files[0]} into the session log. List names only (grep -o "^[A-Z_]*" FILE) or use the value without printing it.`,
         )
     }
-    if (/<\s*\S/.test(first)) {
+    if (/<\s*\S/.test(first) && cw) {
       const redirected = first.match(/<\s*(\S+)/)
       if (redirected && isSecretPath(redirected[1]))
         return deny(`secret-print-guard: this reads ${redirected[1]} into a command whose output lands in the session log.`)
@@ -393,26 +513,22 @@ const WGET_MUTATING = /^--(post-data|post-file|body-data|body-file)(=|$)|^--meth
 const REDIRECTING_FLAGS = new Set(["--resolve", "--connect-to", "-x", "--proxy", "-K", "--config", "--variable"])
 const INTERPRETERS = new Set(["python", "python3", "node", "nodejs", "perl", "ruby", "php", "bun", "deno"])
 
+const HTTP_CLIENTS = new Set(["curl", "wget"])
+
 type HttpCall = { tool: string; urls: string[]; mutating: boolean; data: string[]; redirecting: boolean }
 
 function httpCalls(cmd: string): HttpCall[] {
   const calls: HttpCall[] = []
   for (const seg of segments(cmd)) {
     const toks = tokens(seg)
-    const cw = commandWord(toks)
+    const cw = findCommand(toks, HTTP_CLIENTS) ?? commandWord(toks)
     if (!cw) continue
     const args = toks.slice(cw.index + 1)
     if (cw.word === "curl") {
       const call: HttpCall = { tool: "curl", urls: [], mutating: false, data: [], redirecting: false }
-      for (let i = 0; i < args.length; i++) {
-        const a = args[i]
-        const [flag, inline] = a.startsWith("--") && a.includes("=") ? [a.slice(0, a.indexOf("=")), a.slice(a.indexOf("=") + 1)] : [a, undefined]
-        const shortJoined = /^-[XdFHTmxo]./.test(a) && !a.startsWith("--") ? [a.slice(0, 2), a.slice(2)] : null
-        const f = shortJoined ? shortJoined[0] : flag
-        const takes = CURL_ARG_FLAGS.has(f)
-        const value = shortJoined ? shortJoined[1] : inline !== undefined ? inline : takes ? args[++i] : undefined
+      const take = (f: string, value: string | undefined, raw: string) => {
         if (f === "-X" || f === "--request") {
-          if (value && !/^(GET|HEAD|OPTIONS)$/i.test(value)) call.mutating = true
+          if (value === undefined || !/^(GET|HEAD|OPTIONS)$/i.test(value)) call.mutating = true
         } else if (CURL_DATA_FLAGS.has(f)) {
           call.mutating = true
           if (value !== undefined) call.data.push(value)
@@ -420,8 +536,31 @@ function httpCalls(cmd: string): HttpCall[] {
           call.redirecting = true
         } else if (f === "--url") {
           if (value) call.urls.push(value)
-        } else if (!a.startsWith("-") && !takes) {
-          call.urls.push(a)
+        } else if (!raw.startsWith("-")) {
+          call.urls.push(raw)
+        }
+      }
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i]
+        if (a.startsWith("--")) {
+          const eq = a.indexOf("=")
+          const f = eq > 0 ? a.slice(0, eq) : a
+          const value = eq > 0 ? a.slice(eq + 1) : CURL_ARG_FLAGS.has(f) ? args[++i] : undefined
+          take(f, value, a)
+        } else if (a.startsWith("-") && a.length > 1) {
+          // Short flags cluster (-sSX POST, -sd x, -XPOST): the first flag that
+          // takes a value consumes the rest of the token, or the next token.
+          for (let j = 1; j < a.length; j++) {
+            const f = "-" + a[j]
+            if (CURL_ARG_FLAGS.has(f)) {
+              const restOf = a.slice(j + 1)
+              take(f, restOf.length ? restOf : args[++i], f)
+              break
+            }
+            take(f, undefined, f)
+          }
+        } else {
+          take(a, undefined, a)
         }
       }
       calls.push(call)
@@ -677,7 +816,40 @@ function str(v: unknown): string {
   return typeof v === "string" ? v : v === undefined || v === null ? "" : String(v)
 }
 
-export function bashDenied(cmd: string, ctx: GuardContext): string | null {
+const SHELLS = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash", "mksh", "fish", "su"])
+
+/** Scripts a shell will run from this command line (sh -c, eval, env -S). */
+function nestedScripts(cmd: string): string[] {
+  const out: string[] = []
+  for (const seg of segments(cmd)) {
+    const toks = tokens(seg)
+    for (let i = 0; i < toks.length; i++) {
+      const b = base(toks[i])
+      if (SHELLS.has(b)) {
+        for (let j = i + 1; j < toks.length && toks[j].startsWith("-"); j++) {
+          if (/^-[A-Za-z]*c[A-Za-z]*$/.test(toks[j]) && j + 1 < toks.length) out.push(toks[j + 1])
+        }
+      } else if (b === "eval") {
+        out.push(toks.slice(i + 1).join(" "))
+      } else if (b === "env" && (toks[i + 1] === "-S" || toks[i + 1] === "--split-string") && toks[i + 2]) {
+        out.push(toks[i + 2])
+      }
+    }
+  }
+  return out
+}
+
+const SHELL_FROM_STDIN =
+  /\|\s*(?:sudo\s+)?(?:\S*\/)?(?:ba|z|da|k|a|mk)?sh\b(?!\s+-[A-Za-z]*c)|\b(?:(?:ba|z|da|k|a|mk)?sh|source)\s+<[(<]|(?:^|[;&|]\s*)\.\s+<\(/
+
+export function bashDenied(cmd: string, ctx: GuardContext, depth = 0): string | null {
+  if (depth > 4) return deny("Blocked: shell scripts nested this deep cannot be checked.")
+  if (SHELL_FROM_STDIN.test(unquoted(cmd)))
+    return deny("Blocked: piping or feeding text into a shell hides the command from the guard. Run the command directly.")
+  for (const inner of nestedScripts(cmd)) {
+    const r = bashDenied(inner, ctx, depth + 1)
+    if (r) return r
+  }
   const checks = [
     () => shellWriteToGuardDenied(cmd),
     () => secretBashDenied(cmd),
