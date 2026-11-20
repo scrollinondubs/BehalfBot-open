@@ -8,8 +8,9 @@
 #   2. park their plists so a reboot cannot resurrect them
 #   3. flip BRIDGE_DRY_RUN=0 in .env
 #   4. docker compose up -d
-#   5. verify serve health on 127.0.0.1:4848 and "gateway connected as" in
-#      the bridge logs
+#   5. verify the serve container's own healthcheck reports healthy (the API
+#      is deliberately not published to the host, so there is no host port
+#      to curl) and "gateway connected as" in the bridge logs
 #   6. on any failure: automatic rollback (stop containers, restore plists,
 #      reload launchd agents, restore BRIDGE_DRY_RUN=1)
 #
@@ -88,13 +89,22 @@ sleep 10
 # --- 3+4: go live in Docker ---------------------------------------------------
 set_dry_run 0
 log "BRIDGE_DRY_RUN=0 set in .env; starting compose stack"
-docker compose up -d
+# up -d itself fails when serve never goes healthy (the bridge depends on
+# service_healthy); under set -e that used to exit with no rollback.
+if ! docker compose up -d; then
+  log "FAIL: docker compose up did not complete"
+  rollback
+  exit 1
+fi
 
 # --- 5: verify ----------------------------------------------------------------
-log "verifying opencode serve on 127.0.0.1:4848"
+# No host port is published (see docker-compose.yml header), so read the
+# container's own healthcheck instead of curling the host.
+log "verifying opencode serve via its container healthcheck"
 ok_serve=0
-for _ in $(seq 1 30); do
-  if curl -fsS http://127.0.0.1:4848/global/health >/dev/null 2>&1; then
+for _ in $(seq 1 45); do
+  health="$(docker inspect -f '{{.State.Health.Status}}' behalfbot-opencode-serve 2>/dev/null || echo missing)"
+  if [ "$health" = healthy ]; then
     ok_serve=1; break
   fi
   sleep 2
