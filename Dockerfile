@@ -12,10 +12,11 @@ FROM node:22-bookworm-slim
 
 # python3 for the bridge, curl for the compose healthcheck, git because
 # opencode prefers running inside a repo, ca-certificates for TLS, jq for the
-# heartbeat dispatcher's JSON parsing.
+# heartbeat dispatcher's JSON parsing, ripgrep for OpenCode's grep/glob tools
+# (otherwise it downloads rg at runtime into a noexec tmpfs).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-pip curl git ca-certificates jq \
+        python3 python3-pip curl git ca-certificates jq ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 # opencode pinned exactly. 1.19.6 differs from 1.19.5 only in
@@ -73,7 +74,21 @@ RUN git init -q /app \
 # Non-root from here on. uid/gid 1000, no sudo in the image.
 USER node
 ENV HOME=/home/node \
-    npm_config_cache=/tmp/.npm
+    npm_config_cache=/tmp/.npm \
+    OPENCODE_CONFIG=/app/opencode.json \
+    OPENCODE_CONFIG_DIR=/app/.opencode \
+    OPENCODE_DISABLE_PROJECT_CONFIG=1 \
+    OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
+    OPENCODE_DISABLE_CLAUDE_CODE=1
+
+# Config is PINNED to the image, whatever directory a session runs in. By
+# default OpenCode walks up from the session directory loading every
+# opencode.json, .opencode/ (plugins, agents) and AGENTS.md it finds, and a
+# session outside /app (a heartbeat cwd, a cloned repo in /workspace) would
+# run with NO guard plugin, or with a plugin the repo brought along. The
+# variables above load only /app's config and plugin dir, and turn off
+# project-level config, .claude/.agents skills and CLAUDE.md discovery.
+# AGENTS.md is listed in opencode.json "instructions" by absolute path.
 
 EXPOSE 4747
 

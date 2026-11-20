@@ -3,6 +3,8 @@
   "model": "venice/zai-org-glm-5-2",
   "small_model": "venice/z-ai-glm-5-3-flash",
   "instructions": [
+    "/app/AGENTS.md",
+    "/app/.opencode/instructions/response-style.md",
     ".opencode/instructions/response-style.md"
   ],
   "autoupdate": false,

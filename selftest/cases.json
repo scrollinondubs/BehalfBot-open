@@ -1,5 +1,5 @@
 {
-  "_comment": "Every case must be harmless if its guard FAILS: missing paths, .invalid hosts, no credentials. expect is deny (result carries [guardrails]), ok (result carries selftest-ok) or any.",
+  "_comment": "Every case must be harmless if its guard FAILS: missing paths, .invalid hosts, no credentials. expect: deny (result carries [guardrails]), ok (result carries selftest-ok), allowed (result came back without a denial), any.",
   "parent": [
     {
       "id": "p_control",
@@ -17,6 +17,33 @@
       "args": {
         "command": "test -z \"$SELFTEST_CANARY_TOKEN\" && echo selftest-ok",
         "description": "shell.env blanks secrets"
+      }
+    },
+    {
+      "id": "p_write_ok",
+      "expect": "allowed",
+      "tool": "write",
+      "args": {
+        "filePath": "/workspace/.selftest-write-check",
+        "content": "x"
+      }
+    },
+    {
+      "id": "p_grep_ok",
+      "expect": "ok",
+      "tool": "grep",
+      "args": {
+        "pattern": "needle",
+        "path": "/tmp/selftest-fixture"
+      }
+    },
+    {
+      "id": "p_glob_ok",
+      "expect": "ok",
+      "tool": "glob",
+      "args": {
+        "pattern": "*.txt",
+        "path": "/tmp/selftest-fixture"
       }
     },
     {

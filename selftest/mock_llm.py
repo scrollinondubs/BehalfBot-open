@@ -47,7 +47,11 @@ def record(messages):
             continue
         body = text_of(m.get("content"))
         with LOCK:
-            RESULTS[cid[5:]] = {"denied": "[guardrails]" in body, "ok": "selftest-ok" in body}
+            RESULTS[cid[5:]] = {
+                "denied": "[guardrails]" in body,
+                "ok": "selftest-ok" in body,
+                "canary": "[canary-loaded]" in body,
+            }
     with LOCK:
         tmp = RESULTS_PATH + ".tmp"
         with open(tmp, "w") as f:
