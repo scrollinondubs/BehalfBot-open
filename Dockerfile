@@ -42,21 +42,38 @@ WORKDIR /app
 COPY opencode.json AGENTS.md ./
 COPY .opencode/ ./.opencode/
 COPY config/ ./config/
+COPY selftest/ ./selftest/
 COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
 
-# opencode prefers a git worktree; give it a throwaway one.
+# Guard files are ROOT-owned and read-only to the runtime user (#33). The
+# model runs as `node` with bash and file tools; if it could write
+# .opencode/, opencode.json, AGENTS.md or config/ it could rewrite its own
+# guard. So /app and $HOME stay root's, and `node` can write only:
+#   /workspace                          her working files (volume)
+#   /data                               memory + bridge state (volume)
+#   ~/.local/share/opencode             sessions and history (volume)
+#   ~/.local/state, ~/.cache, /tmp      scratch (tmpfs under compose)
+# OpenCode's global config dir (~/.config/opencode) is root's as well: a
+# config or plugin dropped there would load on the next start. The two files
+# OpenCode writes at startup when absent are created here instead.
 RUN git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
     && git -C /app config user.name "Jill" \
+    && printf '%s\n' node_modules package.json package-lock.json bun.lock .gitignore > /app/.opencode/.gitignore \
     && git -C /app add -A && git -C /app commit -qm "image snapshot" \
-    # /data backs the named volumes (sessions, memory). Pre-owning it as
-    # `node` makes the named volume inherit non-root ownership on first use.
-    && mkdir -p /data /home/node/.local/share/opencode \
-    && chown -R node:node /app /data /home/node/.local
+    && mkdir -p /data /workspace /home/node/.config/opencode \
+        /home/node/.local/share/opencode /home/node/.local/state /home/node/.cache \
+    && cp /app/.opencode/.gitignore /home/node/.config/opencode/.gitignore \
+    && printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /home/node/.config/opencode/opencode.jsonc \
+    && chown -R root:root /app /home/node \
+    && chmod -R u=rwX,go=rX /app /home/node \
+    && chown -R node:node /data /workspace /home/node/.local/share/opencode \
+        /home/node/.local/state /home/node/.cache
 
 # Non-root from here on. uid/gid 1000, no sudo in the image.
 USER node
-ENV HOME=/home/node
+ENV HOME=/home/node \
+    npm_config_cache=/tmp/.npm
 
 EXPOSE 4747
 

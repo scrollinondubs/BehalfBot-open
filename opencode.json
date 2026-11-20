@@ -12,7 +12,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "Venice AI",
       "options": {
-        "baseURL": "https://api.venice.ai/api/v1",
+        "baseURL": "{env:VENICE_BASE_URL}",
         "apiKey": "{env:VENICE_API_KEY}"
       },
       "whitelist": [
@@ -37,6 +37,11 @@
   },
   "permission": {
     "edit": "allow",
+    "external_directory": {
+      "*": "deny",
+      "/workspace/**": "allow",
+      "/tmp/**": "allow"
+    },
     "bash": {
       "*": "allow",
       "rm -rf *": "deny",

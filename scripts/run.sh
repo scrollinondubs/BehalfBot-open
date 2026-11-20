@@ -29,6 +29,10 @@ if [[ -z "${VENICE_API_KEY:-}" ]]; then
   exit 1
 fi
 
+# Bare-host runs talk to Venice directly; the Docker stack points this at the
+# venice-proxy sidecar instead, which holds the key.
+export VENICE_BASE_URL="${VENICE_BASE_URL:-https://api.venice.ai/api/v1}"
+
 # Default memory MCP store to a repo-local gitignored path.
 export BEHALFBOT_MEMORY_FILE="${BEHALFBOT_MEMORY_FILE:-$REPO_DIR/memory/memory.jsonl}"
 mkdir -p "$(dirname "$BEHALFBOT_MEMORY_FILE")"
