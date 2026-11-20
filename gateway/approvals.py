@@ -3,9 +3,9 @@
 
 Two kinds, same store:
 
-  draft   send ONE specific AgentMail draft, exactly as it was when Sean saw
-          it (bound to a sha256 of its recipients, subject, body and
-          attachments), once, before it expires
+  draft   send ONE specific draft, exactly as it was when Sean saw it (bound
+          to a sha256 of the whole sendable object, attachment bytes
+          included), once, before it expires
   url     fetch ONE exact URL through the fetch gateway, once, before it
           expires
 
@@ -23,12 +23,15 @@ Who can do what (docker-compose.yml):
 CLI (testing, and the manual path until the Matrix bridge lands):
 
   approvals.py approve-draft <draft_id> --sha256 <digest> [--ttl 900]
+  CONSUMED_DIRS=/state/agentmail-consumed:/state/fetch-consumed approvals.py list
   approvals.py approve-url <url> [--ttl 600]
   approvals.py list
   approvals.py revoke <kind> <key>
 
 The digest for a draft comes from agentmail-proxy:
-  GET /_jill/drafts/<draft_id>/digest   (recipients, subject and sha256)
+  GET /_jill/drafts/<draft_id>/digest   (the exact content a send will
+  deliver, and its sha256). A send delivers that stored content, not
+  whatever AgentMail's copy of the draft holds at the time.
 """
 import argparse
 import hashlib
@@ -48,14 +51,22 @@ def key_for(kind, value):
     return hashlib.sha256(f"{kind}\0{value}".encode()).hexdigest()
 
 
+# Everything a send delivers. The digest is over the canonical JSON of the
+# whole sendable object: recipients, subject, bodies, labels, threading and
+# every attachment's bytes (round-3 red-team H1).
+SENDABLE = ("to", "cc", "bcc", "reply_to", "subject", "text", "html", "labels", "attachments", "in_reply_to")
+
+
+def sendable(draft):
+    return {k: draft[k] for k in SENDABLE if k in draft and draft[k] is not None}
+
+
+def canonical(obj):
+    return json.dumps(obj, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
 def draft_digest(draft):
-    """sha256 over what a send would actually deliver."""
-    keep = {k: draft.get(k) for k in ("to", "cc", "bcc", "reply_to", "subject", "text", "html")}
-    keep["attachments"] = sorted(
-        str(a.get("attachment_id") or a.get("id") or a.get("filename") or a) if isinstance(a, dict) else str(a)
-        for a in (draft.get("attachments") or [])
-    )
-    return hashlib.sha256(json.dumps(keep, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+    return hashlib.sha256(canonical(sendable(draft)).encode()).hexdigest()
 
 
 def _path(base, kind, value):
@@ -76,35 +87,58 @@ def write_approval(kind, value, ttl, extra=None, base=APPROVALS_DIR):
     return rec
 
 
-def check_and_consume(kind, value, consumed_dir, base=APPROVALS_DIR, now=None, verify=None):
-    """Return the approval record and mark it used, or raise LookupError(reason).
-
-    verify(rec) runs BEFORE the record is consumed, so a mismatch (say, a
-    draft edited after Sean approved it) refuses without burning the approval.
-    """
-    now = time.time() if now is None else now
-    p = _path(base, kind, value)
+def _load(kind, value, base):
     try:
-        with open(p) as f:
+        with open(_path(base, kind, value)) as f:
             rec = json.load(f)
     except (OSError, ValueError):
-        raise LookupError("no approval from Sean for this")
+        return None
     if rec.get("kind") != kind or rec.get("value") != value:
-        raise LookupError("approval record does not match")
+        return None
+    if not re.fullmatch(r"[0-9a-f]{32}", str(rec.get("nonce", ""))):
+        return None
+    return rec
+
+
+def _marker(consumed_dir, kind, value, rec):
+    return os.path.join(consumed_dir, f"{kind}-{key_for(kind, value)}-{rec['nonce']}")
+
+
+def status(kind, value, consumed_dirs, base=APPROVALS_DIR, now=None):
+    """'none', 'live', 'used' or 'expired' for the current approval of this thing."""
+    now = time.time() if now is None else now
+    rec = _load(kind, value, base)
+    if rec is None:
+        return "none"
+    if any(os.path.exists(_marker(d, kind, value, rec)) for d in consumed_dirs):
+        return "used"
+    if now > float(rec.get("expires_at", 0)):
+        return "expired"
+    return "live"
+
+
+def check_and_consume(kind, value, consumed_dir, base=APPROVALS_DIR, now=None, verify=None):
+    """Consume Sean's approval, then verify it; return the record or raise LookupError.
+
+    The approval is BURNED by any attempt that reaches here, before verify
+    runs: a refused attempt (say, a draft whose content no longer matches
+    what Sean approved) cannot be retried against the same approval.
+    (Round-3 red-team C1: a free retry made a lost race costless.)
+    """
+    now = time.time() if now is None else now
+    rec = _load(kind, value, base)
+    if rec is None:
+        raise LookupError("no approval from Sean for this")
     if now > float(rec.get("expires_at", 0)):
         raise LookupError("Sean's approval has expired")
-    if verify:
-        verify(rec)
     os.makedirs(consumed_dir, exist_ok=True)
-    nonce = str(rec.get("nonce", ""))
-    if not re.fullmatch(r"[0-9a-f]{32}", nonce):
-        raise LookupError("approval record is malformed")
-    marker = os.path.join(consumed_dir, f"{kind}-{key_for(kind, value)}-{nonce}")
     try:
-        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        fd = os.open(_marker(consumed_dir, kind, value, rec), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         raise LookupError("this approval was already used")
     os.close(fd)
+    if verify:
+        verify(rec)
     return rec
 
 
@@ -140,13 +174,20 @@ def main(argv=None):
         print("revoked")
         return
     else:
+        # CONSUMED_DIRS: the gateways' consumed-marker dirs, mounted read-only
+        # here, so a used approval shows as used (round-3 red-team M2).
+        consumed = [d for d in os.environ.get("CONSUMED_DIRS", "").split(":") if d]
         for kind in ("draft", "url"):
             d_ = os.path.join(APPROVALS_DIR, kind)
             for name in sorted(os.listdir(d_)) if os.path.isdir(d_) else []:
                 with open(os.path.join(d_, name)) as f:
                     rec = json.load(f)
+                st = status(kind, rec["value"], consumed)
                 left = int(rec["expires_at"] - time.time())
-                print(f"{kind}\t{rec['value']}\t{'expired' if left <= 0 else f'{left}s left'}")
+                shown = f"live, {left}s left" if st == "live" else st
+                if not consumed and st == "live":
+                    shown += " (use state unknown: CONSUMED_DIRS not set)"
+                print(f"{kind}\t{rec['value']}\t{shown}")
         return
     print(f"approved {rec['kind']} {rec['value']} for {int(rec['expires_at'] - rec['created_at'])}s")
 

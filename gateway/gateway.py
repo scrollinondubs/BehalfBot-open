@@ -37,6 +37,7 @@ import re
 import socket
 import ssl
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
@@ -62,12 +63,14 @@ class Deny(Exception):
 class Forward:
     """What to send upstream after a policy approved the request."""
 
-    def __init__(self, method, path, body=None, query=None, raw=None):
+    def __init__(self, method, path, body=None, query=None, raw=None, after=None, release=None):
         self.method = method
         self.path = path
         self.body = body  # a validated Python object, re-serialised on send
         self.query = query or []
         self.raw = raw  # bytes, only for the trusted api route
+        self.after = after  # called with (status, response bytes) before replying
+        self.release = release  # called once the upstream exchange is over
 
 
 class Local:
@@ -228,46 +231,147 @@ def validate_draft(data):
     return data
 
 
+# Per-draft locks: a draft's edit, delete and send never overlap.
+_LOCKS = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def draft_lock(draft_id):
+    with _LOCKS_GUARD:
+        return _LOCKS.setdefault(draft_id, threading.Lock())
+
+
+def _snapshot_path(ctx, draft_id):
+    return os.path.join(ctx["state_dir"], "drafts", approvals.key_for("draft", draft_id) + ".json")
+
+
+def load_snapshot(ctx, draft_id):
+    try:
+        with open(_snapshot_path(ctx, draft_id)) as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return rec["content"] if rec.get("draft_id") == draft_id else None
+
+
+def save_snapshot(ctx, draft_id, content):
+    p = _snapshot_path(ctx, draft_id)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"draft_id": draft_id, "content": approvals.sendable(content)}, f)
+    os.replace(tmp, p)
+
+
+def send_body(content):
+    """The approved snapshot as a messages/send request (AgentMail API)."""
+    body = {k: v for k, v in content.items() if k != "in_reply_to"}
+    if content.get("in_reply_to"):
+        body["headers"] = {"In-Reply-To": content["in_reply_to"], "References": content["in_reply_to"]}
+    return body
+
+
 def agentmail_policy(ctx, method, path, body):
+    """Drafts to anyone; a send delivers the gateway's own snapshot of the draft.
+
+    Round-3 red-team C1: binding an approval to a digest of AgentMail's copy
+    of the draft, then asking AgentMail to send "the draft", let a PATCH
+    land between the check and the send. Now:
+      - every draft written through this gateway is snapshotted here (the
+        validated, re-serialised content, attachment bytes included);
+        Sean approves the sha256 of that snapshot (GET /_jill/.../digest)
+      - a send verifies the approval against the snapshot and then POSTs
+        the snapshot itself to messages/send: AgentMail's draft is not what
+        gets sent, so editing it cannot change what goes out
+      - edits and deletes are refused while a live approval exists
+      - edit, delete and send of one draft are serialised by a lock
+      - any send attempt that reaches the approval burns it
+    """
     base = "/v0/inboxes/" + ctx["inbox"]
     seg = r"[^/]+"
     if path.startswith("/_jill/drafts/") and path.endswith("/digest") and method == "GET":
         draft_id = path[len("/_jill/drafts/"):-len("/digest")]
-        draft = ctx["upstream_json"]("GET", f"{base}/drafts/{draft_id}")
-        return Local(200, {"draft_id": draft_id, "to": draft.get("to"), "cc": draft.get("cc"),
-                           "bcc": draft.get("bcc"), "subject": draft.get("subject"),
-                           "sha256": approvals.draft_digest(draft)})
+        with draft_lock(draft_id):
+            content = load_snapshot(ctx, draft_id)
+        if content is None:
+            raise Deny(404, "no snapshot of this draft: only drafts written through this gateway can be sent")
+        return Local(200, {"draft_id": draft_id, "content": content, "sha256": approvals.draft_digest(content)})
     if not path.startswith(base + "/") and path != base:
         raise Deny(403, "only Jill's own inbox is reachable")
     rest = path[len(base):]
     if method == "GET" and re.fullmatch(
             rf"(/(threads|messages|drafts)(/{seg})?|/(threads|messages)/{seg}/attachments/{seg}|/threads/{seg}/messages)?", rest):
         return Forward("GET", path, query=query_pairs(ctx["raw_path"], READ_QUERY))
+
     if method == "POST" and rest == "/drafts":
-        return Forward("POST", path, body=validate_draft(strict_json(body)))
+        draft = validate_draft(strict_json(body))
+
+        def remember(status, resp):
+            if 200 <= status < 300:
+                try:
+                    draft_id = json.loads(resp)["draft_id"]
+                except (ValueError, KeyError, TypeError):
+                    return
+                with draft_lock(draft_id):
+                    save_snapshot(ctx, draft_id, draft)
+
+        return Forward("POST", path, body=draft, after=remember)
+
     m = re.fullmatch(rf"/drafts/({seg})", rest)
-    if m and method == "PATCH":
-        return Forward("PATCH", path, body=validate_draft(strict_json(body)))
-    if m and method == "DELETE":
-        return Forward("DELETE", path)
+    if m and method in ("PATCH", "DELETE"):
+        draft_id = m.group(1)
+        patch = validate_draft(strict_json(body)) if method == "PATCH" else None
+        lock = draft_lock(draft_id)
+        lock.acquire()
+        try:
+            if approvals.status("draft", draft_id, [ctx["consumed_dir"]], base=ctx["approvals_dir"]) == "live":
+                raise Deny(409, "Sean has approved this draft as it is; it cannot change until it is sent or the approval expires")
+        except Deny:
+            lock.release()
+            raise
+
+        def update(status, resp):
+            if not 200 <= status < 300:
+                return
+            if method == "DELETE":
+                try:
+                    os.remove(_snapshot_path(ctx, draft_id))
+                except FileNotFoundError:
+                    pass
+            else:
+                merged = dict(load_snapshot(ctx, draft_id) or {})
+                merged.update(patch)
+                save_snapshot(ctx, draft_id, merged)
+
+        return Forward(method, path, body=patch, after=update, release=lock.release)
+
     m = re.fullmatch(rf"/drafts/({seg})/send", rest)
     if m and method == "POST":
         if strict_json(body, allow_empty=True):
             raise Deny(400, "draft send takes no body")
         draft_id = m.group(1)
-        draft = ctx["upstream_json"]("GET", f"{base}/drafts/{draft_id}")
-        digest = approvals.draft_digest(draft)
-
-        def same_draft(rec):
-            if rec.get("sha256") != digest:
-                raise LookupError("the draft changed after Sean approved it; ask him again")
-
+        lock = draft_lock(draft_id)
+        lock.acquire()
         try:
-            approvals.check_and_consume("draft", draft_id, ctx["consumed_dir"], base=ctx["approvals_dir"],
-                                        verify=same_draft)
-        except LookupError as e:
-            raise Deny(403, f"not sent: {e}. Ask Sean to approve draft {draft_id}")
-        return Forward("POST", path, body={})
+            content = load_snapshot(ctx, draft_id)
+            if content is None:
+                raise Deny(404, "no snapshot of this draft: only drafts written through this gateway can be sent")
+            digest = approvals.draft_digest(content)
+
+            def same_draft(rec):
+                if rec.get("sha256") != digest:
+                    raise LookupError("the draft is not the one Sean approved; this approval is now used up")
+
+            try:
+                approvals.check_and_consume("draft", draft_id, ctx["consumed_dir"], base=ctx["approvals_dir"],
+                                            verify=same_draft)
+            except LookupError as e:
+                raise Deny(403, f"not sent: {e}. Ask Sean to approve draft {draft_id}")
+        except Deny:
+            lock.release()
+            raise
+        return Forward("POST", f"{base}/messages/send", body=send_body(content), release=lock.release)
+
     raise Deny(403, "not allowed: Jill reads her inbox and writes drafts; sending needs Sean's approval of the draft")
 
 
@@ -522,27 +626,44 @@ def make_handler(cfg):
                     return self._fetch(decision.obj, shown)
                 return self._json(decision.status, decision.obj, shown)
 
-            headers = {k: v for k, v in self.headers.items() if k.lower() in FWD_REQ_HEADERS}
-            if decision.raw is not None:
-                payload = decision.raw
-            elif decision.body is not None:
-                payload = json.dumps(decision.body).encode()
-                headers["content-type"] = "application/json"
-            else:
-                payload = b""
-            headers = upstream_headers(headers)
-            if payload or decision.method in ("POST", "PUT", "PATCH"):
-                headers["content-length"] = str(len(payload))
-            target = (up.path.rstrip("/") + quote(decision.path, safe="/@:")) or "/"
-            if decision.query:
-                target += "?" + urlencode(decision.query)
             try:
-                conn = connect(up)
-                conn.request(decision.method, target, body=payload or None, headers=headers)
-                resp = conn.getresponse()
-            except OSError:
-                return self._json(502, {"error": "upstream unreachable"}, shown)
-            self._relay(resp, conn, shown, cap=None)
+                headers = {k: v for k, v in self.headers.items() if k.lower() in FWD_REQ_HEADERS}
+                if decision.raw is not None:
+                    payload = decision.raw
+                elif decision.body is not None:
+                    payload = json.dumps(decision.body).encode()
+                    headers["content-type"] = "application/json"
+                else:
+                    payload = b""
+                headers = upstream_headers(headers)
+                if payload or decision.method in ("POST", "PUT", "PATCH"):
+                    headers["content-length"] = str(len(payload))
+                target = (up.path.rstrip("/") + quote(decision.path, safe="/@:")) or "/"
+                if decision.query:
+                    target += "?" + urlencode(decision.query)
+                try:
+                    conn = connect(up)
+                    conn.request(decision.method, target, body=payload or None, headers=headers)
+                    resp = conn.getresponse()
+                except OSError:
+                    return self._json(502, {"error": "upstream unreachable"}, shown)
+                if decision.after:
+                    data = resp.read(MAX_BODY)
+                    conn.close()
+                    decision.after(resp.status, data)
+                    self.send_response(resp.status)
+                    for k, v in resp.getheaders():
+                        if k.lower() in FWD_RESP_HEADERS:
+                            self.send_header(k, v)
+                    self.send_header("content-length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    self._log(resp.status, shown)
+                    return
+                self._relay(resp, conn, shown, cap=None)
+            finally:
+                if decision.release:
+                    decision.release()
 
         def _relay(self, resp, conn, shown, cap):
             self.send_response(resp.status)

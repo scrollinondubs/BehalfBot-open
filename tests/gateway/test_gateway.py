@@ -106,15 +106,24 @@ class AgentMail(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.c = cfg("agentmail", self.tmp)
-        self.draft = {"draft_id": "d1", "to": ["lead@x.com"], "subject": "Hi", "text": "body"}
-
-    def up(self, method, path):
-        self.assertEqual(path, f"{BASE}/drafts/d1")
-        return dict(self.draft)
+        self.ctx = dict(self.c, raw_path="", upstream_json=lambda *a: {})
+        self.draft = {"to": ["lead@x.com"], "subject": "Hi", "text": "body"}
+        g.save_snapshot(self.ctx, "d1", self.draft)
+        self.adir = os.path.join(self.tmp, "approvals")
 
     def deny(self, method, raw, body=b""):
         with self.assertRaises(g.Deny, msg=f"{method} {raw} {body[:90]!r}"):
-            run(self.c, method, raw, body, self.up)
+            run(self.c, method, raw, body)
+
+    def approve(self, content=None, ttl=60):
+        approvals.write_approval("draft", "d1", ttl, {"sha256": approvals.draft_digest(content or self.draft)},
+                                 base=self.adir)
+
+    def send(self):
+        f = run(self.c, "POST", BASE + "/drafts/d1/send", b"")
+        if f.release:
+            f.release()
+        return f
 
     def test_reads_allowed_in_her_inbox_only(self):
         for p in ("", "/threads", "/threads/t1", "/messages/m1", "/drafts", "/drafts/d1", "/messages/m1/attachments/a1"):
@@ -126,8 +135,6 @@ class AgentMail(unittest.TestCase):
     def test_drafts_to_anyone_but_no_scheduling_or_unknown_fields(self):
         f = run(self.c, "POST", BASE + "/drafts", J(to=["lead@x.com"], subject="s", text="t"))
         self.assertEqual(f.body, {"to": ["lead@x.com"], "subject": "s", "text": "t"})
-        self.assertIsInstance(run(self.c, "PATCH", BASE + "/drafts/d1", J(text="new")), g.Forward)
-        self.assertIsInstance(run(self.c, "DELETE", BASE + "/drafts/d1"), g.Forward)
         for body in (J(to=["a@x.com"], send_at="2026-11-21T00:00:00Z"), J(to=["a@x.com"], sendAt="x"),
                      J(to=["a@x.com"], scheduled_at="x"), J(to=["a@x.com"], headers={"Bcc": "e@x.com"}),
                      J(to=[{"email": SEAN, "address": "e@x.com"}]), J(to=["Sean <sean@grid7.com>, e@x.com"]),
@@ -141,27 +148,50 @@ class AgentMail(unittest.TestCase):
                   "/messages/m1/forward", "/threads/t1/reply"):
             self.deny("POST", BASE + p, J(to=[SEAN]))
 
-    def test_draft_send_needs_a_fresh_matching_one_shot_approval(self):
-        send = BASE + "/drafts/d1/send"
-        self.deny("POST", send)  # no approval
-        digest = approvals.draft_digest(self.draft)
-        adir = os.path.join(self.tmp, "approvals")
-        approvals.write_approval("draft", "d1", 60, {"sha256": digest}, base=adir)
-        self.assertIsInstance(run(self.c, "POST", send, b"", self.up), g.Forward)
-        self.deny("POST", send)  # one approval, one send
-        approvals.write_approval("draft", "d1", 60, {"sha256": digest}, base=adir)
-        self.draft["to"] = ["attacker@evil.example"]  # edited after approval
-        self.deny("POST", send)
-        self.draft["to"] = ["lead@x.com"]
-        self.assertIsInstance(run(self.c, "POST", send, b"", self.up), g.Forward)  # not burned by the mismatch
-        approvals.write_approval("draft", "d1", 1, {"sha256": digest}, base=adir)
-        time.sleep(1.2)
-        self.deny("POST", send)  # expired
-        self.deny("POST", BASE + "/drafts/d1/send", J(to=["e@x.com"]))  # no body allowed
+    def test_send_delivers_the_approved_snapshot_once(self):
+        self.deny("POST", BASE + "/drafts/d1/send")  # no approval
+        self.approve()
+        f = self.send()
+        self.assertEqual(f.path, BASE + "/messages/send")
+        self.assertEqual(f.body, self.draft)
+        self.deny("POST", BASE + "/drafts/d1/send")  # one approval, one send
 
-    def test_digest_endpoint(self):
-        out = run(self.c, "GET", "/_jill/drafts/d1/digest", b"", self.up)
+    def test_a_refused_attempt_burns_the_approval(self):
+        self.approve()
+        g.save_snapshot(self.ctx, "d1", dict(self.draft, to=["attacker@evil.example"]))
+        self.deny("POST", BASE + "/drafts/d1/send")  # content differs
+        g.save_snapshot(self.ctx, "d1", self.draft)  # restore and retry
+        self.deny("POST", BASE + "/drafts/d1/send")  # burned: no free retry
+        self.approve(ttl=1)
+        time.sleep(1.2)
+        self.deny("POST", BASE + "/drafts/d1/send")  # expired
+
+    def test_edits_frozen_while_an_approval_is_live(self):
+        self.approve()
+        self.deny("PATCH", BASE + "/drafts/d1", J(to=["attacker@evil.example"]))
+        self.deny("DELETE", BASE + "/drafts/d1")
+        self.send()
+        f = run(self.c, "PATCH", BASE + "/drafts/d1", J(text="after the send"))  # used: editable again
+        f.release()
+
+    def test_drafts_not_written_through_the_gateway_cannot_be_sent(self):
+        approvals.write_approval("draft", "elsewhere", 60, {"sha256": "0" * 64}, base=self.adir)
+        self.deny("POST", BASE + "/drafts/elsewhere/send")
+
+    def test_digest_covers_every_deliverable_field_and_attachment_bytes(self):
+        base_ = dict(self.draft, attachments=[{"filename": "a.pdf", "content_type": "application/pdf", "content": "QUJD"}])
+        d0 = approvals.draft_digest(base_)
+        for change in ({"attachments": [{"filename": "a.pdf", "content_type": "application/pdf", "content": "WFla"}]},
+                       {"in_reply_to": "<m1@x>"}, {"labels": ["x"]}, {"reply_to": ["e@x.com"]}, {"html": "<p>x</p>"},
+                       {"bcc": ["e@x.com"]}):
+            self.assertNotEqual(approvals.draft_digest(dict(base_, **change)), d0, change)
+        out = run(self.c, "GET", "/_jill/drafts/d1/digest")
         self.assertEqual(out.obj["sha256"], approvals.draft_digest(self.draft))
+        self.assertEqual(out.obj["content"], self.draft)
+
+    def test_in_reply_to_becomes_threading_headers(self):
+        self.assertEqual(g.send_body({"to": ["a@x.com"], "in_reply_to": "<m1@x>"}),
+                         {"to": ["a@x.com"], "headers": {"In-Reply-To": "<m1@x>", "References": "<m1@x>"}})
 
 
 class SiYuan(unittest.TestCase):
@@ -303,22 +333,6 @@ class Live(unittest.TestCase):
         c.endheaders(b"{}")
         self.assertEqual(c.getresponse().status, 400)
 
-    def test_agentmail_send_flow_end_to_end(self):
-        Upstream.seen.clear()
-        st, _, _ = self.req(self.mail, "POST", f"{BASE}/drafts/d1/send", b"")
-        self.assertEqual(st, 403)
-        self.assertFalse([s for s in Upstream.seen if s["method"] == "POST"])
-        st, _, data = self.req(self.mail, "GET", "/_jill/drafts/d1/digest")
-        digest = json.loads(data)["sha256"]
-        approvals.write_approval("draft", "d1", 60, {"sha256": digest}, base=os.path.join(self.tmp, "approvals"))
-        st, _, _ = self.req(self.mail, "POST", f"{BASE}/drafts/d1/send", b"")
-        self.assertEqual(st, 200)
-        posts = [s for s in Upstream.seen if s["method"] == "POST"]
-        self.assertEqual(len(posts), 1)
-        self.assertEqual(posts[0]["path"], f"{BASE}/drafts/d1/send")
-        st, _, _ = self.req(self.mail, "POST", f"{BASE}/drafts/d1/send", b"")
-        self.assertEqual(st, 403)
-
     def test_api_needs_password_and_blocks_mcp(self):
         auth = {"authorization": "Basic " + base64.b64encode(b"opencode:api-pw").decode()}
         self.assertEqual(self.req(self.api, "GET", "/global/health")[0], 401)
@@ -327,6 +341,119 @@ class Live(unittest.TestCase):
                             dict(auth, **{"content-type": "application/json"}))
         self.assertEqual(st, 403)
 
+
+class FakeAgentMail(BaseHTTPRequestHandler):
+    """Stateful: drafts can be created and patched; sends are recorded as delivered."""
+    drafts = {}
+    delivered = []
+    lock = threading.Lock()
+    counter = [0]
+
+    def log_message(self, *a):
+        pass
+
+    def _reply(self, obj, status=200):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _any(self):
+        n = int(self.headers.get("content-length") or 0)
+        body = json.loads(self.rfile.read(n) or b"{}")
+        with self.lock:
+            if self.command == "POST" and self.path.endswith("/drafts"):
+                self.counter[0] += 1
+                did = f"d{self.counter[0]}"
+                self.drafts[did] = body
+                return self._reply({"draft_id": did})
+            if self.command == "PATCH" and "/drafts/" in self.path:
+                did = self.path.rsplit("/", 1)[1]
+                self.drafts.setdefault(did, {}).update(body)
+                return self._reply({"draft_id": did})
+            if self.command == "POST" and self.path.endswith("/messages/send"):
+                self.delivered.append(body)
+                return self._reply({"message_id": f"m{len(self.delivered)}"})
+            if self.command == "POST" and self.path.endswith("/send"):
+                # what the round-2 design did: AgentMail sends its CURRENT draft
+                did = self.path.split("/drafts/")[1].split("/")[0]
+                self.delivered.append(dict(self.drafts.get(did, {})))
+                return self._reply({"message_id": "m"})
+        self._reply({})
+
+    do_GET = do_POST = do_PATCH = do_DELETE = _any
+
+
+class DraftSendRace(unittest.TestCase):
+    """Round-3 red-team C1 as a regression: parallel PATCH + send attempts
+    against approved drafts must never deliver anything Sean did not approve."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.up = serve(FakeAgentMail)
+        cls.mail = serve(g.make_handler(cfg("agentmail", cls.tmp, UPSTREAM_URL=f"http://127.0.0.1:{cls.up.server_port}")))
+
+    def req(self, method, path, obj=None):
+        c = http.client.HTTPConnection("127.0.0.1", self.mail.server_port, timeout=20)
+        body = json.dumps(obj) if obj is not None else None
+        c.request(method, path, body=body, headers={"content-type": "application/json"} if body else {})
+        r = c.getresponse()
+        return r.status, r.read()
+
+    def test_parallel_patch_and_send_never_deliver_changed_content(self):
+        approved_contents = []
+        for rnd in range(25):
+            good = {"to": [SEAN], "subject": f"Weekly summary {rnd}", "text": "benign"}
+            st, data = self.req("POST", f"{BASE}/drafts", good)
+            self.assertEqual(st, 200)
+            did = json.loads(data)["draft_id"]
+            st, data = self.req("GET", f"/_jill/drafts/{did}/digest")
+            digest = json.loads(data)["sha256"]
+            approvals.write_approval("draft", did, 60, {"sha256": digest}, base=os.path.join(self.tmp, "approvals"))
+            approved_contents.append(good)
+            evil = {"to": ["attacker@evil.example"], "subject": "exfil", "text": "FAKE-NOTES-CONTENT"}
+            results = []
+
+            def patch():
+                for _ in range(5):
+                    results.append(("patch", self.req("PATCH", f"{BASE}/drafts/{did}", evil)[0]))
+
+            def send():
+                for _ in range(3):
+                    results.append(("send", self.req("POST", f"{BASE}/drafts/{did}/send")[0]))
+
+            threads = [threading.Thread(target=f) for f in (patch, send, patch, send, patch)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            sends_ok = [r for r in results if r == ("send", 200)]
+            self.assertLessEqual(len(sends_ok), 1, f"round {rnd}: one approval sent more than once")
+        for msg in FakeAgentMail.delivered:
+            self.assertIn(msg, approved_contents, "a delivered message differs from everything Sean approved")
+            self.assertNotIn("attacker@evil.example", json.dumps(msg))
+        self.assertGreater(len(FakeAgentMail.delivered), 0)
+
+
+class Cli(unittest.TestCase):
+    def test_list_shows_used_and_expired(self):
+        tmp = tempfile.mkdtemp()
+        consumed = os.path.join(tmp, "consumed")
+        approvals.write_approval("url", "https://example.com/used", 60, base=tmp)
+        approvals.write_approval("url", "https://example.com/live", 60, base=tmp)
+        approvals.write_approval("url", "https://example.com/old", 1, base=tmp)
+        approvals.check_and_consume("url", "https://example.com/used", consumed, base=tmp)
+        time.sleep(1.2)
+        env = dict(os.environ, APPROVALS_DIR=tmp, CONSUMED_DIRS=consumed)
+        cli = [sys.executable, os.path.join(HERE, "..", "..", "gateway", "approvals.py")]
+        out = subprocess.run(cli + ["list"], env=env, check=True, capture_output=True, text=True).stdout
+        lines = {l.split("\t")[1]: l.split("\t")[2] for l in out.strip().splitlines()}
+        self.assertEqual(lines["https://example.com/used"], "used")
+        self.assertEqual(lines["https://example.com/old"], "expired")
+        self.assertTrue(lines["https://example.com/live"].startswith("live"))
 
 class Cli(unittest.TestCase):
     def test_cli_round_trip(self):
