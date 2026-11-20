@@ -31,15 +31,13 @@ What this repo proves today:
 | Proof-of-loop run output | `mvp-run-output.json` |
 | Open-weight model run | **Blocked on keys (issue #8)** |
 
-## The open-weight blocker
+## Model provider: Venice only
 
-The only provisioned model key today is Anthropic, so the MVP loop runs on `anthropic/claude-sonnet-4-5`. The Venice AI and OpenRouter provider blocks are already in `opencode.json`, env-gated via `{env:VENICE_API_KEY}` / `{env:OPENROUTER_API_KEY}` with open-weight model IDs staged (`zai-org-glm-5-1`, `kimi-k2-7-code`, `z-ai/glm-5.2`, `moonshotai/kimi-k2-thinking`). The swap is a one-liner once keys exist:
+Jill runs on Venice AI only (BehalfBot-open#46). `opencode.json` sets `enabled_providers: ["venice"]` and whitelists Venice models whose `privacy` is `private` (default `venice/zai-org-glm-5-2`, small model `venice/z-ai-glm-5-3-flash`). There is no Anthropic or OpenRouter block, and the heartbeat dispatcher and Discord bridge both refuse any model that is not `venice/<id>`.
 
 ```bash
-bash scripts/run.sh --model openrouter/z-ai/glm-5.2 "your prompt"
+bash scripts/run.sh --model venice/kimi-k2-7-code "your prompt"
 ```
-
-Provisioning tracked in **issue #8**. Verify exact model IDs against `opencode models venice-ai` / `opencode models openrouter` once keyed - IDs staged here come from the porting research and need confirmation against models.dev.
 
 ## Quick start (Docker - canonical)
 
@@ -72,15 +70,16 @@ Proof the containerized serve answers GLM-5.2 end to end:
 
 ```bash
 curl -fsSL https://opencode.ai/install | bash   # install opencode
-cp .env.example .env                             # fill ANTHROPIC_API_KEY
+cp .env.example .env                             # fill VENICE_API_KEY
 bash scripts/run.sh "Read AGENTS.md and tell me who you are."
 ```
 
 ## Repo layout
 
 ```
-AGENTS.md                          # Jax identity + hard limits (OpenCode reads this natively)
-opencode.json                      # providers (anthropic active, venice/openrouter env-gated), mcp, permissions
+AGENTS.md                          # Jill identity + hard limits (OpenCode reads this natively)
+opencode.json                      # Venice-only provider, pinned MCP servers, permissions
+mcp/package.json + lockfile        # MCP servers, exact versions, installed at image build
 .opencode/
   skills/brand-voice/SKILL.md      # first ported skill
   agents/software-engineering.md   # first ported subagent
