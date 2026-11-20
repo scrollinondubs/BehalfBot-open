@@ -51,6 +51,7 @@ def record(messages):
                 "denied": "[guardrails]" in body,
                 "ok": "selftest-ok" in body,
                 "canary": "[canary-loaded]" in body,
+                "escaped": "selftest-escaped" in body,
             }
     with LOCK:
         tmp = RESULTS_PATH + ".tmp"
