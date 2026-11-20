@@ -188,7 +188,9 @@ services:
     volumes:
       - approvals:/state/approvals:ro
       - agentmail-state:/state/gateway
-    networks: [jill-internal, jill-egress]
+    # jill-control: the bridge reads draft digests here to show Sean exactly
+    # what an approval would send.
+    networks: [jill-internal, jill-egress, jill-control]
     <<: *gateway
 
   fetch-gateway:
@@ -202,7 +204,7 @@ services:
     volumes:
       - approvals:/state/approvals:ro
       - fetch-state:/state/gateway
-    networks: [jill-internal, jill-egress]
+    networks: [jill-internal, jill-egress, jill-control]
     <<: *gateway
 
   siyuan-proxy:
@@ -257,9 +259,13 @@ services:
       # Sean's approvals land here (the Matrix wiring is package D). Until
       # then: docker compose exec discord-bridge python3 /app/gateway/approvals.py ...
       APPROVALS_DIR: /state/approvals
+      CONSUMED_DIRS: /state/agentmail-gw/consumed:/state/fetch-gw/consumed
     volumes:
       - bridge-state:/state/bridge
       - approvals:/state/approvals
+      # read-only: lets `approvals.py list` show used approvals
+      - agentmail-state:/state/agentmail-gw:ro
+      - fetch-state:/state/fetch-gw:ro
     depends_on:
       api-proxy:
         condition: service_healthy
@@ -294,6 +300,7 @@ services:
       OPENCODE_ATTACH_URL: http://api-proxy:4748
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
       APPROVALS_DIR: /state/approvals
+      CONSUMED_DIRS: /state/agentmail-gw/consumed:/state/fetch-gw/consumed
       DISPATCHER_INTERVAL_SECONDS: ${DISPATCHER_INTERVAL_SECONDS:-900}
       HEARTBEAT_MODEL_OPUS: ${HEARTBEAT_MODEL_OPUS:-}
       HEARTBEAT_MODEL_SONNET: ${HEARTBEAT_MODEL_SONNET:-}
@@ -308,6 +315,8 @@ services:
       - ./scripts:/app/scripts:ro
       - dispatcher-state:/state/dispatcher
       - approvals:/state/approvals
+      - agentmail-state:/state/agentmail-gw:ro
+      - fetch-state:/state/fetch-gw:ro
     depends_on:
       api-proxy:
         condition: service_healthy
@@ -343,5 +352,5 @@ volumes:
   bridge-state:     # bridge channel -> session map
   dispatcher-state: # heartbeat state, logs, telemetry, briefings
   approvals:        # Sean's one-shot approvals (bridge/dispatcher write, gateways read)
-  agentmail-state:  # consumed draft approvals
+  agentmail-state:  # draft snapshots (what a send delivers), consumed approvals
   fetch-state:      # consumed URL approvals, URL requests
