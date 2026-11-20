@@ -30,37 +30,139 @@
 # If a host port is ever genuinely needed again, add an auth token FIRST.
 # Removing the publish is the boundary; it is not defence in depth.
 #
-# CONTAINMENT (#46, after the #54 red-team): the model can run arbitrary
-# code as uid node inside opencode-serve, so nothing it must not reach may be
-# reachable from there.
+# CONTAINMENT (#46, after two red-team rounds): the model can run arbitrary
+# code inside opencode-serve, and some OpenCode code paths (prompt @file
+# expansion, LSP, formatters) run outside any guard hook. So the server
+# itself is treated as untrusted:
 #
-#   network   opencode-serve is ONLY on `jill-internal` (internal: true): no
-#             route to the internet, no external DNS. Its exits are the
-#             gateway sidecars below, each holding one upstream credential
-#             and enforcing that upstream's policy on the decoded request.
-#   secrets   no upstream key is in opencode-serve at all. It holds only the
-#             API password and per-gateway caller tokens, in the env of a
-#             root process that tool shells (uid node, empty env) cannot read.
-#   uids      the server is root with CAP_SETUID/SETGID/KILL only; every bash
-#             tool command drops to node (runtime/jill-shell). node cannot run
-#             opencode, read /proc/<server>/environ, or write the data dir.
+#   secrets   opencode-serve holds NONE: no upstream key, no API password, no
+#             caller token. Each upstream key lives only in its gateway.
+#   uid/caps  opencode-serve runs as node, non-root, no capabilities.
+#   network   jill-netns owns serve's network namespace and firewalls it
+#             (runtime/setup-netns.sh): API only from api-proxy, no loopback
+#             API, no Docker/Colima gateway host, nothing outside
+#             jill-internal. jill-internal itself has no route out.
+#   API       api-proxy (password held by bridge and dispatcher only) allows
+#             a route list: no MCP registration, shell, PTY, config writes.
+#   approval  sending email and fetching a web page need Sean's one-shot
+#             approval (gateway/approvals.py), written only by the bridge or
+#             dispatcher into a volume serve does not mount.
 #
-#   Discord -> discord-bridge -> opencode-serve -> venice-proxy -> Venice
-#                                              -> agentmail-proxy -> AgentMail
-#                                              -> siyuan-proxy -> SiYuan
-#                                              -> brave-proxy -> brave-mcp -> Brave
+#   Discord -> bridge -> api-proxy -> opencode-serve -> venice-proxy -> Venice
+#                                                    -> agentmail-proxy -> AgentMail
+#                                                    -> siyuan-proxy -> SiYuan
+#                                                    -> brave-proxy -> brave-mcp -> Brave
+#                                                    -> fetch-gateway -> approved URLs
 #
 # Secrets: compose interpolates ${VARS} from the gitignored .env in this
 # directory. Per-service `environment:` blocks, never `env_file:`, so each
-# container gets only what it needs. The caller tokens and the API password
-# are random strings generated at install (see .env.example).
+# container gets only what it needs. The API password is a random string
+# generated at install (see .env.example).
 #
 # BRIDGE_DRY_RUN defaults to 1 (bridge validates config + resolves serve,
 # never opens a Discord gateway session - the host bridge holds the single
 # Jill token). docker/cutover.sh flips it to 0 in .env at cutover time.
 
 services:
+  # --- network namespace owner and firewall for opencode-serve ---------------
+  jill-netns:
+    image: behalfbot-open:latest
+    container_name: behalfbot-jill-netns
+    user: root
+    command: ["/opt/jill/bin/setup-netns.sh"]
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      INTERNAL_SUBNET: ${JILL_INTERNAL_SUBNET:-10.231.0.0/24}
+      INTERNAL_GATEWAY: ${JILL_INTERNAL_GATEWAY:-10.231.0.1}
+      API_PROXY_IP: ${JILL_API_PROXY_IP:-10.231.0.10}
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 1
+    networks:
+      jill-internal:
+        aliases: [opencode-serve]
+    read_only: true
+    tmpfs: [/tmp, /run]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/netns-ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  # --- the model -----------------------------------------------------------
+  opencode-serve:
+    build: .
+    image: behalfbot-open:latest
+    container_name: behalfbot-opencode-serve
+    # Self-test (guards, containment, subagent, hostile cwd), then serve.
+    command: ["bash", "/app/selftest/serve-entrypoint.sh"]
+    working_dir: /app
+    network_mode: "service:jill-netns"
+    cap_drop: [ALL]
+    environment:
+      VENICE_BASE_URL: http://venice-proxy:8080/api/v1
+      BEHALFBOT_MEMORY_FILE: /data/memory.jsonl
+      JILL_EXPECT_FIREWALL: "1"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/lib/opencode/state:uid=1000,gid=1000,mode=0700
+      - /var/cache/opencode:uid=1000,gid=1000,mode=0700
+      - /home/node/.cache:uid=1000,gid=1000
+      - /home/node/.local/state:uid=1000,gid=1000
+    volumes:
+      - opencode-data:/var/lib/opencode/data
+      - serve-data:/data
+      - workspace:/workspace
+    depends_on:
+      jill-netns:
+        condition: service_healthy
+      venice-proxy:
+        condition: service_started
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # Nothing in this namespace can reach the API (by design); the
+      # entrypoint writes this file once serve is listening.
+      test: ["CMD", "test", "-f", "/tmp/serve-ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 240s
+
   # --- gateways: the only exits from jill-internal ---------------------------
+  api-proxy:
+    image: behalfbot-open:latest
+    container_name: behalfbot-api-proxy
+    command: ["python3", "/app/gateway/gateway.py"]
+    environment:
+      GATEWAY_ROUTE: api
+      UPSTREAM_URL: http://opencode-serve:4747
+      GATEWAY_LISTEN: 0.0.0.0:4748
+      GATEWAY_BASIC_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
+    networks:
+      jill-internal:
+        ipv4_address: ${JILL_API_PROXY_IP:-10.231.0.10}
+      jill-control: {}
+    depends_on:
+      opencode-serve:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -u \"opencode:$$GATEWAY_BASIC_PASSWORD\" http://127.0.0.1:4748/global/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    <<: &gateway
+      read_only: true
+      cap_drop: [ALL]
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
+
   venice-proxy:
     image: behalfbot-open:latest
     container_name: behalfbot-venice-proxy
@@ -68,16 +170,10 @@ services:
     environment:
       GATEWAY_ROUTE: venice
       UPSTREAM_KEY: ${VENICE_API_KEY:?set VENICE_API_KEY in .env}
-      GATEWAY_CALLER_TOKEN: ${VENICE_CALLER_TOKEN:?set VENICE_CALLER_TOKEN in .env}
       # Venice "private" inference only; keep in step with opencode.json.
       VENICE_MODELS: zai-org-glm-5-2,z-ai-glm-5-3-flash,zai-org-glm-5-1,kimi-k2-7-code,deepseek-v4-pro
     networks: [jill-internal, jill-egress]
-    <<: &gateway
-      read_only: true
-      cap_drop: [ALL]
-      restart: unless-stopped
-      security_opt:
-        - no-new-privileges:true
+    <<: *gateway
 
   agentmail-proxy:
     image: behalfbot-open:latest
@@ -87,8 +183,25 @@ services:
       GATEWAY_ROUTE: agentmail
       UPSTREAM_KEY: ${AGENTMAIL_API_KEY:-}
       AGENTMAIL_INBOX: ${AGENTMAIL_INBOX:-jill-agent@agentmail.to}
-      # Literal, not from .env: Sean decided Jill sends to him only (#46).
-      AGENTMAIL_RECIPIENTS: sean@grid7.com
+      APPROVALS_DIR: /state/approvals
+      GATEWAY_STATE_DIR: /state/gateway
+    volumes:
+      - approvals:/state/approvals:ro
+      - agentmail-state:/state/gateway
+    networks: [jill-internal, jill-egress]
+    <<: *gateway
+
+  fetch-gateway:
+    image: behalfbot-open:latest
+    container_name: behalfbot-fetch-gateway
+    command: ["python3", "/app/gateway/gateway.py"]
+    environment:
+      GATEWAY_ROUTE: fetch
+      APPROVALS_DIR: /state/approvals
+      GATEWAY_STATE_DIR: /state/gateway
+    volumes:
+      - approvals:/state/approvals:ro
+      - fetch-state:/state/gateway
     networks: [jill-internal, jill-egress]
     <<: *gateway
 
@@ -100,7 +213,6 @@ services:
       GATEWAY_ROUTE: siyuan
       UPSTREAM_URL: ${SIYUAN_URL:-}
       UPSTREAM_KEY: ${SIYUAN_TOKEN:-}
-      GATEWAY_CALLER_TOKEN: ${SIYUAN_CALLER_TOKEN:?set SIYUAN_CALLER_TOKEN in .env}
     networks: [jill-internal, jill-egress]
     <<: *gateway
 
@@ -123,59 +235,10 @@ services:
     environment:
       GATEWAY_ROUTE: mcp
       UPSTREAM_URL: http://brave-mcp:8080
-      GATEWAY_CALLER_TOKEN: ${BRAVE_CALLER_TOKEN:?set BRAVE_CALLER_TOKEN in .env}
     networks: [jill-internal, jill-brave]
     <<: *gateway
 
-  # --- the model -----------------------------------------------------------
-  opencode-serve:
-    build: .
-    image: behalfbot-open:latest
-    container_name: behalfbot-opencode-serve
-    # Self-test (guards, containment, subagent, hostile cwd), then serve, then
-    # prove the API refuses callers without the password. See selftest/.
-    command: ["bash", "/app/selftest/serve-entrypoint.sh"]
-    working_dir: /app
-    user: root
-    group_add: ["1500"]
-    cap_drop: [ALL]
-    cap_add: [SETUID, SETGID, KILL]
-    environment:
-      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
-      VENICE_CALLER_TOKEN: ${VENICE_CALLER_TOKEN:?set VENICE_CALLER_TOKEN in .env}
-      SIYUAN_CALLER_TOKEN: ${SIYUAN_CALLER_TOKEN:?set SIYUAN_CALLER_TOKEN in .env}
-      BRAVE_CALLER_TOKEN: ${BRAVE_CALLER_TOKEN:?set BRAVE_CALLER_TOKEN in .env}
-      VENICE_BASE_URL: http://venice-proxy:8080/api/v1
-      BEHALFBOT_MEMORY_FILE: /data/memory.jsonl
-    read_only: true
-    tmpfs:
-      - /tmp
-      - /var/lib/opencode/state:mode=0700
-      - /var/cache/opencode:mode=0700
-      - /home/node/.cache:uid=1000,gid=1000
-      - /home/node/.local/state:uid=1000,gid=1000
-    # NO ports: stanza. See the header.
-    expose:
-      - "4747"
-    volumes:
-      - opencode-data:/var/lib/opencode/data
-      - serve-data:/data
-      - workspace:/workspace
-    depends_on:
-      venice-proxy:
-        condition: service_started
-    networks: [jill-internal]
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS -u \"opencode:$$OPENCODE_SERVER_PASSWORD\" http://127.0.0.1:4747/global/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      # The guard self-test runs before serve starts listening.
-      start_period: 240s
-
+  # --- trusted callers: hold the API password and write approvals ----------
   discord-bridge:
     build: .
     image: behalfbot-open:latest
@@ -187,16 +250,20 @@ services:
       JAX_OPEN_CHANNEL_ID: ${JAX_OPEN_CHANNEL_ID:?set JAX_OPEN_CHANNEL_ID in .env}
       PRINCIPAL_USER_ID: ${PRINCIPAL_USER_ID:?set PRINCIPAL_USER_ID in .env}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-venice/zai-org-glm-5-2}
-      OPENCODE_SERVER_URL: http://opencode-serve:4747
+      OPENCODE_SERVER_URL: http://api-proxy:4748
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
       BRIDGE_SESSIONS_FILE: /state/bridge/sessions.json
       BRIDGE_DRY_RUN: ${BRIDGE_DRY_RUN:-1}
+      # Sean's approvals land here (the Matrix wiring is package D). Until
+      # then: docker compose exec discord-bridge python3 /app/gateway/approvals.py ...
+      APPROVALS_DIR: /state/approvals
     volumes:
       - bridge-state:/state/bridge
+      - approvals:/state/approvals
     depends_on:
-      opencode-serve:
+      api-proxy:
         condition: service_healthy
-    networks: [jill-internal, jill-egress]
+    networks: [jill-control, jill-egress]
     read_only: true
     cap_drop: [ALL]
     restart: unless-stopped
@@ -206,8 +273,7 @@ services:
   # Opt-in scheduled-work engine (docs/heartbeat-dispatcher.md). Start with:
   #   cp HEARTBEATS.md.template HEARTBEATS.md   # compose bind-mounts this file
   #   docker compose --profile dispatcher up -d
-  # Runs attach to opencode-serve, so tools run there, inside the containment.
-  # Group ocrun lets this container (and only this one) run the opencode CLI.
+  # Runs attach through api-proxy, so tools run in serve, inside containment.
   heartbeat-dispatcher:
     build: .
     image: behalfbot-open:latest
@@ -218,7 +284,6 @@ services:
       - -c
       - 'while true; do bash scheduled-tasks/heartbeat-dispatcher.sh || true; sleep "$${DISPATCHER_INTERVAL_SECONDS:-900}"; done'
     working_dir: /app
-    group_add: ["1600"]
     environment:
       BEHALFBOT_HOME: /app
       BEHALFBOT_STATE_HOME: /state/dispatcher
@@ -226,8 +291,9 @@ services:
       XDG_STATE_HOME: /state/dispatcher/xdg/state
       XDG_CACHE_HOME: /state/dispatcher/xdg/cache
       XDG_CONFIG_HOME: /etc/opencode-xdg
-      OPENCODE_ATTACH_URL: http://opencode-serve:4747
+      OPENCODE_ATTACH_URL: http://api-proxy:4748
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
+      APPROVALS_DIR: /state/approvals
       DISPATCHER_INTERVAL_SECONDS: ${DISPATCHER_INTERVAL_SECONDS:-900}
       HEARTBEAT_MODEL_OPUS: ${HEARTBEAT_MODEL_OPUS:-}
       HEARTBEAT_MODEL_SONNET: ${HEARTBEAT_MODEL_SONNET:-}
@@ -241,18 +307,27 @@ services:
       - ./scheduled-tasks:/app/scheduled-tasks:ro
       - ./scripts:/app/scripts:ro
       - dispatcher-state:/state/dispatcher
+      - approvals:/state/approvals
     depends_on:
-      opencode-serve:
+      api-proxy:
         condition: service_healthy
-    networks: [jill-internal, jill-egress]
+    networks: [jill-control, jill-egress]
     cap_drop: [ALL]
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
 
 networks:
-  # No route out. opencode-serve is on this network only.
+  # No route out. opencode-serve's namespace (via jill-netns) is on this
+  # network only, and firewalled further inside the namespace.
   jill-internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${JILL_INTERNAL_SUBNET:-10.231.0.0/24}
+          gateway: ${JILL_INTERNAL_GATEWAY:-10.231.0.1}
+  # api-proxy <-> bridge, dispatcher. serve is not on it.
+  jill-control:
     internal: true
   # Ordinary outbound network: gateways, bridge (Discord), dispatcher.
   jill-egress:
@@ -262,8 +337,11 @@ networks:
     internal: true
 
 volumes:
-  workspace:        # Jill's working files (node:jillwork, setgid)
-  opencode-data:    # opencode serve data dir (root 0700): sessions, history
-  serve-data:       # memory MCP jsonl (root 0700)
+  workspace:        # Jill's working files
+  opencode-data:    # opencode serve data dir: sessions, history
+  serve-data:       # memory MCP jsonl
   bridge-state:     # bridge channel -> session map
   dispatcher-state: # heartbeat state, logs, telemetry, briefings
+  approvals:        # Sean's one-shot approvals (bridge/dispatcher write, gateways read)
+  agentmail-state:  # consumed draft approvals
+  fetch-state:      # consumed URL approvals, URL requests
