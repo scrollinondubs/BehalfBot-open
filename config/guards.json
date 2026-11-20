@@ -1,7 +1,7 @@
 {
-  "_comment": "Read by .opencode/guards/policy.ts from the image's own config/ dir (root-owned, read-only). Missing or unreadable means deny. Hosts match exactly or as a dot-boundary subdomain of an entry.",
+  "_comment": "Read by .opencode/guards/policy.ts from the image's own config/ dir (root-owned, read-only). Missing or unreadable means deny. Hosts match exactly or as a dot-boundary subdomain of an entry. Defense in depth only: opencode-serve has no route to the internet; its only exits are the gateway sidecars in docker-compose.yml.",
   "egress_hosts": [
-    "api.agentmail.to"
+    "agentmail-proxy"
   ],
   "write_roots": [
     "/workspace",
