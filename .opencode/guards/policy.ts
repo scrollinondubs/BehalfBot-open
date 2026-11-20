@@ -634,7 +634,7 @@ export function mailRecipients(payloads: string[]): string[] | null {
   return out.length ? out.map((a) => a.toLowerCase()) : null
 }
 
-function agentmailSendDenied(pathname: string, payloads: string[], allowed: string[]): string | null {
+function agentmailSendDenied(pathname: string, payloads: string[]): string | null {
   let p = pathname
   for (let i = 0; i < 5; i++) {
     let next = p
@@ -647,21 +647,17 @@ function agentmailSendDenied(pathname: string, payloads: string[], allowed: stri
     p = next
   }
   p = p.toLowerCase()
-  if (/\/(reply|reply-all|reply_all|forward)(\/|$)/.test(p) || /\/drafts\/[^/]+\/send(\/|$)/.test(p))
+  // Sean's policy (2026-11-20 22:02): Jill reads her inbox and writes drafts
+  // to anyone; nothing is sent unless Sean approved that specific draft. The
+  // agentmail-proxy gateway enforces the approval; this only gives the
+  // model a clear early answer.
+  if (/\/drafts\/[^/]+\/send$/.test(p)) return null
+  if (/\/(reply|reply-all|reply_all|forward)(\/|$)/.test(p) || /\/send(\/|$)/.test(p))
     return deny(
-      "Blocked: AgentMail reply, forward and draft-send take their recipients from stored mail, so they cannot be checked. Jill may send only to Sean; anything else stays a draft for him.",
+      "Blocked: email is never sent directly. Create a draft (POST .../drafts), ask Sean to approve that draft, then POST .../drafts/<id>/send.",
     )
-  if (!/\/send(\/|$)/.test(p)) return null
-  const rcpts = mailRecipients(payloads)
-  if (!rcpts)
-    return deny(
-      "Blocked: AgentMail send whose recipients cannot be read from a literal payload (missing, from a file, or built from a variable). Write the to/cc/bcc addresses literally.",
-    )
-  const bad = rcpts.filter((r) => !allowed.includes(r))
-  if (bad.length)
-    return deny(
-      `Blocked: AgentMail send to ${bad.join(", ")}. Jill may send email only to Sean (${allowed.join(", ") || "none configured"}); anything else is a draft for Sean to approve.`,
-    )
+  if (payloads.some((d) => /send_?at|sendat|schedul/i.test(d)))
+    return deny("Blocked: drafts cannot carry a scheduled send time; sending needs Sean's approval of the draft.")
   return null
 }
 
@@ -692,7 +688,7 @@ function httpDenied(cmd: string, ctx: GuardContext): string | null {
       if (!hostAllowed(u.hostname, allow))
         return deny(`Blocked: mutating HTTP request to ${u.hostname}, which is not on config/guards.json egress_hosts. Ask Sean.`)
       if (AGENTMAIL_HOST.test(u.hostname)) {
-        const r = agentmailSendDenied(u.pathname, call.data, ctx.config?.agentmailRecipients ?? [])
+        const r = agentmailSendDenied(u.pathname, call.data)
         if (r) return r
       }
     }
@@ -894,7 +890,28 @@ export function bashDenied(cmd: string, ctx: GuardContext, depth = 0): string | 
   return null
 }
 
+// OpenCode's prompt @-reference syntax (config/markdown.ts FILE_REGEX). In a
+// `task` prompt every @path is read by the server and inlined into the
+// subagent's context through a code path that fires no tool hook
+// (session/prompt.ts "file:" parts, bypassCwdCheck). Round-2 red-team C1.
+const PROMPT_FILE_REF = /(?<![\w`])@(\.?[^\s`,.]*(?:\.[^\s`,.]+)*)/g
+const KNOWN_AGENTS = new Set(["build", "plan", "general", "explore", "software-engineering", "security-advisor", "startup-advisor"])
+
+export function taskDenied(args: Record<string, unknown>): string | null {
+  if (str(args.command))
+    return deny("Blocked: the task tool's `command` parameter expands command templates; put the instructions in the prompt instead.")
+  for (const m of str(args.prompt).matchAll(PROMPT_FILE_REF)) {
+    const name = m[1]
+    if (name && !KNOWN_AGENTS.has(name))
+      return deny(
+        `Blocked: "@${name}" in a subagent prompt makes OpenCode read that path outside every guard. Write the path without the @ and let the subagent read it with its own tools.`,
+      )
+  }
+  return null
+}
+
 export function evaluate(tool: string, args: Record<string, unknown>, ctx: GuardContext): string | null {
+  if (tool === "task") return taskDenied(args)
   if (tool === "bash") {
     const wd = str(args.workdir)
     return bashDenied(str(args.command), wd ? { ...ctx, directory: path.resolve(ctx.directory, wd) } : ctx)
@@ -940,12 +957,8 @@ export function evaluate(tool: string, args: Record<string, unknown>, ctx: Guard
     for (const rule of DM_URL_RULES) if (rule.pattern.test(urlArg)) return deny(rule.reason)
   }
 
-  if (/agentmail/i.test(tool) && /send|reply|forward/i.test(tool)) {
-    if (/reply|forward/i.test(tool) || /draft/i.test(tool))
-      return deny("Blocked: AgentMail reply, forward and draft-send cannot be checked. Jill may send only to Sean.")
-    const payload = JSON.stringify({ to: args.to, cc: args.cc, bcc: args.bcc })
-    return agentmailSendDenied("/send", [payload], ctx.config?.agentmailRecipients ?? [])
-  }
+  if (/agentmail/i.test(tool) && /send|reply|forward/i.test(tool))
+    return deny("Blocked: email is never sent directly; drafts only, and Sean approves each send.")
 
   if (/merge_pull_request$/.test(tool)) return deny("Blocked: Jill cannot merge pull requests. Sean merges.")
   if (/delete_repository$/.test(tool)) return deny("Blocked: repository deletion is prohibited.")

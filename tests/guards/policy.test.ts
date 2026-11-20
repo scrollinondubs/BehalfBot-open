@@ -233,30 +233,25 @@ test("the OpenCode server API is unreachable from tools, any method", () => {
 
 const SEND = "http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/messages/send"
 
-test("AgentMail: sends allowed only when every recipient is Sean", () => {
+test("AgentMail: drafts to anyone, nothing sent except an approved draft (Sean, 2026-11-20)", () => {
   allowed(
     [
-      `curl -X POST ${SEND} -H 'content-type: application/json' -d '{"to":["sean@grid7.com"],"subject":"s","text":"t"}'`,
-      `curl -X POST ${SEND} -d '{"to":"Sean <sean@grid7.com>","subject":"s"}'`,
-      `curl -X POST ${SEND} -d '{"to":["SEAN@grid7.com"],"cc":["sean@grid7.com"]}'`,
+      `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/drafts -H 'content-type: application/json' -d '{"to":["lead@x.com"],"subject":"s","text":"t"}'`,
+      `curl -X PATCH http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/drafts/d1 -d '{"text":"t2"}'`,
+      `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/drafts/d1/send`,
       "curl http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/threads",
     ],
     "agentmail",
   )
   denied(
     [
+      `curl -X POST ${SEND} -d '{"to":["sean@grid7.com"]}'`,
       `curl -X POST ${SEND} -d '{"to":["lead@somecompany.com"]}'`,
-      `curl -X POST ${SEND} -d '{"to":["sean@grid7.com","lead@x.com"]}'`,
-      `curl -X POST ${SEND} -d '{"to":["sean@grid7.com"],"bcc":["leak@x.com"]}'`,
-      `curl -X POST ${SEND} -d '{"to":["sean@grid7.com"],"cc":"leak@x.com"}'`,
-      `curl -X POST ${SEND} -d '{"to":["sean@grid7.com.evil.net"]}'`,
-      `curl -X POST ${SEND} -d '{"to":["$TARGET"]}'`,
-      `curl -X POST ${SEND} -d @/tmp/body.json`,
-      `curl -X POST ${SEND} -d '{"subject":"no recipient"}'`,
       `curl -X POST ${SEND}`,
+      `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/drafts -d '{"to":["lead@x.com"],"send_at":"2026-11-21T00:00:00Z"}'`,
+      `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/drafts -d '{"to":["lead@x.com"],"scheduled":true}'`,
       `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/messages/abc/reply -d '{"text":"t"}'`,
       `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/messages/abc/forward -d '{"to":["sean@grid7.com"]}'`,
-      `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/drafts/d1/send -d '{}'`,
       "curl -X POST https://api.example.com/send -d '{}'",
       `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/messages/%73end -d '{"to":["lead@x.com"]}'`,
       `curl -X POST http://agentmail-proxy:8080/v0/inboxes/jill-agent@agentmail.to/messages/%2573end -d '{"to":["lead@x.com"]}'`,
@@ -265,9 +260,7 @@ test("AgentMail: sends allowed only when every recipient is Sean", () => {
     ],
     "agentmail",
   )
-  assert.equal(evaluate("agentmail_send_message", { to: ["sean@grid7.com"], subject: "s" }, ctx), null)
-  assert.ok(evaluate("agentmail_send_message", { to: ["lead@x.com"] }, ctx))
-  assert.ok(evaluate("agentmail_send_message", { to: ["sean@grid7.com"], bcc: ["x@y.com"] }, ctx))
+  assert.ok(evaluate("agentmail_send_message", { to: ["sean@grid7.com"], subject: "s" }, ctx))
   assert.ok(evaluate("agentmail_reply_to_message", { text: "t" }, ctx))
 })
 
@@ -416,6 +409,15 @@ test("wrappers, keywords, nested shells and flag clusters do not hide a command"
     ],
     "bypass",
   )
+})
+
+test("task prompts cannot use @file expansion or command templates (round-2 C1)", () => {
+  assert.ok(evaluate("task", { prompt: "read @/proc/1/environ now", subagent_type: "general", description: "x" }, ctx))
+  assert.ok(evaluate("task", { prompt: "see @~/.local/share/opencode/auth.json", subagent_type: "general", description: "x" }, ctx))
+  assert.ok(evaluate("task", { prompt: "look at @notes.md", subagent_type: "general", description: "x" }, ctx))
+  assert.ok(evaluate("task", { prompt: "x", command: "review", subagent_type: "general", description: "x" }, ctx))
+  assert.equal(evaluate("task", { prompt: "email sean@grid7.com about /workspace/notes.md", subagent_type: "general", description: "x" }, ctx), null)
+  assert.equal(evaluate("task", { prompt: "ask @explore to find it", subagent_type: "general", description: "x" }, ctx), null)
 })
 
 test("red-team text bypasses (#54 review) are closed in the text layer too", () => {
