@@ -1,0 +1,19 @@
+#!/bin/sh
+# /opt/jill/bin/bash - the shell OpenCode runs every bash tool command with
+# (opencode.json "shell"). OpenCode calls it as: bash -c "<command>".
+#
+# opencode-serve runs as root with only SETUID/SETGID/KILL. This drops the
+# command to uid node (1000), group jillwork for /workspace, no capabilities,
+# no_new_privs, and an EMPTY environment: nothing the server holds (API
+# password, proxy caller tokens) reaches the command, whatever its name.
+# node cannot read root's /proc/<pid>/environ, so it cannot get them that
+# way either. The basename is "bash" so OpenCode treats it as bash.
+umask 002
+if [ "$(id -u)" != 0 ]; then
+  echo "jill-shell: expected to start as root (opencode-serve); refusing" >&2
+  exit 126
+fi
+exec setpriv --reuid=1000 --regid=1000 --groups=1500 --inh-caps=-all --no-new-privs -- \
+  env -i HOME=/home/node USER=node LOGNAME=node SHELL=/bin/bash LANG=C.UTF-8 TERM=dumb \
+  PATH=/usr/local/bin:/usr/bin:/bin \
+  /bin/bash "$@"

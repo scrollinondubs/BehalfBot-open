@@ -32,6 +32,7 @@ fi
 # Bare-host runs talk to Venice directly; the Docker stack points this at the
 # venice-proxy sidecar instead, which holds the key.
 export VENICE_BASE_URL="${VENICE_BASE_URL:-https://api.venice.ai/api/v1}"
+export VENICE_CALLER_TOKEN="${VENICE_CALLER_TOKEN:-$VENICE_API_KEY}"
 
 # Default memory MCP store to a repo-local gitignored path.
 export BEHALFBOT_MEMORY_FILE="${BEHALFBOT_MEMORY_FILE:-$REPO_DIR/memory/memory.jsonl}"
