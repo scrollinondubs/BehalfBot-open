@@ -189,6 +189,47 @@ class AgentMail(unittest.TestCase):
         self.assertEqual(out.obj["sha256"], approvals.draft_digest(self.draft))
         self.assertEqual(out.obj["content"], self.draft)
 
+    def test_control_characters_refused_in_every_header_bound_field(self):
+        bad = [
+            J(to=["sean@grid7.com\n"]), J(to=["sean@grid7.com\x00"]), J(to=["\tsean@grid7.com"]),
+            J(subject="hi\r\nBcc: attacker@evil.example"), J(subject="a\x00b"), J(labels=["x\ny"]),
+            J(in_reply_to="<a@b>\r\nBcc: attacker@evil.example"), J(in_reply_to="a@b"), J(in_reply_to="<a@b> <c@d>"),
+            J(attachments=[{"filename": "a\r\nX: y", "content": "QUJD"}]),
+            J(attachments=[{"content_type": "text/plain\n", "content": "QUJD"}]),
+            J(attachments=[{"filename": "a", "content": "not base64!"}]),
+            J(text="ok\x00"), J(html="<p>\x1b[31m</p>"),
+            J(attachments=5), J(attachments=[5]), J(attachments=[{"filename": 5}]), J(labels="x"), J(subject=5),
+        ]
+        for body in bad:
+            self.deny("POST", BASE + "/drafts", body)
+            self.deny("PATCH", BASE + "/drafts/d1", body)
+
+    def test_addresses_and_bodies_are_normalised_and_forwarded_normalised(self):
+        f = run(self.c, "POST", BASE + "/drafts",
+                J(to=[" Lead@Example.COM "], cc="Sean@GRID7.com", text="line 1\nline 2\ttabbed", in_reply_to="<m1@x>"))
+        self.assertEqual(f.body, {"to": ["Lead@example.com"], "cc": "Sean@grid7.com",
+                                  "text": "line 1\nline 2\ttabbed", "in_reply_to": "<m1@x>"})
+
+    def test_post_cannot_overwrite_a_live_approved_snapshot(self):
+        self.approve()
+        f = run(self.c, "POST", BASE + "/drafts", J(to=["attacker@evil.example"], subject="x"))
+        with self.assertRaises(g.Deny):
+            f.after(200, json.dumps({"draft_id": "d1"}).encode())  # upstream reuses the id
+        self.assertEqual(g.load_snapshot(self.ctx, "d1"), self.draft)
+
+    def test_lock_map_is_bounded(self):
+        self.assertEqual(len({id(g.draft_lock(f"x{i}")) for i in range(5000)}), len(g._STRIPES))
+        self.assertIs(g.draft_lock("same"), g.draft_lock("same"))
+
+    def test_old_snapshots_are_pruned(self):
+        for i in range(3):
+            g.save_snapshot(self.ctx, f"old{i}", self.draft)
+        old = g._snapshot_path(self.ctx, "old0")
+        os.utime(old, (time.time() - g.SNAPSHOT_TTL - 10,) * 2)
+        g.save_snapshot(self.ctx, "fresh", self.draft)
+        self.assertFalse(os.path.exists(old))
+        self.assertIsNotNone(g.load_snapshot(self.ctx, "old1"))
+
     def test_in_reply_to_becomes_threading_headers(self):
         self.assertEqual(g.send_body({"to": ["a@x.com"], "in_reply_to": "<m1@x>"}),
                          {"to": ["a@x.com"], "headers": {"In-Reply-To": "<m1@x>", "References": "<m1@x>"}})
@@ -373,6 +414,9 @@ class FakeAgentMail(BaseHTTPRequestHandler):
                 did = self.path.rsplit("/", 1)[1]
                 self.drafts.setdefault(did, {}).update(body)
                 return self._reply({"draft_id": did})
+            if self.command == "DELETE" and "/drafts/" in self.path:
+                self.drafts.pop(self.path.rsplit("/", 1)[1], None)
+                return self._reply({})
             if self.command == "POST" and self.path.endswith("/messages/send"):
                 self.delivered.append(body)
                 return self._reply({"message_id": f"m{len(self.delivered)}"})
@@ -436,6 +480,39 @@ class DraftSendRace(unittest.TestCase):
             self.assertIn(msg, approved_contents, "a delivered message differs from everything Sean approved")
             self.assertNotIn("attacker@evil.example", json.dumps(msg))
         self.assertGreater(len(FakeAgentMail.delivered), 0)
+
+
+class SendCleanup(unittest.TestCase):
+    def test_draft_and_snapshot_removed_after_a_send(self):
+        tmp = tempfile.mkdtemp()
+        up = serve(FakeAgentMail)
+        mail = serve(g.make_handler(cfg("agentmail", tmp, UPSTREAM_URL=f"http://127.0.0.1:{up.server_port}")))
+
+        def req(method, path, obj=None):
+            c = http.client.HTTPConnection("127.0.0.1", mail.server_port, timeout=10)
+            body = json.dumps(obj) if obj is not None else None
+            c.request(method, path, body=body, headers={"content-type": "application/json"} if body else {})
+            r = c.getresponse()
+            return r.status, r.read()
+
+        st, data = req("POST", f"{BASE}/drafts", {"to": [SEAN], "subject": "cleanup", "text": "x"})
+        did = json.loads(data)["draft_id"]
+        digest = json.loads(req("GET", f"/_jill/drafts/{did}/digest")[1])["sha256"]
+        approvals.write_approval("draft", did, 60, {"sha256": digest}, base=os.path.join(tmp, "approvals"))
+        self.assertEqual(req("POST", f"{BASE}/drafts/{did}/send")[0], 200)
+        self.assertNotIn(did, FakeAgentMail.drafts)
+        self.assertEqual(req("GET", f"/_jill/drafts/{did}/digest")[0], 404)
+
+    def test_bridge_digest_cli_reads_the_snapshot_mount(self):
+        tmp = tempfile.mkdtemp()
+        ctx = {"state_dir": tmp}
+        content = {"to": [SEAN], "subject": "s", "text": "t"}
+        g.save_snapshot(ctx, "d9", content)
+        env = dict(os.environ, SNAPSHOT_DIR=os.path.join(tmp, "drafts"))
+        cli = [sys.executable, os.path.join(HERE, "..", "..", "gateway", "approvals.py")]
+        out = json.loads(subprocess.run(cli + ["digest", "d9"], env=env, check=True, capture_output=True, text=True).stdout)
+        self.assertEqual(out["sha256"], approvals.draft_digest(content))
+        self.assertEqual(out["content"], content)
 
 
 class Cli(unittest.TestCase):

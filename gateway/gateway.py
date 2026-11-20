@@ -209,36 +209,91 @@ ATTACHMENT_KEYS = {"filename", "content_type", "content", "content_disposition",
 READ_QUERY = {"limit", "page_token", "labels", "before", "after", "ascending"}
 
 
+# C0 controls and DEL. Bodies may carry newlines and tabs; nothing else may
+# carry any control character (round-4 red-team N1: CR/LF in subject,
+# labels, attachment names or in_reply_to could become extra MIME headers).
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+BODY_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+MESSAGE_ID = re.compile(r"^<[^<>\s\x00-\x1f\x7f]{1,250}>$")
+
+
+def _text(v, what, body=False):
+    if not isinstance(v, str):
+        raise Deny(400, f"{what} must be a string")
+    if (BODY_CONTROL if body else CONTROL).search(v):
+        raise Deny(400, f"{what} contains control characters")
+    return v
+
+
 def _addresses(v, what):
+    """Plain addresses only; returned stripped, with the domain lower-cased."""
     items = v if isinstance(v, list) else [v]
+    out = []
     for it in items:
-        if not isinstance(it, str) or not EMAIL.match(it.strip()):
+        if not isinstance(it, str):
             raise Deny(400, f"{what} must be plain email addresses")
+        a = it.strip(" ")
+        if CONTROL.search(a) or not EMAIL.match(a):
+            raise Deny(400, f"{what} must be plain email addresses")
+        local, _, domain = a.rpartition("@")
+        out.append(f"{local}@{domain.lower()}")
+    return out if isinstance(v, list) else out[0]
 
 
 def validate_draft(data):
+    """Validate and NORMALISE a draft; the normalised form is what is
+    forwarded, snapshotted, digested and sent."""
     only_keys(data, DRAFT_KEYS, "draft")
+    out = {}
     for k in ("to", "cc", "bcc", "reply_to"):
         if k in data:
-            _addresses(data[k], k)
-    for k in ("subject", "text", "html", "in_reply_to"):
-        if k in data and not isinstance(data[k], str):
-            raise Deny(400, f"{k} must be a string")
-    if "labels" in data and not (isinstance(data["labels"], list) and all(isinstance(x, str) for x in data["labels"])):
-        raise Deny(400, "labels must be a list of strings")
-    for a in data.get("attachments") or []:
-        only_keys(a, ATTACHMENT_KEYS, "attachment")
-    return data
+            out[k] = _addresses(data[k], k)
+    if "subject" in data:
+        out["subject"] = _text(data["subject"], "subject")
+    for k in ("text", "html"):
+        if k in data:
+            out[k] = _text(data[k], k, body=True)
+    if "in_reply_to" in data:
+        v = _text(data["in_reply_to"], "in_reply_to")
+        if not MESSAGE_ID.match(v):
+            raise Deny(400, "in_reply_to must be a single message id like <id@host>")
+        out["in_reply_to"] = v
+    if "labels" in data:
+        if not isinstance(data["labels"], list):
+            raise Deny(400, "labels must be a list of strings")
+        out["labels"] = [_text(x, "label") for x in data["labels"]]
+    if "attachments" in data:
+        atts = data["attachments"]
+        if not isinstance(atts, list):
+            raise Deny(400, "attachments must be a list")
+        clean = []
+        for a in atts:
+            only_keys(a, ATTACHMENT_KEYS, "attachment")
+            c = {}
+            for k in ("filename", "content_type", "content_disposition", "content_id"):
+                if k in a:
+                    c[k] = _text(a[k], f"attachment {k}")
+            if "content" in a:
+                content = a["content"]
+                if not isinstance(content, str) or not re.fullmatch(r"[A-Za-z0-9+/=\r\n]*", content):
+                    raise Deny(400, "attachment content must be base64")
+                c["content"] = content
+            clean.append(c)
+        out["attachments"] = clean
+    return out
 
 
-# Per-draft locks: a draft's edit, delete and send never overlap.
-_LOCKS = {}
-_LOCKS_GUARD = threading.Lock()
+# Per-draft locks: a draft's edit, delete and send never overlap. A fixed
+# set of striped locks keeps memory bounded whatever ids callers send.
+_STRIPES = [threading.Lock() for _ in range(256)]
 
 
 def draft_lock(draft_id):
-    with _LOCKS_GUARD:
-        return _LOCKS.setdefault(draft_id, threading.Lock())
+    return _STRIPES[int(approvals.key_for("draft", draft_id)[:8], 16) % len(_STRIPES)]
+
+
+SNAPSHOT_TTL = 30 * 24 * 3600
+SNAPSHOT_QUOTA = 512 * 1024 * 1024
 
 
 def _snapshot_path(ctx, draft_id):
@@ -254,6 +309,31 @@ def load_snapshot(ctx, draft_id):
     return rec["content"] if rec.get("draft_id") == draft_id else None
 
 
+def prune_snapshots(ctx, keep=None):
+    """Drop snapshots older than SNAPSHOT_TTL, then oldest-first past the quota."""
+    d = os.path.join(ctx["state_dir"], "drafts")
+    try:
+        entries = [(e.stat().st_mtime, e.stat().st_size, e.path) for e in os.scandir(d) if e.is_file()]
+    except OSError:
+        return
+    now = time.time()
+    total = 0
+    for mtime, size, path_ in sorted(entries, reverse=True):
+        total += size
+        if path_ != keep and (now - mtime > SNAPSHOT_TTL or total > SNAPSHOT_QUOTA):
+            try:
+                os.remove(path_)
+            except OSError:
+                pass
+
+
+def remove_snapshot(ctx, draft_id):
+    try:
+        os.remove(_snapshot_path(ctx, draft_id))
+    except FileNotFoundError:
+        pass
+
+
 def save_snapshot(ctx, draft_id, content):
     p = _snapshot_path(ctx, draft_id)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -261,6 +341,7 @@ def save_snapshot(ctx, draft_id, content):
     with open(tmp, "w") as f:
         json.dump({"draft_id": draft_id, "content": approvals.sendable(content)}, f)
     os.replace(tmp, p)
+    prune_snapshots(ctx, keep=p)
 
 
 def send_body(content):
@@ -278,7 +359,9 @@ def agentmail_policy(ctx, method, path, body):
     of the draft, then asking AgentMail to send "the draft", let a PATCH
     land between the check and the send. Now:
       - every draft written through this gateway is snapshotted here (the
-        validated, re-serialised content, attachment bytes included);
+        validated, normalised content, attachment bytes included); a draft
+        made elsewhere becomes sendable only through a gateway PATCH, and
+        then what goes out is that snapshot, never the outside draft;
         Sean approves the sha256 of that snapshot (GET /_jill/.../digest)
       - a send verifies the approval against the snapshot and then POSTs
         the snapshot itself to messages/send: AgentMail's draft is not what
@@ -313,6 +396,8 @@ def agentmail_policy(ctx, method, path, body):
                 except (ValueError, KeyError, TypeError):
                     return
                 with draft_lock(draft_id):
+                    if approvals.status("draft", draft_id, [ctx["consumed_dir"]], base=ctx["approvals_dir"]) == "live":
+                        raise Deny(409, "AgentMail returned the id of a draft Sean has approved; its snapshot was not changed")
                     save_snapshot(ctx, draft_id, draft)
 
         return Forward("POST", path, body=draft, after=remember)
@@ -326,7 +411,7 @@ def agentmail_policy(ctx, method, path, body):
         try:
             if approvals.status("draft", draft_id, [ctx["consumed_dir"]], base=ctx["approvals_dir"]) == "live":
                 raise Deny(409, "Sean has approved this draft as it is; it cannot change until it is sent or the approval expires")
-        except Deny:
+        except BaseException:
             lock.release()
             raise
 
@@ -334,10 +419,7 @@ def agentmail_policy(ctx, method, path, body):
             if not 200 <= status < 300:
                 return
             if method == "DELETE":
-                try:
-                    os.remove(_snapshot_path(ctx, draft_id))
-                except FileNotFoundError:
-                    pass
+                remove_snapshot(ctx, draft_id)
             else:
                 merged = dict(load_snapshot(ctx, draft_id) or {})
                 merged.update(patch)
@@ -367,10 +449,20 @@ def agentmail_policy(ctx, method, path, body):
                                             verify=same_draft)
             except LookupError as e:
                 raise Deny(403, f"not sent: {e}. Ask Sean to approve draft {draft_id}")
-        except Deny:
+        except BaseException:
             lock.release()
             raise
-        return Forward("POST", f"{base}/messages/send", body=send_body(content), release=lock.release)
+
+        def cleanup(status, resp):
+            # Sent: the draft and its snapshot are done (round-4 N6).
+            if 200 <= status < 300:
+                remove_snapshot(ctx, draft_id)
+                try:
+                    ctx["upstream_call"]("DELETE", f"{base}/drafts/{draft_id}")
+                except Deny:
+                    pass
+
+        return Forward("POST", f"{base}/messages/send", body=send_body(content), after=cleanup, release=lock.release)
 
     raise Deny(403, "not allowed: Jill reads her inbox and writes drafts; sending needs Sean's approval of the draft")
 
@@ -569,6 +661,18 @@ def make_handler(cfg):
         except ValueError:
             raise Deny(502, "upstream returned non-JSON")
 
+    def upstream_call(method, path):
+        conn = connect(up, timeout=30)
+        try:
+            conn.request(method, (up.path.rstrip("/") + quote(path, safe="/@:")) or "/", headers=upstream_headers())
+            resp = conn.getresponse()
+            resp.read(MAX_BODY)
+            return resp.status
+        except OSError:
+            raise Deny(502, "upstream unreachable")
+        finally:
+            conn.close()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "jill-gateway"
         sys_version = ""
@@ -615,11 +719,11 @@ def make_handler(cfg):
                 shown = path
                 self._check_headers()
                 body = self._read_body()
-                ctx = dict(cfg, raw_path=self.path, upstream_json=upstream_json)
+                ctx = dict(cfg, raw_path=self.path, upstream_json=upstream_json, upstream_call=upstream_call)
                 decision = cfg["policy"](ctx, self.command, path, body)
             except Deny as d:
                 return self._json(d.status, {"error": d.reason}, shown, d.reason)
-            except (ValueError, OSError):
+            except (ValueError, OSError, TypeError, AttributeError, KeyError):
                 return self._json(400, {"error": "bad request"}, shown)
             if isinstance(decision, Local):
                 if decision.status == "fetch":
@@ -650,7 +754,10 @@ def make_handler(cfg):
                 if decision.after:
                     data = resp.read(MAX_BODY)
                     conn.close()
-                    decision.after(resp.status, data)
+                    try:
+                        decision.after(resp.status, data)
+                    except Deny as d:
+                        return self._json(d.status, {"error": d.reason}, shown, d.reason)
                     self.send_response(resp.status)
                     for k, v in resp.getheaders():
                         if k.lower() in FWD_RESP_HEADERS:

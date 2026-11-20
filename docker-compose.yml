@@ -188,9 +188,7 @@ services:
     volumes:
       - approvals:/state/approvals:ro
       - agentmail-state:/state/gateway
-    # jill-control: the bridge reads draft digests here to show Sean exactly
-    # what an approval would send.
-    networks: [jill-internal, jill-egress, jill-control]
+    networks: [jill-internal, jill-egress]
     <<: *gateway
 
   fetch-gateway:
@@ -204,7 +202,7 @@ services:
     volumes:
       - approvals:/state/approvals:ro
       - fetch-state:/state/gateway
-    networks: [jill-internal, jill-egress, jill-control]
+    networks: [jill-internal, jill-egress]
     <<: *gateway
 
   siyuan-proxy:
@@ -263,13 +261,15 @@ services:
     volumes:
       - bridge-state:/state/bridge
       - approvals:/state/approvals
-      # read-only: lets `approvals.py list` show used approvals
+      # read-only: `approvals.py list` shows used approvals, and
+      # `approvals.py digest <id>` shows Sean exactly what a send delivers,
+      # with no network path to the gateways
       - agentmail-state:/state/agentmail-gw:ro
       - fetch-state:/state/fetch-gw:ro
     depends_on:
       api-proxy:
         condition: service_healthy
-    networks: [jill-control, jill-egress]
+    networks: [jill-control, jill-callers]
     read_only: true
     cap_drop: [ALL]
     restart: unless-stopped
@@ -320,7 +320,7 @@ services:
     depends_on:
       api-proxy:
         condition: service_healthy
-    networks: [jill-control, jill-egress]
+    networks: [jill-control, jill-callers]
     cap_drop: [ALL]
     restart: unless-stopped
     security_opt:
@@ -338,8 +338,12 @@ networks:
   # api-proxy <-> bridge, dispatcher. serve is not on it.
   jill-control:
     internal: true
-  # Ordinary outbound network: gateways, bridge (Discord), dispatcher.
+  # Ordinary outbound network for the gateways.
   jill-egress:
+    driver: bridge
+  # Outbound for the bridge (Discord) and dispatcher (webhooks), kept apart
+  # from the gateways, which parse model-controlled input.
+  jill-callers:
     driver: bridge
   # brave-proxy <-> brave-mcp only; opencode-serve is not on it.
   jill-brave:

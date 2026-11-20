@@ -28,9 +28,10 @@ CLI (testing, and the manual path until the Matrix bridge lands):
   approvals.py list
   approvals.py revoke <kind> <key>
 
-The digest for a draft comes from agentmail-proxy:
-  GET /_jill/drafts/<draft_id>/digest   (the exact content a send will
-  deliver, and its sha256). A send delivers that stored content, not
+The digest for a draft: `approvals.py digest <draft_id>` in the bridge or
+dispatcher, reading agentmail-proxy's snapshot from a read-only mount (the
+exact content a send will deliver, and its sha256). The gateway also serves
+it at GET /_jill/drafts/<draft_id>/digest. A send delivers that stored content, not
   whatever AgentMail's copy of the draft holds at the time.
 """
 import argparse
@@ -152,12 +153,26 @@ def main(argv=None):
     u = sub.add_parser("approve-url")
     u.add_argument("url")
     u.add_argument("--ttl", type=int, default=600)
+    dg = sub.add_parser("digest", help="show a draft's snapshot and sha256 (what a send would deliver)")
+    dg.add_argument("draft_id")
     sub.add_parser("list")
     r = sub.add_parser("revoke")
     r.add_argument("kind", choices=["draft", "url"])
     r.add_argument("value")
     a = ap.parse_args(argv)
 
+    if a.cmd == "digest":
+        snap_dir = os.environ.get("SNAPSHOT_DIR", "/state/agentmail-gw/drafts")
+        try:
+            with open(os.path.join(snap_dir, key_for("draft", a.draft_id) + ".json")) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            sys.exit("no snapshot for that draft (only drafts written through agentmail-proxy can be sent)")
+        if rec.get("draft_id") != a.draft_id:
+            sys.exit("snapshot does not match that draft id")
+        content = sendable(rec["content"])
+        print(json.dumps({"draft_id": a.draft_id, "content": content, "sha256": draft_digest(content)}, indent=2))
+        return
     if a.cmd == "approve-draft":
         if not DRAFT_ID.match(a.draft_id) or not re.fullmatch(r"[0-9a-f]{64}", a.sha256):
             sys.exit("draft id or sha256 is malformed")
