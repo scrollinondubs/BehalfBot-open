@@ -83,7 +83,12 @@ mcp/package.json + lockfile        # MCP servers, exact versions, installed at i
 .opencode/
   skills/brand-voice/SKILL.md      # first ported skill
   agents/software-engineering.md   # first ported subagent
-  plugins/guardrails.ts            # TS port of the bash guardrail hooks
+  plugins/guardrails.ts            # wires the guards into OpenCode (one export only)
+  guards/policy.ts                 # the deny rules: secrets, egress, AgentMail, writes, rm, git
+config/guards.json                 # egress hosts, write roots, AgentMail recipients (read-only in the image)
+selftest/                          # boot self-test: real opencode run against a scripted model
+docker/venice-proxy.conf.template  # sidecar that holds the Venice key
+tests/                             # unit tests (node --test) and shell tests
   instructions/response-style.md   # loaded via the instructions array
 config/security-allowlist.json     # authorized security-scan targets
 scripts/run.sh                     # headless wrapper (claude -p analog)
