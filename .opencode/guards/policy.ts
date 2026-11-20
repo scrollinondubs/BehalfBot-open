@@ -911,19 +911,25 @@ export function evaluate(tool: string, args: Record<string, unknown>, ctx: Guard
     return null
   }
 
-  if (tool === "read") {
-    const p = str(args.filePath ?? args.file_path)
-    if (isSecretPath(p) || isSecretPath(path.resolve(ctx.directory, p)))
-      return deny(`secret-print-guard: reading ${p} would put secret values in the transcript.`)
-    return null
-  }
-  if (tool === "grep") {
-    const p = str(args.path)
+  // read/grep/glob run inside the SERVER process (root, cap-dropped), not in
+  // the uid-dropped shell, so a symlink a tool shell plants in /workspace
+  // (-> /proc/self/environ, the data dir) would be followed with the
+  // server's rights. Resolve the real target and allow only the app tree
+  // and the writable roots.
+  if (tool === "read" || tool === "grep" || tool === "glob") {
+    const p = str(args.filePath ?? args.file_path ?? args.path)
     const inc = str(args.include)
-    if ((p && isSecretPath(p)) || (inc && /\.env|auth\.json|\.pem|\.key|credentials|environ/.test(inc)))
+    if (tool === "grep" && inc && /\.env|auth\.json|\.pem|\.key|credentials|environ/.test(inc))
       return deny("secret-print-guard: grepping secret-bearing files prints their values.")
-    if (p && /^\/proc(\/|$)/.test(path.resolve(ctx.directory, p)))
-      return deny("secret-print-guard: grepping /proc reads process environments.")
+    if (!p) return null
+    const abs = path.resolve(ctx.directory, p)
+    const real = realish(abs)
+    if (isSecretPath(p) || isSecretPath(abs) || isSecretPath(real))
+      return deny(`secret-print-guard: reading ${p} would put secret values in the transcript.`)
+    const roots = [ctx.appRoot, ...(ctx.config?.writeRoots ?? [])]
+    const under = (x: string) => roots.some((r) => x === r || x.startsWith(r.replace(/\/+$/, "") + "/") || x === realish(r) || x.startsWith(realish(r) + "/"))
+    if (!under(abs) || !under(real))
+      return deny(`Blocked: ${p} resolves to ${real}, outside the readable directories (${roots.join(", ")}).`)
     return null
   }
 

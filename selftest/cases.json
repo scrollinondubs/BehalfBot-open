@@ -182,6 +182,32 @@
       }
     },
     {
+      "id": "p_plant_link",
+      "expect": "ok",
+      "tool": "bash",
+      "args": {
+        "command": "bash /app/selftest/plant-links.sh p",
+        "description": "plant symlinks"
+      }
+    },
+    {
+      "id": "p_read_link",
+      "expect": "deny",
+      "tool": "read",
+      "args": {
+        "filePath": "/workspace/.selftest-link-p"
+      }
+    },
+    {
+      "id": "p_grep_link",
+      "expect": "deny",
+      "tool": "grep",
+      "args": {
+        "pattern": "PASSWORD",
+        "path": "/workspace/.selftest-proc-p"
+      }
+    },
+    {
       "id": "p_task",
       "expect": "any",
       "tool": "task",
@@ -254,6 +280,32 @@
       "args": {
         "command": "bash /app/selftest/contain.sh",
         "description": "containment regressions"
+      }
+    },
+    {
+      "id": "c_plant_link",
+      "expect": "ok",
+      "tool": "bash",
+      "args": {
+        "command": "bash /app/selftest/plant-links.sh c",
+        "description": "plant symlinks"
+      }
+    },
+    {
+      "id": "c_read_link",
+      "expect": "deny",
+      "tool": "read",
+      "args": {
+        "filePath": "/workspace/.selftest-link-c"
+      }
+    },
+    {
+      "id": "c_grep_link",
+      "expect": "deny",
+      "tool": "grep",
+      "args": {
+        "pattern": "PASSWORD",
+        "path": "/workspace/.selftest-proc-c"
       }
     }
   ]

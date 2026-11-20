@@ -314,6 +314,25 @@ test("file writes: a symlink cannot launder a protected target", () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test("read/grep/glob: a symlink planted by the shell cannot point the server-run tools elsewhere", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-"))
+  const ws = path.join(dir, "workspace")
+  const secret = path.join(dir, "outside")
+  fs.mkdirSync(ws)
+  fs.mkdirSync(secret)
+  fs.writeFileSync(path.join(secret, "data.txt"), "x")
+  fs.symlinkSync(path.join(secret, "data.txt"), path.join(ws, "innocent.txt"))
+  fs.symlinkSync(secret, path.join(ws, "dirlink"))
+  fs.writeFileSync(path.join(ws, "notes.txt"), "x")
+  const c: GuardContext = { directory: ws, appRoot: "/app", home: "/home/node", config: { ...config!, writeRoots: [ws] } }
+  assert.ok(evaluate("read", { filePath: path.join(ws, "innocent.txt") }, c))
+  assert.ok(evaluate("grep", { pattern: "x", path: path.join(ws, "dirlink") }, c))
+  assert.ok(evaluate("glob", { pattern: "*", path: path.join(ws, "dirlink") }, c))
+  assert.equal(evaluate("read", { filePath: path.join(ws, "notes.txt") }, c), null)
+  assert.ok(evaluate("read", { filePath: "/var/lib/opencode/data/storage/x.json" }, c))
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test("apply_patch: every Add/Update/Delete/Move path is checked", () => {
   const patch = (body: string) => evaluate("apply_patch", { patchText: `*** Begin Patch\n${body}\n*** End Patch` }, ctx)
   assert.deepEqual(patchPaths("*** Begin Patch\n*** Update File: a.ts\n*** Move to: b.ts\n*** End Patch"), ["a.ts", "b.ts"])

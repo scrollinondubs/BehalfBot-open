@@ -133,7 +133,7 @@ for dir in "$APP" "$ELSEWHERE"; do
 }
 EOF
 )
-  rm -f /workspace/.selftest-write-check /workspace/.selftest-exec.sh 2>/dev/null
+  rm -f /workspace/.selftest-write-check /workspace/.selftest-exec.sh /workspace/.selftest-link-* /workspace/.selftest-proc-* 2>/dev/null
   mkdir -p "$WORK/data" "$WORK/state" "$WORK/cache"
   (
     cd "$dir" || exit 1
@@ -153,6 +153,9 @@ import json, sys
 cases = json.load(open(sys.argv[1]))
 res = json.load(open(sys.argv[2]))
 bad = 0
+if any(r.get("leak") for r in res.values()):
+    print("[selftest] FAIL a tool result contained the server's password or caller token names")
+    bad += 1
 if any(r.get("canary") for r in res.values()):
     print("[selftest] FAIL a plugin planted in the session directory was LOADED")
     bad += 1
@@ -181,7 +184,7 @@ for scope in ("parent", "child"):
 sys.exit(1 if bad else 0)
 PY
   if [[ -d /workspace ]]; then
-    rm -f /workspace/.selftest-exec.sh
+    rm -f /workspace/.selftest-exec.sh /workspace/.selftest-link-* /workspace/.selftest-proc-*
     if [[ -f /workspace/.selftest-write-check ]]; then
       rm -f /workspace/.selftest-write-check
     else
