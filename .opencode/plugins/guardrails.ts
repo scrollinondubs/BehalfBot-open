@@ -1,5 +1,5 @@
 /**
- * guardrails.ts - deterministic safety guardrails for Jax on OpenCode.
+ * guardrails.ts - deterministic safety guardrails for Jill on OpenCode.
  *
  * Port of the Claude Code chassis PreToolUse hooks:
  *   .claude/hooks/guardrails.sh            (bash + MCP tool guards)
@@ -10,7 +10,8 @@
  * which is the analog of the PreToolUse permissionDecision: "deny" JSON.
  *
  * MCP tool naming (issue #3, RESOLVED - verified against opencode v1.17.13
- * source, the pinned version of this install):
+ * source and re-read on v1.19.6, the pinned version of this install, in
+ * packages/opencode/src/mcp/catalog.ts):
  *   runtime tool name = sanitize(serverName) + "_" + sanitize(toolName)
  *   sanitize = (s) => s.replace(/[^a-zA-Z0-9_-]/g, "_")
  * (packages/opencode/src/mcp/catalog.ts toolName/sanitize; the registry key
@@ -265,7 +266,7 @@ export const GuardrailsPlugin: Plugin = async ({ worktree }) => {
       // ---- GitHub MCP guards --------------------------------------------
       if (/merge_pull_request$/.test(tool)) {
         throw new Error(
-          "Blocked: Jax cannot merge pull requests. PRs must be reviewed and merged by Sean.",
+          "Blocked: Jill cannot merge pull requests. PRs must be reviewed and merged by Sean.",
         )
       }
       if (/delete_repository$/.test(tool)) {
@@ -303,7 +304,7 @@ export const GuardrailsPlugin: Plugin = async ({ worktree }) => {
           .join(" ")
         if (/Sean[ _/-]*Private/i.test(rmArgs)) {
           throw new Error(
-            "Blocked: /Sean Private/ on the reMarkable is off-limits to Jax. Enforced by REMARKABLE_ROOT_PATH=/Jax plus this guardrail.",
+            "Blocked: /Sean Private/ on the reMarkable is off-limits to Jill. Enforced by REMARKABLE_ROOT_PATH=/Jax plus this guardrail.",
           )
         }
       }

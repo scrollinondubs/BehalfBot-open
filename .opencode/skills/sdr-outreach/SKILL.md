@@ -75,7 +75,7 @@ Principles:
 - **Short** - under 150 words
 - **Plain** - no marketing language, no emojis. Run the draft through the `brand-voice` skill.
 - **Human-sounding** - after brand-voice, strip AI tells (em dashes, synonym cycling, filler phrases)
-- **From Jill** - use `jax@vibecodelisboa.com` as the from address (shared assistant identity). Sign off as `Jax - Sean's AI assistant`. Never sign as Sean.
+- **From Jill** - drafts only, from `jill-agent@agentmail.to`. Sign off as `Jill / Sean's assistant`. Never sign as Sean, and never send: the AgentMail gate only lets mail go to Sean.
 - **Check cohort availability** - before mentioning Build School, query Turso for the next upcoming cohort (start date in the future) and open spots. Only mention it if signups are actually open with available space. Reference the correct cohort number and start date. Never mention a cohort already in progress. **Requires capability grant (deferred): Turso.**
 
 Templates:
