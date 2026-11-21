@@ -34,7 +34,7 @@ jobs:
         run: python3 -m unittest discover -s tests/gateway -v
       - name: Kill switch, alert spool, credential expiry (jill-control vs a fake homeserver)
         run: python3 -m unittest discover -s tests/control -v
-      - name: Dispatcher controls (halt, caps, spend cap, all-failed alarm, state lock)
+      - name: Dispatcher controls (halt, caps, spend cap, all-failed alarm, state lock; heartbeats ship off)
         run: bash scheduled-tasks/dispatcher-selftest.sh
 
   selftest:

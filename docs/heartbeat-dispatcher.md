@@ -86,7 +86,7 @@ Docker (canonical): the compose stack ships an opt-in `heartbeat-dispatcher` ser
 
 ```bash
 cp HEARTBEATS.md.template HEARTBEATS.md   # compose bind-mounts this file
-docker compose --profile dispatcher up -d
+docker compose --profile heartbeats up -d
 ```
 
 ## Triggers (deterministic keyword dispatch)

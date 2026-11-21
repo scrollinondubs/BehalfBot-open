@@ -93,8 +93,11 @@ if t curl -s http://brave-mcp:8080/mcp; then out brave-mcp-direct; fi
 # live in volumes serve never mounts, behind a sidecar serve cannot reach. If
 # serve could write a flag it could lift its own halt; if it could write the
 # spool, alerts would be an egress path to Sean's homeserver.
-for d in /state/control /state/alerts /state/credentials; do
-  if [ -e "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then out "control-volume-mounted:$d"; fi
+for d in /state/control /state/alerts /state/credentials /state/credentials/venice \
+         /state/credentials/agentmail /state/credentials/siyuan /state/venice; do
+  if [ -e "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null | grep -vxE 'venice|agentmail|siyuan')" ]; then
+    out "control-volume-mounted:$d"
+  fi
   if touch "$d/.selftest-write" 2>/dev/null; then rm -f "$d/.selftest-write"; out "control-dir-writable:$d"; fi
 done
 if t getent hosts jill-control; then out jill-control-resolvable; fi

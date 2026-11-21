@@ -108,8 +108,12 @@ COMMANDS = {
     "status": "status",
 }
 
-STAGE_RANK = {"ok": 0, "t7": 1, "t1": 2, "unknown": 3, "missing": 4, "rejected": 5, "expired": 6}
-RENAG_STAGES = ("unknown", "missing", "rejected", "expired")
+STAGE_RANK = {"ok": 0, "t7": 1, "t1": 2, "unknown": 3, "missing": 4, "rate_limited": 5, "exhausted": 6,
+              "rejected": 7, "expired": 8}
+RENAG_STAGES = ("unknown", "missing", "rate_limited", "exhausted", "rejected", "expired")
+# Red-team F3: a halt or conserve is honoured whatever its age (a late stop
+# is still a stop); only the commands that LIFT a stop, and status, expire.
+AGE_LIMITED = ("resume", "unconserve", "status")
 
 
 def log(msg):
@@ -156,6 +160,9 @@ def parse_command(content):
     if rest:
         m = DURATION_RE.match(rest[0])
         if m:
+            if int(m.group(1)) < 1:
+                return "invalid", None, "`%s %s` would lift immediately; nothing changed. Use at least 1m, or no duration." % (
+                    command, rest[0])
             duration = duration_to_iso(int(m.group(1)), m.group(2).lower())
             rest = rest[1:]
     reason = " ".join(rest).strip() or None
@@ -180,7 +187,9 @@ def strip_reply_fallback(body):
 
 def parse_event(ev, principal, now_ms=None, max_age_s=MAX_EVENT_AGE_S):
     """(body, "") when the event should be matched against the lexicon, else
-    (None, reason). Reasons go to the log and never carry a body."""
+    (None, reason). Reasons go to the log and never carry a body. A body
+    older than max_age_s comes back with reason "stale": the caller decides,
+    per command, whether age matters (AGE_LIMITED)."""
     etype = ev.get("type")
     sender = str(ev.get("sender") or "")
     if etype == "m.room.encrypted":
@@ -199,15 +208,13 @@ def parse_event(ev, principal, now_ms=None, max_age_s=MAX_EVENT_AGE_S):
     if not isinstance(ts, (int, float)) or isinstance(ts, bool):
         return None, "no-timestamp"
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-    if (now_ms - ts) / 1000 > max_age_s:
-        return None, "stale"
     if content.get("msgtype") != "m.text":
         return None, "msgtype"
     body = content.get("body") if isinstance(content.get("body"), str) else ""
     if isinstance(rel.get("m.in_reply_to"), dict):
         body = strip_reply_fallback(body)
     body = LEADING_MENTION_RE.sub("", body.strip())
-    return body, ""
+    return body, "stale" if (now_ms - ts) / 1000 > max_age_s else ""
 
 
 # --- Matrix REST -----------------------------------------------------------
@@ -338,12 +345,10 @@ class Control:
         if command == "halt":
             flags.write(self.halt_file, True, by, duration, reason)
             lift = "Auto-lift %s." % duration if duration else "No auto-lift - stays halted until you say `resume`."
-            return ("HALTED. No further Jill heartbeat runs, critical ones included. The dispatcher checks "
-                    "before every run and every retry.\n"
+            return ("HALTED. venice-proxy now refuses every model call, chat included, so a run in progress "
+                    "fails at its next model step. Heartbeats (if enabled) are skipped too.\n"
                     "%s\n"
-                    "Still possible for a short while: the one scheduled run already in progress finishes "
-                    "(up to about 20 minutes).\n"
-                    "NOT covered by halt: chat with Jill through her bridge, which only you drive.\n"
+                    "NOT covered by halt: a tool call already executing finishes; this room keeps listening.\n"
                     "Say `resume` to lift, `status` to check." % lift)
         if command == "conserve":
             flags.write(self.conservation_file, True, by, duration, reason)
@@ -399,9 +404,23 @@ class Control:
             if parsed is None:
                 continue
             command, duration, reason = parsed
-            log("COMMAND %s from the principal (event %s)" % (command, ev.get("event_id")))
+            log("COMMAND %s from the principal (event %s%s)" % (command, ev.get("event_id"),
+                                                               ", stale" if why == "stale" else ""))
+            if command == "invalid":
+                text = reason
+            elif why == "stale" and command in AGE_LIMITED:
+                if command == "status":
+                    continue
+                sent = ev.get("origin_server_ts", 0) / 1000
+                text = ("Ignored a `%s` sent at %s: it is more than %d minutes old, and an old message must not "
+                        "lift a stop. Send it again if you still mean it.\n%s" % (
+                            command, flags.utcnow_iso(datetime.fromtimestamp(sent, timezone.utc)),
+                            MAX_EVENT_AGE_S // 60, self.describe_state()))
+            else:
+                text = None
             try:
-                text = self.apply(command, duration, reason)
+                if text is None:
+                    text = self.apply(command, duration, reason)
             except OSError as exc:
                 log("ERROR: could not write state for %s: %s" % (command, exc))
                 text = "Could not apply `%s` - writing the flag file failed." % command
@@ -475,12 +494,8 @@ class Control:
 
     @staticmethod
     def _spooled_text(path):
-        try:
-            if os.path.getsize(path) > MAX_FILE_BYTES:
-                return None
-            with open(path, encoding="utf-8") as fh:
-                rec = json.load(fh)
-        except (OSError, ValueError):
+        rec, ok = flags.read(path)  # regular files only, size-capped, no symlinks or FIFOs
+        if not ok:
             return None
         if not isinstance(rec, dict) or not isinstance(rec.get("text"), str):
             return None
@@ -509,7 +524,9 @@ class Control:
         out = {}
         probe_every = self.cfg["probe_interval"]
         for cid in self.cfg["cred_expect"]:
-            rec, ok = flags.read(os.path.join(self.cfg["cred_dir"], "%s.json" % cid))
+            # One volume per gateway, mounted at <cred_dir>/<id>/ (F5): no
+            # gateway can write another's record.
+            rec, ok = flags.read(os.path.join(self.cfg["cred_dir"], cid, "%s.json" % cid))
             if not ok or not rec:
                 if now - self.started > 2 * probe_every:
                     out[cid] = ("missing", "no probe result from its gateway; is the %s gateway running?" % cid)
@@ -520,6 +537,10 @@ class Control:
             last_ok = rec.get("last_ok_at") if isinstance(rec.get("last_ok_at"), (int, float)) else 0
             if rec.get("result") == "rejected":
                 out[cid] = ("rejected", "the upstream refused the key (HTTP %s)" % status)
+            elif rec.get("result") == "exhausted":
+                out[cid] = ("exhausted", "the account has no balance or access left (HTTP %s)" % status)
+            elif rec.get("result") == "rate_limited":
+                out[cid] = ("rate_limited", "the upstream is rate-limiting the key (HTTP %s)" % status)
             elif now - checked > 3 * probe_every:
                 out[cid] = ("unknown", "the gateway has not probed for %dh" % ((now - checked) // 3600))
             elif rec.get("result") != "ok" and now - last_ok > 86400:
@@ -546,6 +567,54 @@ class Control:
             if prior is None or STAGE_RANK[stage[0]] > STAGE_RANK[prior[0]]:
                 out[cid] = stage
         return out
+
+    # -- Venice meter (the gateway's spend ledger, read-only here) ----------
+
+    def check_meter(self):
+        """Alert once a day at VENICE_ALERT_USD_PER_DAY, once at the hard
+        ceiling, once if responses arrive without usage (charged a flat
+        amount), and once if the meter cannot be read. Dollars are rounded
+        to cents and clamped."""
+        d = self.cfg.get("meter_dir")
+        if not d:
+            return
+        day = time.strftime("%Y-%m-%d", time.gmtime(self.clock()))
+        path = os.path.join(d, "meter-%s.json" % day)
+        state_file = os.path.join(self.cfg["control_dir"], "meter-alerts.json")
+        sent, _ = flags.read(state_file)
+        if sent.get("day") != day:
+            sent = {"day": day}
+        if not os.path.lexists(path):
+            return
+        rec, ok = flags.read(path)
+        usd = rec.get("usd") if ok else None
+        alerts = []
+        if not isinstance(usd, (int, float)) or isinstance(usd, bool) or usd < 0:
+            alerts.append(("unreadable", "The Venice meter for %s cannot be read, so venice-proxy is refusing "
+                                         "every model call today. Check the venice-meter volume." % day))
+        else:
+            usd = min(round(usd, 2), 1e6)
+            ceiling = rec.get("ceiling_usd") if isinstance(rec.get("ceiling_usd"), (int, float)) else None
+            if usd >= self.cfg["meter_alert_usd"]:
+                alerts.append(("threshold", "Venice spend today is $%.2f, past the $%.2f alert line%s." % (
+                    usd, self.cfg["meter_alert_usd"],
+                    "; the hard ceiling is $%.2f" % ceiling if ceiling is not None else "")))
+            if ceiling is not None and usd >= ceiling:
+                alerts.append(("ceiling", "Venice spend today reached the $%.2f hard ceiling. venice-proxy now refuses "
+                                          "every model call until midnight UTC." % ceiling))
+            if isinstance(rec.get("unmetered"), int) and rec["unmetered"] > 0:
+                alerts.append(("unmetered", "%d Venice response(s) today carried no usage, so each was charged a flat "
+                                            "amount. The meter may be off." % rec["unmetered"]))
+        changed = False
+        for key, text in alerts:
+            if not sent.get(key) and self.post(text):
+                sent[key] = True
+                changed = True
+        if changed:
+            try:
+                write_json_atomic(state_file, sent)
+            except OSError as exc:
+                log("WARN: could not save meter alert state: %s" % exc)
 
     def probe_matrix(self):
         try:
@@ -594,6 +663,14 @@ def _int_env(env, name, default, minimum):
         return default
 
 
+def _float_env(env, name, default):
+    try:
+        v = float(env.get(name, default))
+    except ValueError:
+        return default
+    return v if v >= 0 else default
+
+
 def parse_expires(raw):
     out = {}
     for item in re.split(r"[,\s]+", (raw or "").strip()):
@@ -636,6 +713,8 @@ def load_config(env=os.environ):
         "realert_days": _int_env(env, "CREDENTIAL_REALERT_DAYS", 3, 1),
         "poll_seconds": _int_env(env, "CONTROL_POLL_SECONDS", 15, 5),
         "alerts_per_hour": _int_env(env, "ALERTS_PER_HOUR", 20, 1),
+        "meter_dir": env.get("VENICE_METER_DIR") or None,
+        "meter_alert_usd": _float_env(env, "VENICE_ALERT_USD_PER_DAY", 1.0),
         "announce": env.get("CONTROL_ANNOUNCE_ON_BOOT", "1") == "1",
         "matrix_probe": None,
     }
@@ -676,7 +755,8 @@ def boot(control):
     if failures:
         return failures
     try:
-        control.poll_room()
+        if not control.poll_room():
+            failures.append("the control room gave no pagination token, so the switch cannot read it")
     except MatrixError as exc:
         failures.append("could not read the control room (%s)" % exc)
     return failures
@@ -701,12 +781,18 @@ def main():
         while True:
             time.sleep(3600)
     control = Control(cfg, Matrix(cfg["homeserver"], cfg["token"]))
-    failures = boot(control)
-    if failures:
-        log("ERROR: boot self-test failed; the kill switch is UNARMED:")
+    # Retry in-process with backoff rather than exiting into a restart loop:
+    # the container stays up, unhealthy and loud, until the switch can arm.
+    wait = 5
+    while True:
+        failures = boot(control)
+        if not failures:
+            break
+        log("ERROR: boot self-test failed; the kill switch is UNARMED (retrying in %ds):" % wait)
         for f in failures:
             log("ERROR:   %s" % f)
-        return 1
+        time.sleep(wait)
+        wait = min(wait * 2, 300)
     control._mark_armed()
     with open("/tmp/control-ready", "w") as fh:
         fh.write("armed\n")
@@ -718,6 +804,8 @@ def main():
     def credentials():
         control.probe_matrix()
         control.check_credentials()
+
+    threading.Thread(target=_loop, args=("meter", 60, control.check_meter), daemon=True).start()
 
     threading.Thread(target=_loop, args=("credentials", min(cfg["probe_interval"], 3600), credentials),
                      daemon=True).start()

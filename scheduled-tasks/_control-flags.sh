@@ -47,14 +47,23 @@ control_flag_state() {
         printf 'on\n'
         return 0
     fi
-    _cf_enabled=$(jq -r 'if .enabled == true then "true" else "false" end' "$_cf_flag" 2>/dev/null) || _cf_enabled="error"
+    # `enabled` must be the boolean true, and auto_lift_after null or exactly
+    # YYYY-MM-DDTHH:MM:SSZ. Anything else is invalid, so on (red-team F6).
+    _cf_enabled=$(jq -r 'if has("enabled") | not then "false"
+                         elif (.enabled | type) == "boolean" then (.enabled | tostring)
+                         else "invalid" end' "$_cf_flag" 2>/dev/null) || _cf_enabled="invalid"
     case "$_cf_enabled" in
         true) ;;
         false) printf 'off\n'; return 0 ;;
         *) printf 'on\n'; return 0 ;;
     esac
-    _cf_lift=$(jq -r '.auto_lift_after // ""' "$_cf_flag" 2>/dev/null) || _cf_lift="unparseable"
-    if [[ -z "$_cf_lift" ]]; then
+    _cf_lift=$(jq -r '.auto_lift_after | if . == null then "__none__" elif type == "string" then . else "invalid" end' \
+        "$_cf_flag" 2>/dev/null) || _cf_lift="invalid"
+    if [[ "$_cf_lift" == "__none__" ]]; then
+        printf 'on\n'
+        return 0
+    fi
+    if [[ ! "$_cf_lift" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
         printf 'on\n'
         return 0
     fi

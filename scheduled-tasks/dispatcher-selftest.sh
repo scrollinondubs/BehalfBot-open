@@ -11,7 +11,12 @@
 #   halt         halt.json on: nothing fires, critical included
 #   halt-expired an auto-lift in the past: fires
 #   halt-garbage an unparseable halt.json: nothing fires (fail closed)
-#   halt-midtick halt arriving during a tick: the next heartbeat does not fire
+#   halt-midtick halt arriving during a tick: the next heartbeat does not fire,
+#                nor the validator or notify of the run in progress
+#   F1           unreadable, invalid or missing telemetry reads as cap reached
+#   F2           an invalid state file stops the tick; bad writes are dropped
+#   F4           an unarmed switch is checked before every run
+#   F6           strict flag schema, orphan and held locks, cents in alerts
 #   unarmed      CONTROL_REQUIRE_ARMED=1 with no armed.json: nothing fires,
 #                one alert
 #   fire-cap     max_fires_per_day: 1 holds across two ticks, one alert
@@ -43,10 +48,15 @@ say() { printf '[dispatcher-selftest] %s\n' "$*"; }
 ok() { say "ok   $*"; }
 bad() { say "FAIL $*"; fail=1; }
 
+# No recursive delete of a computed path, ever: `trash` where it exists
+# (a workstation), otherwise the scratch dir stays in TMPDIR, which in the
+# container is discarded with it.
 cleanup() {
-    case "$ROOT" in
-        */dispatcher-selftest.*) find "$ROOT" -depth -delete 2>/dev/null ;;
-    esac
+    if command -v trash >/dev/null 2>&1; then
+        trash "$ROOT" 2>/dev/null || true
+    else
+        say "scratch left at $ROOT"
+    fi
 }
 trap cleanup EXIT
 
@@ -57,6 +67,14 @@ mkdir -p "$ROOT/bin"
 cat > "$ROOT/bin/opencode" <<'SH'
 #!/usr/bin/env bash
 echo x >> "$FAKE_SB/calls"
+if [[ -f "$FAKE_SB/unarm-on-call" ]]; then
+    printf '{"armed_at": 1}\n' > "$FAKE_SB/control/armed.json"
+fi
+if [[ -f "$FAKE_SB/badcost" ]]; then
+    printf '%s\n' '{"type":"text","part":{"text":"FAKE-MODEL-OUTPUT"}}'
+    printf '%s\n' '{"type":"step_finish","part":{"cost":-50,"tokens":{"input":"lots","output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}'
+    exit 0
+fi
 if [[ -f "$FAKE_SB/halt-on-call" ]]; then
     printf '{"enabled": true, "auto_lift_after": null, "reason": "mid-tick"}\n' > "$FAKE_SB/control/halt.json"
 fi
@@ -165,7 +183,7 @@ tick
 new_sandbox halt-midtick "hb-a|" "hb-b|" "hb-c|"
 touch "$SB/halt-on-call"
 tick
-[[ "$(calls)" == 1 ]] && logged "HALTED mid-tick" \
+[[ "$(calls)" == 1 ]] && logged "HALTED" \
     && ok "halt mid-tick: the run in progress finished, the next two heartbeats did not fire" \
     || bad "halt mid-tick: $(calls) run(s) fired"
 
@@ -174,6 +192,22 @@ touch "$SB/halt-on-call" "$SB/fail"
 tick
 [[ "$(calls)" == 1 ]] && logged "retry 2 of hb-a skipped" \
     && ok "halt during retries: no further attempt" || bad "halt during retries: $(calls) attempt(s)"
+
+new_sandbox halt-validator "hb-a|output_validator: true"
+touch "$SB/halt-on-call"
+tick
+[[ "$(calls)" == 1 ]] && logged "validator and notify for hb-a skipped" \
+    && ok "F6 halt during a run: the validator model call and the notify are skipped" \
+    || bad "F6 halt during a run: $(calls) model call(s)"
+
+new_sandbox strict-flags "hb-a|"
+for doc in '{"enabled": "true"}' '{"enabled": 1}' '{"enabled": true, "auto_lift_after": "2001-01-01"}' \
+           '{"enabled": true, "auto_lift_after": "2001-01-01T00:00:00+00:00"}' '{"enabled": true, "auto_lift_after": 5}'; do
+    printf '%s\n' "$doc" > "$SB/control/halt.json"
+    tick
+done
+[[ "$(calls)" == 0 ]] && ok "F6 strict flag schema: 5 malformed halt files all read as halted" \
+    || bad "F6 strict flag schema: $(calls) run(s) fired on a malformed halt.json"
 
 # --- unarmed kill switch --------------------------------------------------
 new_sandbox unarmed "hb-a|"
@@ -184,6 +218,58 @@ tick CONTROL_REQUIRE_ARMED=1
 printf '{"armed_at": %s}\n' "$(date +%s)" > "$SB/control/armed.json"
 tick CONTROL_REQUIRE_ARMED=1
 [[ "$(calls)" -ge 1 ]] && ok "armed switch: fires" || bad "armed switch: still blocked"
+
+new_sandbox unarmed-midtick "hb-a|" "hb-b|"
+printf '{"armed_at": %s}\n' "$(date +%s)" > "$SB/control/armed.json"
+touch "$SB/unarm-on-call"
+tick CONTROL_REQUIRE_ARMED=1
+[[ "$(calls)" == 1 ]] && ok "F4 switch going unarmed mid-tick: the next heartbeat did not fire" \
+    || bad "F4 unarmed mid-tick: $(calls) run(s)"
+
+# --- state file and lock ----------------------------------------------------
+new_sandbox state-invalid "hb-a|"
+mkdir -p "$SB/state/scheduled-tasks"
+printf '[]\n' > "$SB/state/scheduled-tasks/heartbeat-state.json"
+tick
+tick
+[[ "$(calls)" == 0 && "$(alerts state-invalid)" == 1 ]] \
+    && [[ "$(cat "$SB/state/scheduled-tasks/heartbeat-state.json")" == "[]" ]] \
+    && ok "F2 invalid state file: nothing fired, one alert, the file was left for a human" \
+    || bad "F2 invalid state file: calls=$(calls) alerts=$(alerts state-invalid)"
+
+new_sandbox state-empty-write "hb-a|"
+(
+    export BEHALFBOT_HOME="$SB/home" BEHALFBOT_STATE_HOME="$SB/state" DISPATCHER_TEST_SOURCE=1
+    # shellcheck source=/dev/null
+    source "$DISPATCHER"
+    init_state
+    set_state "keep" "v" "1"
+    _state_update 'empty'
+    _state_update '"a string"'
+)
+jq -e '.keep.v == "1"' "$SB/state/scheduled-tasks/heartbeat-state.json" >/dev/null 2>&1 \
+    && ok "F2 an empty or non-object update never replaces the state file" \
+    || bad "F2 an empty or non-object update replaced the state file"
+
+new_sandbox orphan-lock "hb-a|"
+mkdir -p "$SB/state/scheduled-tasks"
+echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
+mkdir "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
+tick
+[[ "$(calls)" == 1 && "$(alerts state-lock)" == 1 ]] && logged "orphaned state lock" \
+    && ok "F6 orphaned lock (no pid): removed with an alert, then the tick ran" \
+    || bad "F6 orphaned lock: calls=$(calls) alerts=$(alerts state-lock)"
+
+new_sandbox held-lock "hb-a|"
+mkdir -p "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
+echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
+echo $$ > "$SB/state/scheduled-tasks/heartbeat-state.json.lock/pid"
+tick
+rm -f "$SB/state/scheduled-tasks/heartbeat-state.json.lock/pid"
+rmdir "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
+[[ "$(calls)" == 0 && "$(alerts state-lock)" == 1 ]] && logged "write refused" \
+    && ok "F6 lock held by a live process: writes refused, nothing fired, one alert" \
+    || bad "F6 held lock: calls=$(calls) alerts=$(alerts state-lock)"
 
 # --- per-heartbeat fire cap -----------------------------------------------
 new_sandbox fire-cap "hb-a|max_fires_per_day: 1"
@@ -214,6 +300,45 @@ reported=$(jq -s '[.[].reported_cost_usd] | add' "$SB"/state/logs/telemetry/*-us
 [[ "$first" == 1 && "$(calls)" == 1 && "$(alerts spend-cap)" == 1 ]] && logged "SPEND-CAPPED" \
     && ok "daily spend cap: tripped after the first \$1.40 run, nothing more fired, one alert" \
     || bad "daily spend cap: first=$first total=$(calls) alerts=$(alerts spend-cap)"
+
+new_sandbox spend-half "hb-a|"
+tick DISPATCHER_MAX_USD_PER_DAY=2
+tick DISPATCHER_MAX_USD_PER_DAY=2
+[[ "$(alerts spend-half)" == 1 ]] && ok "spend at 50% of the cap: one alert" || bad "spend-half: $(alerts spend-half) alert(s)"
+if grep -hoE '\$[0-9]+\.[0-9]+' "$SB"/spool/*.json | grep -qvE '^\$[0-9]+\.[0-9]{2}$'; then
+    bad "F6 an alert carries a dollar figure that is not rounded to cents"
+else
+    ok "F6 dollar figures in alerts are rounded to cents"
+fi
+
+# --- F1: telemetry that cannot be trusted reads as "cap reached" ------------
+new_sandbox telemetry-garbage "hb-a|"
+mkdir -p "$SB/state/logs/telemetry"
+printf 'not json\n' > "$SB/state/logs/telemetry/$(date +%Y-%m-%d)-usage.jsonl"
+tick
+[[ "$(calls)" == 0 && "$(alerts spend-cap)" == 1 ]] && ok "F1 an unparseable telemetry row: capped, one alert" \
+    || bad "F1 unparseable telemetry: calls=$(calls) alerts=$(alerts spend-cap)"
+
+new_sandbox telemetry-negative "hb-a|"
+mkdir -p "$SB/state/logs/telemetry"
+printf '{"heartbeat":"x","cost_usd":-100}\n' > "$SB/state/logs/telemetry/$(date +%Y-%m-%d)-usage.jsonl"
+tick
+[[ "$(calls)" == 0 ]] && ok "F1 a negative cost row cannot offset spend: capped" || bad "F1 negative cost: $(calls) run(s)"
+
+new_sandbox telemetry-badrun "hb-a|" "hb-b|"
+touch "$SB/badcost"
+tick
+[[ "$(calls)" == 1 ]] && jq -e '.invalid == true and .cost_usd >= 0' "$SB"/state/logs/telemetry/*-usage.jsonl >/dev/null \
+    && ok "F1 a run reporting a negative cost and string tokens is clamped, marked invalid, and caps the day" \
+    || bad "F1 bad run telemetry: calls=$(calls)"
+
+new_sandbox telemetry-missing "hb-a|" "hb-b|"
+mkdir -p "$SB/state/logs/telemetry/$(date +%Y-%m-%d)-usage.jsonl"
+tick
+[[ "$(calls)" -le 1 ]] && logged "no telemetry row was recorded" \
+    && ok "F1 a run that left no telemetry row: the rest of the day is capped" \
+    || bad "F1 missing telemetry row: calls=$(calls)"
+rmdir "$SB/state/logs/telemetry/$(date +%Y-%m-%d)-usage.jsonl" 2>/dev/null
 
 # --- unmeasured spend -------------------------------------------------------
 new_sandbox unmeasured "hb-a|" "hb-b|"

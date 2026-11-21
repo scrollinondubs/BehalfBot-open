@@ -123,10 +123,10 @@ The chassis's gather-first scheduled-work engine, ported to OpenCode (issue #4).
 cp HEARTBEATS.md.template HEARTBEATS.md      # register heartbeats here
 bash scripts/validate-heartbeats.sh          # lint before commit
 DRY_RUN=true bash scheduled-tasks/heartbeat-dispatcher.sh   # host one-shot
-docker compose --profile dispatcher up -d    # containerized 15-min loop
+docker compose --profile heartbeats up -d    # containerized 15-min loop (off by default)
 ```
 
-In compose the dispatcher only runs with an armed Matrix kill switch (`jill-control`). It also enforces daily fire and spend caps, alarms when every run is failing, and posts content-free alerts to Matrix. A boot self-test proves each of these first. See [docs/control.md](docs/control.md).
+Heartbeats are **off by default**: the dispatcher sits behind the `heartbeats` compose profile, and Jill runs only when Sean messages her. Halt and the daily Venice ceiling bind at `venice-proxy`, so they cover chat too. When enabled, the dispatcher only runs with an armed Matrix kill switch (`jill-control`). It also enforces daily fire and spend caps, alarms when every run is failing, and posts content-free alerts to Matrix. A boot self-test proves each of these first. See [docs/control.md](docs/control.md).
 
 Full writeup: [docs/heartbeat-dispatcher.md](docs/heartbeat-dispatcher.md). The companion `scripts/dispatch-trigger.sh` routes keyword-prefixed inbound messages (registered in `triggers.yaml`) to shell handlers deterministically, without a model round trip.
 

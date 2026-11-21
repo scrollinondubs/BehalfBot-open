@@ -4,7 +4,7 @@
 # Parses HEARTBEATS.md, checks schedules, evaluates conditions, invokes the
 # model via `opencode run` when work exists. Run it on a fixed tick (default
 # every 15 minutes) from cron, launchd, systemd, or the compose
-# `heartbeat-dispatcher` service (`docker compose --profile dispatcher up -d`).
+# `heartbeat-dispatcher` service (`docker compose --profile heartbeats up -d`).
 #
 # Architecture (gather-first dispatcher, ported from scrollinondubs/behalfbot
 # chassis/scheduled-tasks/heartbeat-dispatcher.sh):
@@ -70,7 +70,8 @@
 #   ALERT_SPOOL_DIR         - alerts are dropped here as JSON for jill-control
 #                             to post to Matrix. Content-free by contract.
 #   DISPATCHER_MAX_USD_PER_DAY - daily spend ceiling across ALL heartbeats
-#                             (default 5). Critical heartbeats included.
+#                             (default 1, one alert at 50%). Critical
+#                             heartbeats included.
 #   DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY - per-heartbeat fire cap used when a
 #                             heartbeat sets no max_fires_per_day (default 24;
 #                             0 disables the default).
@@ -242,23 +243,51 @@ get_state() {
 # colliding; it does nothing about two writers both reading the state file,
 # computing from the same stale snapshot, and the second mv discarding the
 # first writer's change. mkdir is atomic everywhere this runs and needs no
-# flock. A dead holder's lock is recovered; after 10s the write proceeds
-# unlocked (a possibly lost write beats a hung dispatcher). The lock is a
-# directory holding one pid file, removed with rm -f + rmdir: never a
-# recursive delete of a computed path.
+# flock. The lock is a directory holding one pid file, removed with
+# rm -f + rmdir: never a recursive delete of a computed path.
+#
+# A dead holder's lock is recovered. A lock dir with NO pid file for 2s was
+# orphaned by a writer killed between mkdir and the pid write: it is removed
+# and alerted on. A live holder for 10s makes this write REFUSED, never
+# done unlocked: STATE_LOCK_FAILED stops the tick firing anything more (red
+# team F6), because a lost fire count is a cap bypass.
+STATE_LOCK_FAILED=0
+STATE_LOCK_ALERTED=0
+
+_state_lock_alert() {
+    log "$1"
+    if [[ $STATE_LOCK_ALERTED -eq 0 ]]; then
+        STATE_LOCK_ALERTED=1
+        alert_ops state-lock "$2"
+    fi
+}
+
 _state_lock_acquire() {
-    local lock_dir="${STATE_FILE}.lock" waited=0 holder=""
+    local lock_dir="${STATE_FILE}.lock" waited=0 holder="" nopid=0
     while ! mkdir "$lock_dir" 2>/dev/null; do
         holder=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
-        if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null; then
+        if [[ -z "$holder" ]]; then
+            nopid=$((nopid + 1))
+            if [[ $nopid -ge 20 ]]; then
+                _state_lock_alert "WARNING orphaned state lock (no pid file) - removed" \
+                    "The dispatcher found an orphaned state lock (a writer died mid-write) and removed it. If this repeats, check the dispatcher container."
+                rmdir "$lock_dir" 2>/dev/null || true
+                nopid=0
+                continue
+            fi
+        elif ! kill -0 "$holder" 2>/dev/null; then
             rm -f "$lock_dir/pid" 2>/dev/null || true
             rmdir "$lock_dir" 2>/dev/null || true
             continue
+        else
+            nopid=0
         fi
         sleep 0.1
         waited=$((waited + 1))
         if [[ $waited -ge 100 ]]; then
-            log "WARNING state lock held >10s by pid ${holder:-unknown} - proceeding unlocked, a write may be lost"
+            STATE_LOCK_FAILED=1
+            _state_lock_alert "ERROR state lock held >10s by pid ${holder:-unknown} - write refused; this tick fires nothing more" \
+                "The dispatcher could not take its state lock for 10s, so it refused the write and stopped firing for this tick. Another dispatcher may be running."
             return 1
         fi
     done
@@ -273,16 +302,25 @@ _state_lock_release() {
 # _state_update <jq filter> [jq args...] - one locked read-modify-write.
 # Released only when THIS call holds the lock: releasing on the timeout path
 # would delete a lock another writer still owns.
+# The result replaces the state file only if it is a non-empty JSON object
+# (red-team F2): an empty or invalid temp file is discarded, never renamed
+# over the state.
 _state_update() {
     local filter="$1"; shift
-    local tmp="${STATE_FILE}.$$.${RANDOM}.tmp" locked=0
-    _state_lock_acquire && locked=1
-    if jq "$@" "$filter" "$STATE_FILE" > "$tmp"; then
+    local tmp="${STATE_FILE}.$$.${RANDOM}.tmp"
+    _state_lock_acquire || return 0
+    if jq "$@" "$filter" "$STATE_FILE" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]] \
+        && jq -e 'type == "object"' "$tmp" >/dev/null 2>&1; then
         mv "$tmp" "$STATE_FILE"
     else
         rm -f "$tmp"
+        log "WARNING a state update produced no valid JSON object - discarded"
     fi
-    if [[ $locked -eq 1 ]]; then _state_lock_release; fi
+    _state_lock_release
+}
+
+state_valid() {
+    jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1
 }
 
 set_state() {
@@ -592,8 +630,10 @@ invoke_opencode() {
     local prompt_input="$1" output_file="$2" model="$3" budget="$4" heartbeat_name="${5:-unknown}" cwd="${6:-$BEHALFBOT_HOME}"
     local telemetry_file="$TELEMETRY_DIR/$DATE-usage.jsonl"
     local tmp_events="$LOG_DIR/.opencode-events-$$.jsonl"
-    local start_ts exit_code=0 end_ts wall_secs ts_iso
+    local start_ts exit_code=0 end_ts wall_secs ts_iso rows_before rows_after
 
+    rows_before=$(wc -l < "$telemetry_file" 2>/dev/null | tr -d ' ') || rows_before=0
+    [[ "$rows_before" =~ ^[0-9]+$ ]] || rows_before=0
     start_ts=$(date +%s)
 
     local args=()
@@ -617,6 +657,11 @@ invoke_opencode() {
         # larger of OpenCode's figure and our own token-based estimate:
         # opencode.json carries no prices, so OpenCode reports 0, and a spend
         # cap summing zeros never trips.
+        #
+        # Every cost and token value is clamped to a non-negative number. A
+        # value that is not one marks the row `invalid`, and an invalid row
+        # makes the spend caps read "cap reached" (red-team F1): a negative
+        # or string cost must never make spend look smaller.
         local price
         price=$(model_price "$model")
         jq -cs \
@@ -626,26 +671,30 @@ invoke_opencode() {
             --argjson wall "$wall_secs" \
             --argjson exit_code "$exit_code" \
             --argjson price "$price" \
-            '[.[] | select(.type == "step_finish") | .part] as $steps |
-            ([$steps[].cost // 0] | add // 0) as $reported |
-            ((([$steps[].tokens.input // 0] | add // 0) * $price[0]
-              + ([$steps[].tokens.output // 0] | add // 0) * $price[1]
-              + ([$steps[].tokens.reasoning // 0] | add // 0) * $price[1]
-              + ([$steps[].tokens.cache.write // 0] | add // 0) * $price[0]
-              + ([$steps[].tokens.cache.read // 0] | add // 0) * $price[2]) / 1000000) as $estimated |
+            'def ok: type == "number" and . >= 0 and . < 1e12;
+            def s(f): [.[] | (f // 0) | if ok then . else 0 end] | add // 0;
+            [.[] | select(.type == "step_finish") | .part] as $steps |
+            ([$steps[] | (.cost // 0), (.tokens.input // 0), (.tokens.output // 0), (.tokens.reasoning // 0),
+              (.tokens.cache.write // 0), (.tokens.cache.read // 0)] | all(ok)) as $valid |
+            ($steps | s(.cost)) as $reported |
+            ((($steps | s(.tokens.input)) * $price[0]
+              + ($steps | s(.tokens.output)) * $price[1]
+              + ($steps | s(.tokens.reasoning)) * $price[1]
+              + ($steps | s(.tokens.cache.write)) * $price[0]
+              + ($steps | s(.tokens.cache.read)) * $price[2]) / 1000000) as $estimated |
             {
                 ts: $ts,
                 heartbeat: $name,
                 model: $model,
                 cost_usd: ([$reported, $estimated] | max),
                 reported_cost_usd: $reported,
-                input_tokens: ([$steps[].tokens.input // 0] | add // 0),
-                output_tokens: ([$steps[].tokens.output // 0] | add // 0),
-                cache_read_tokens: ([$steps[].tokens.cache.read // 0] | add // 0),
-                cache_create_tokens: ([$steps[].tokens.cache.write // 0] | add // 0),
+                input_tokens: ($steps | s(.tokens.input)),
+                output_tokens: ($steps | s(.tokens.output)),
+                cache_read_tokens: ($steps | s(.tokens.cache.read)),
+                cache_create_tokens: ($steps | s(.tokens.cache.write)),
                 wall_seconds: $wall,
                 exit_code: $exit_code
-            }' "$tmp_events" >> "$telemetry_file" 2>> "$LOG_FILE" \
+            } + (if $valid then {} else {invalid: true} end)' "$tmp_events" >> "$telemetry_file" 2>> "$LOG_FILE" \
             && log "TELEMETRY $heartbeat_name - cost logged" \
             || log "WARN: telemetry parse failed for $heartbeat_name"
 
@@ -673,6 +722,15 @@ invoke_opencode() {
     else
         printf '%s\n' "{\"ts\":\"$ts_iso\",\"heartbeat\":\"$heartbeat_name\",\"model\":\"$model\",\"cost_usd\":0,\"input_tokens\":0,\"output_tokens\":0,\"cache_read_tokens\":0,\"cache_create_tokens\":0,\"wall_seconds\":$wall_secs,\"exit_code\":$exit_code,\"error\":\"no_json_output\"}" >> "$telemetry_file"
         rm -f "$tmp_events"
+    fi
+
+    # Every run must leave exactly one more telemetry row. If it did not, the
+    # spend of that run is invisible, so the day's cap reads as reached.
+    rows_after=$(wc -l < "$telemetry_file" 2>/dev/null | tr -d ' ') || rows_after=0
+    [[ "$rows_after" =~ ^[0-9]+$ ]] || rows_after=0
+    if [[ $rows_after -le $rows_before ]]; then
+        log "ERROR $heartbeat_name - no telemetry row was recorded; treating today's spend cap as reached"
+        set_state "_dispatcher" "telemetry_fault_date" "$DATE"
     fi
 
     # A run that produced an empty result file is a failure even on exit 0.
@@ -931,15 +989,28 @@ _state_int() {
 # Dollars spent today from the dispatcher's own telemetry: the surface an
 # operator audits afterwards, so the cap cannot disagree with it. With a
 # name, that heartbeat plus its validator rows; without, everything.
+#
+# Prints a number, or "invalid" (red-team F1) when the file cannot be read,
+# or any row is not JSON, is marked invalid, or carries a cost that is not a
+# non-negative number. Callers treat "invalid" as cap reached.
 usd_today() {
     local name="${1:-}"
     local tfile="$TELEMETRY_DIR/$DATE-usage.jsonl"
-    [[ -f "$tfile" ]] || { echo 0; return 0; }
-    jq -R -s --arg n "$name" '
-        [ split("\n")[] | select(length > 0) | (fromjson? // empty)
-          | select($n == "" or .heartbeat == $n or .heartbeat == ($n + "-validator"))
-          | (.cost_usd // 0) ] | add // 0
-    ' "$tfile" 2>/dev/null || echo 0
+    [[ -e "$tfile" ]] || { echo 0; return 0; }
+    jq -r -R -s --arg n "$name" '
+        [ split("\n")[] | select(length > 0) | (try fromjson catch "BAD") ] as $rows
+        | if any($rows[]; type != "object" or .invalid == true
+                 or (.cost_usd | type) != "number" or .cost_usd < 0)
+          then "invalid"
+          else [ $rows[] | select($n == "" or .heartbeat == $n or .heartbeat == ($n + "-validator"))
+                 | .cost_usd ] | add // 0
+          end
+    ' "$tfile" 2>/dev/null || echo invalid
+}
+
+# cents <n>: a dollar figure for an alert, rounded and clamped to [0, 1e6].
+cents() {
+    awk -v v="$1" 'BEGIN { v += 0; if (v < 0) v = 0; if (v > 1000000) v = 1000000; printf "%.2f", v }'
 }
 
 # --- Daily fire caps (ported from chassis 3205a7f) ---
@@ -1001,8 +1072,12 @@ fire_cap_check() {
             log "WARN $name - max_usd_per_day '$max_usd' is not a number. Ignoring."
         else
             spent=$(usd_today "$name")
+            if [[ "$spent" == "invalid" ]]; then
+                CAP_REASON="max_usd_per_day treated as reached: today's telemetry cannot be read reliably"
+                return 0
+            fi
             if _num_ge "$spent" "$max_usd"; then
-                CAP_REASON="max_usd_per_day reached: \$$spent of \$$max_usd already spent today"
+                CAP_REASON="max_usd_per_day reached: \$$(cents "$spent") of \$$(cents "$max_usd") already spent today"
                 return 0
             fi
         fi
@@ -1028,17 +1103,34 @@ cap_alert_once() {
 SPEND_REASON=""
 
 # 0 = over the cap (do not fire), 1 = may fire.
+#
+# Default $1/day (Sean, 2026-11-21), with one alert at 50%. Fail-closed: an
+# unreadable telemetry file, an invalid row, or a run that left no row
+# today all read as "cap reached" (red-team F1).
 global_spend_capped() {
-    local cap="${DISPATCHER_MAX_USD_PER_DAY:-5}" spent
+    local cap="${DISPATCHER_MAX_USD_PER_DAY:-1}" spent
     SPEND_REASON=""
     if [[ ! "$cap" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        log "WARN: DISPATCHER_MAX_USD_PER_DAY '$cap' is not a number - using 5"
-        cap=5
+        log "WARN: DISPATCHER_MAX_USD_PER_DAY '$cap' is not a number - using 1"
+        cap=1
+    fi
+    if [[ "$(get_state "_dispatcher" "telemetry_fault_date")" == "$DATE" ]]; then
+        SPEND_REASON="a run today left no telemetry row, so today's spend is unknown"
+        return 0
     fi
     spent=$(usd_today)
-    if _num_ge "$spent" "$cap"; then
-        SPEND_REASON="\$$spent of the \$$cap daily Venice budget is spent"
+    if [[ "$spent" == "invalid" ]]; then
+        SPEND_REASON="today's telemetry cannot be read reliably, so today's spend is unknown"
         return 0
+    fi
+    if _num_ge "$spent" "$cap"; then
+        SPEND_REASON="\$$(cents "$spent") of the \$$(cents "$cap") daily budget is spent"
+        return 0
+    fi
+    if _num_ge "$spent" "$(awk -v c="$cap" 'BEGIN { print c / 2 }')" \
+        && [[ "$(get_state "_dispatcher" "spend_half_alert_date")" != "$DATE" ]]; then
+        set_state "_dispatcher" "spend_half_alert_date" "$DATE"
+        alert_ops spend-half "Heartbeat spend today is \$$(cents "$spent"), half of the \$$(cents "$cap") daily cap."
     fi
     return 1
 }
@@ -1070,6 +1162,18 @@ main() {
     acquire_lock
     init_state
     log "=== Dispatcher run started ==="
+
+    # Red-team F2: a state file that is not a JSON object loses every fire
+    # count and cap date, so nothing fires until a human looks.
+    if ! state_valid; then
+        log "ERROR $STATE_FILE is not a JSON object - nothing fires until it is repaired"
+        local marker="$STATE_DIR/.state-invalid-alerted-$DATE"
+        if [[ ! -e "$marker" ]]; then
+            : > "$marker"
+            alert_ops state-invalid "The dispatcher's state file is corrupt, so no heartbeat runs until it is repaired. Check scheduled-tasks/heartbeat-state.json in the dispatcher volume."
+        fi
+        return
+    fi
 
     if [[ ! -f "$HEARTBEATS_FILE" ]]; then
         log "No HEARTBEATS.md at $HEARTBEATS_FILE (copy HEARTBEATS.md.template to get started)"
@@ -1243,8 +1347,12 @@ main() {
         # The halt gate is checked again here, not only at tick start: a tick
         # walks every heartbeat, and each run can take 20 minutes, so a halt
         # sent mid-tick must stop the heartbeats that have not fired yet.
-        if is_halted; then
-            log "HALTED mid-tick - $name and every later heartbeat skipped"
+        if is_halted || kill_switch_unarmed; then
+            log "HALTED mid-tick - $name and every later heartbeat skipped (halt flag or unarmed switch)"
+            break
+        fi
+        if [[ $STATE_LOCK_FAILED -eq 1 ]]; then
+            log "STOPPED - the state lock could not be taken; $name and every later heartbeat skipped"
             break
         fi
 
@@ -1279,7 +1387,7 @@ ${gathered_data}
         local invoke_success=false
         local attempt
         for attempt in 1 2 3; do
-            if [[ $attempt -gt 1 ]] && is_halted; then
+            if [[ $attempt -gt 1 ]] && { is_halted || kill_switch_unarmed || [[ $STATE_LOCK_FAILED -eq 1 ]]; }; then
                 log "HALTED - retry $attempt of $name skipped"
                 break
             fi
@@ -1370,6 +1478,14 @@ ${gathered_data}
         fi
         set_state "_dispatcher" "opencode_global_fail_streak" "0"
         set_state "_dispatcher" "opencode_global_failed_names" ""
+
+        # Red-team F6: a halt that arrived during the run also stops the
+        # validator (another model call) and the notification.
+        if is_halted || kill_switch_unarmed; then
+            log "HALTED - validator and notify for $name skipped"
+            set_state "$name" "last_result" "halted_after_run"
+            break
+        fi
 
         # Five Failure Modes post-output validator (opt-in per heartbeat)
         if ! run_output_validator "$name" "$output_file"; then

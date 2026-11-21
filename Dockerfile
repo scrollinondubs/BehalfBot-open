@@ -66,7 +66,7 @@ COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
 #   /app, global config, /home/node   uid 65534 (nobody), read-only to all
 #   /var/lib/opencode, /data          node 0700 (OpenCode data, memory MCP)
 #   /workspace                        node (her files)
-#   /state/{bridge,dispatcher,gateway,approvals,control,alerts,credentials}
+#   /state/{bridge,dispatcher,gateway,approvals,control,alerts,credentials,venice}
 #                                     node, per-container volumes
 RUN git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
@@ -76,7 +76,8 @@ RUN git init -q /app \
     && mkdir -p /etc/opencode-xdg/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode \
         /data /workspace /home/node/.local/state /home/node/.cache \
         /state/bridge /state/dispatcher /state/gateway /state/approvals \
-        /state/control /state/alerts /state/credentials \
+        /state/control /state/alerts /state/credentials /state/venice \
+        /state/credentials/venice /state/credentials/agentmail /state/credentials/siyuan \
     && cp /app/.opencode/.gitignore /etc/opencode-xdg/opencode/.gitignore \
     && printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /etc/opencode-xdg/opencode/opencode.jsonc \
     && chown -R 65534:65534 /app /etc/opencode-xdg /home/node \

@@ -44,6 +44,7 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import approvals  # noqa: E402
+import control_flags as flags  # noqa: E402
 
 MAX_BODY = 20 * 1024 * 1024
 MAX_FETCH = 10 * 1024 * 1024
@@ -63,7 +64,7 @@ class Deny(Exception):
 class Forward:
     """What to send upstream after a policy approved the request."""
 
-    def __init__(self, method, path, body=None, query=None, raw=None, after=None, release=None):
+    def __init__(self, method, path, body=None, query=None, raw=None, after=None, release=None, tap=None):
         self.method = method
         self.path = path
         self.body = body  # a validated Python object, re-serialised on send
@@ -71,6 +72,7 @@ class Forward:
         self.raw = raw  # bytes, only for the trusted api route
         self.after = after  # called with (status, response bytes) before replying
         self.release = release  # called once the upstream exchange is over
+        self.tap = tap  # sees the relayed response: feed(bytes), finish(status)
 
 
 class Local:
@@ -163,11 +165,200 @@ VENICE_PARAMS = {"disableThinking", "disable_thinking", "stripThinkingResponse",
 MESSAGE_KEYS = {"role", "content", "name", "tool_calls", "tool_call_id", "reasoning_content"}
 
 
+# --- control gate and daily meter (venice; #49) ----------------------------
+#
+# All of Jill's spend goes through this gateway (chat and any heartbeat), so
+# the kill switch and the spend ceiling bind HERE, where Jill cannot route
+# around them, not only in the dispatcher.
+
+def control_gate(ctx):
+    """Refuse model calls while halted, or while the kill switch is not
+    listening. The control-state volume is mounted read-only; if it is
+    configured but missing, refuse (a switch nobody can see is not armed)."""
+    d = ctx.get("control_dir")
+    if not d:
+        return
+    if not os.path.isdir(d):
+        raise Deny(503, "control state is not mounted; model calls refused")
+    if flags.state(os.path.join(d, flags.HALT)) == "on":
+        raise Deny(423, "Jill is halted by Sean; model calls are refused until he says resume")
+    if ctx.get("require_armed"):
+        armed, ok = flags.read(os.path.join(d, "armed.json"))
+        at = armed.get("armed_at") if ok else None
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or time.time() - at > ctx["armed_max_age"]:
+            raise Deny(503, "the kill switch is not listening; model calls are paused until it is")
+
+
+def parse_prices(raw):
+    """'model=in:out:cache_read,...' -> {model: (in, out, cache)}, USD per 1M tokens."""
+    out = {}
+    for item in (raw or "").split(","):
+        name, _, nums = item.strip().partition("=")
+        parts = nums.split(":")
+        try:
+            vals = [float(x) for x in parts]
+        except ValueError:
+            continue
+        if name and len(vals) >= 2 and all(v >= 0 for v in vals):
+            out[name] = (vals[0], vals[1], vals[2] if len(vals) > 2 else vals[0])
+    return out
+
+
+DEFAULT_PRICES = "zai-org-glm-5-2=1.40:4.40:0.26,z-ai-glm-5-3-flash=0.17:0.55:0.03"
+
+
+def _count(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+class Meter:
+    """Per-day Venice requests and dollars, persisted in the gateway's own
+    volume. A request is counted when it is forwarded; its cost is settled
+    from the response's `usage`, or charged a fixed pessimistic amount when
+    the response carries none. A meter file that cannot be read stops all
+    calls for the day (fail closed)."""
+
+    def __init__(self, state_dir, max_usd, max_requests, prices, unmetered_usd, clock=time.time):
+        self.dir = state_dir
+        self.max_usd = max_usd
+        self.max_requests = max_requests
+        self.prices = prices or parse_prices(DEFAULT_PRICES)
+        self.unmetered = unmetered_usd
+        self.clock = clock
+        self.lock = threading.Lock()
+
+    def _path(self):
+        return os.path.join(self.dir, "meter-%s.json" % time.strftime("%Y-%m-%d", time.gmtime(self.clock())))
+
+    def _load(self):
+        p = self._path()
+        if not os.path.lexists(p):
+            return {"requests": 0, "usd": 0.0, "unmetered": 0}
+        rec, ok = flags.read(p)
+        if not ok or not isinstance(rec.get("requests"), int) or not isinstance(rec.get("usd"), (int, float)) \
+                or rec["requests"] < 0 or rec["usd"] < 0:
+            raise Deny(503, "the Venice meter is unreadable; model calls are refused today")
+        return rec
+
+    def _save(self, rec):
+        rec.update(date=time.strftime("%Y-%m-%d", time.gmtime(self.clock())), ceiling_usd=self.max_usd,
+                   max_requests=self.max_requests)
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            safe_write_json(self._path(), rec)
+        except OSError:
+            raise Deny(503, "the Venice meter cannot be written; model calls are refused")
+
+    def price(self, model):
+        if model in self.prices:
+            return self.prices[model]
+        return tuple(max(p[i] for p in self.prices.values()) for i in range(3))
+
+    def cost(self, model, usage):
+        """USD for an OpenAI-style usage object, or None when it is unusable."""
+        if not isinstance(usage, dict):
+            return None
+        prompt, completion = _count(usage.get("prompt_tokens")), _count(usage.get("completion_tokens"))
+        if prompt is None or completion is None:
+            return None
+        details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+        cached = min(_count(details.get("cached_tokens")) or 0, prompt)
+        p_in, p_out, p_cache = self.price(model)
+        return ((prompt - cached) * p_in + cached * p_cache + completion * p_out) / 1e6
+
+    def reserve(self):
+        with self.lock:
+            rec = self._load()
+            if rec["usd"] >= self.max_usd:
+                raise Deny(429, "the daily Venice spend ceiling ($%.2f) is reached; model calls resume tomorrow (UTC)"
+                           % self.max_usd)
+            if rec["requests"] >= self.max_requests:
+                raise Deny(429, "the daily Venice request ceiling (%d) is reached" % self.max_requests)
+            rec["requests"] += 1
+            self._save(rec)
+
+    def settle(self, model, status, usage):
+        cost = self.cost(model, usage)
+        if cost is None:
+            cost = self.unmetered if 200 <= status < 300 else 0.0
+            unmetered = 1 if 200 <= status < 300 else 0
+        else:
+            unmetered = 0
+        with self.lock:
+            try:
+                rec = self._load()
+            except Deny:
+                return
+            rec["usd"] = round(rec["usd"] + cost, 6)
+            rec["unmetered"] = rec.get("unmetered", 0) + unmetered
+            try:
+                self._save(rec)
+            except Deny:
+                pass
+
+
+class UsageTap:
+    """Collects a relayed response (bounded) and settles the meter from the
+    `usage` object, whether the body is JSON or a server-sent event stream."""
+
+    LIMIT = 4 * 1024 * 1024
+
+    def __init__(self, meter, model):
+        self.meter, self.model, self.buf, self.done = meter, model, bytearray(), False
+
+    def feed(self, chunk):
+        if len(self.buf) < self.LIMIT:
+            self.buf += chunk[: self.LIMIT - len(self.buf)]
+
+    def usage(self):
+        text = bytes(self.buf).decode("utf-8", errors="replace")
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj.get("usage")
+        except ValueError:
+            pass
+        for line in reversed(text.splitlines()):
+            if line.startswith("data:") and '"usage"' in line:
+                try:
+                    obj = json.loads(line[5:].strip())
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
+                    return obj["usage"]
+        return None
+
+    def finish(self, status):
+        if not self.done:
+            self.done = True
+            self.meter.settle(self.model, status, self.usage())
+
+
+def safe_write_json(path, obj):
+    """Write via a random O_EXCL|O_NOFOLLOW temp name, then rename: a planted
+    symlink or FIFO at a predictable temp path can neither redirect nor
+    block the write."""
+    d = os.path.dirname(path) or "."
+    tmp = os.path.join(d, ".%s.%s.tmp" % (os.path.basename(path), os.urandom(8).hex()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def venice_policy(ctx, method, path, body):
     if method == "GET" and path == "/api/v1/models":
         return Forward("GET", path)
     if method != "POST" or path != "/api/v1/chat/completions":
         raise Deny(403, "only chat/completions (POST) and models (GET) are forwarded")
+    control_gate(ctx)
     data = strict_json(body)
     only_keys(data, VENICE_TOP, "request")
     if data.get("model") not in ctx["models"]:
@@ -199,7 +390,14 @@ def venice_policy(ctx, method, path, body):
                     raise Deny(403, f"content part type {kind!r} is not forwarded")
         elif content is not None and not isinstance(content, str):
             raise Deny(400, "message content must be text or parts")
-    return Forward("POST", path, body=data)
+    if data.get("stream"):
+        # Venice only reports usage on a stream when asked; the meter needs it.
+        data["stream_options"] = {"include_usage": True}
+    meter = ctx.get("meter")
+    if meter is None:
+        return Forward("POST", path, body=data)
+    meter.reserve()
+    return Forward("POST", path, body=data, tap=UsageTap(meter, data["model"]))
 
 
 # --- agentmail -------------------------------------------------------------
@@ -617,7 +815,23 @@ def load_config(env=os.environ):
         "consumed_dir": os.path.join(env.get("GATEWAY_STATE_DIR", "/state/gateway"), "consumed"),
         "state_dir": env.get("GATEWAY_STATE_DIR", "/state/gateway"),
         "credential_dir": env.get("CREDENTIAL_STATUS_DIR") or None,
+        "control_dir": env.get("CONTROL_DIR") or None,
+        "require_armed": env.get("CONTROL_REQUIRE_ARMED", "0") == "1",
+        "armed_max_age": int(env.get("CONTROL_ARMED_MAX_AGE_SECONDS", "900")),
+        "meter": None,
     }
+    if name == "venice":
+        try:
+            max_usd = float(env.get("VENICE_MAX_USD_PER_DAY", "5"))
+            max_req = int(env.get("VENICE_MAX_REQUESTS_PER_DAY", "2000"))
+            unmetered = float(env.get("VENICE_UNMETERED_USD_PER_REQUEST", "0.05"))
+        except ValueError:
+            raise SystemExit("VENICE_MAX_USD_PER_DAY, VENICE_MAX_REQUESTS_PER_DAY and "
+                             "VENICE_UNMETERED_USD_PER_REQUEST must be numbers")
+        if max_usd < 0 or max_req < 0 or unmetered < 0:
+            raise SystemExit("Venice meter limits must not be negative")
+        cfg["meter"] = Meter(os.path.join(cfg["state_dir"], "meter"), max_usd, max_req,
+                             parse_prices(env.get("VENICE_PRICES") or DEFAULT_PRICES), unmetered)
     if name == "venice" and not cfg["models"]:
         raise SystemExit("VENICE_MODELS is required")
     if name == "agentmail" and not cfg["inbox"]:
@@ -751,6 +965,8 @@ def make_handler(cfg):
                     conn.request(decision.method, target, body=payload or None, headers=headers)
                     resp = conn.getresponse()
                 except OSError:
+                    if decision.tap:
+                        decision.tap.finish(502)
                     return self._json(502, {"error": "upstream unreachable"}, shown)
                 if decision.after:
                     data = resp.read(MAX_BODY)
@@ -768,12 +984,14 @@ def make_handler(cfg):
                     self.wfile.write(data)
                     self._log(resp.status, shown)
                     return
-                self._relay(resp, conn, shown, cap=None)
+                self._relay(resp, conn, shown, cap=None, tap=decision.tap)
             finally:
+                if decision.tap:
+                    decision.tap.finish(0)
                 if decision.release:
                     decision.release()
 
-        def _relay(self, resp, conn, shown, cap):
+        def _relay(self, resp, conn, shown, cap, tap=None):
             self.send_response(resp.status)
             for k, v in resp.getheaders():
                 if k.lower() in FWD_RESP_HEADERS or k.lower().startswith("x-ratelimit"):
@@ -789,6 +1007,8 @@ def make_handler(cfg):
                     if cap is not None and sent + len(chunk) > cap:
                         self.wfile.write(chunk[: cap - sent])
                         break
+                    if tap:
+                        tap.feed(chunk)
                     self.wfile.write(chunk)
                     self.wfile.flush()
                     sent += len(chunk)
@@ -796,6 +1016,8 @@ def make_handler(cfg):
                 pass
             finally:
                 conn.close()
+                if tap:
+                    tap.finish(resp.status)
             self._log(resp.status, shown)
 
         def _fetch(self, f, shown):
@@ -839,16 +1061,29 @@ PROBES = {
 
 
 def probe_once(cfg, call):
-    """call(method, path, body) -> HTTP status, raising Deny when unreachable."""
+    """call(method, path, body) -> (HTTP status, body bytes), raising Deny
+    when unreachable. 402 and an explicit accessPermitted: false (Venice) are
+    'exhausted'; 429 is 'rate_limited'."""
     method, path, body = PROBES[cfg["name"]]
     try:
-        status = call(method, path.format(inbox=cfg["inbox"]), body)
+        status, data = call(method, path.format(inbox=cfg["inbox"]), body)
     except Deny:
         return "error", 0
-    if 200 <= status < 300:
-        return "ok", status
+    if status == 402:
+        return "exhausted", status
+    if status == 429:
+        return "rate_limited", status
     if status in (401, 403):
         return "rejected", status
+    if 200 <= status < 300:
+        if cfg["name"] == "venice":
+            try:
+                info = json.loads(data).get("data", {})
+            except (ValueError, AttributeError):
+                info = {}
+            if isinstance(info, dict) and info.get("accessPermitted") is False:
+                return "exhausted", status
+        return "ok", status
     return "error", status
 
 
@@ -863,10 +1098,7 @@ def write_probe(cfg, result, status, now=None):
         last_ok = None
     rec = {"route": cfg["name"], "result": result, "http_status": status, "checked_at": now,
            "last_ok_at": now if result == "ok" else last_ok}
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(rec, f)
-    os.replace(tmp, path)
+    safe_write_json(path, rec)
     return rec
 
 
@@ -900,8 +1132,7 @@ def main():
                 conn.request(method, (up.path.rstrip("/") + quote(path, safe="/@:")) or "/", body=payload,
                              headers=headers)
                 resp = conn.getresponse()
-                resp.read(MAX_BODY)
-                return resp.status
+                return resp.status, resp.read(1024 * 1024)
             except OSError:
                 raise Deny(502, "upstream unreachable")
             finally:

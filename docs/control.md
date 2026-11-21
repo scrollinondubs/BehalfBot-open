@@ -1,7 +1,17 @@
-# Control: kill switch, caps, alerts, credential expiry
+# Control: kill switch, spend ceiling, alerts, credential expiry
 
-Jill v2 package C (#49, part of #46). Everything here works without a model.
+Jill v2 package C (#49, part of #46). Nothing here needs a model to work.
 None of it gives Jill a new secret or a new way out of her container.
+
+**Two facts first:**
+
+- **Halt stops chat.** `venice-proxy` refuses every model call while Jill
+  is halted, chat included, so a run already in progress fails at its next
+  model step.
+- **Heartbeats are off by default.** Jill launches with no scheduled work
+  and runs only when Sean messages her (Sean, 2026-11-21). The dispatcher
+  sits behind the `heartbeats` compose profile and does not start unless
+  you ask for it.
 
 ## The pieces
 
@@ -10,22 +20,24 @@ Sean (Matrix control room, NOT encrypted)
    |  halt / resume / conserve / unconserve / status
    v
 jill-control  (gateway/control.py)            holds MATRIX_CONTROL_TOKEN
-   | writes                 ^ drains                  ^ reads
-   v                        |                         |
-control-state volume    alert-spool volume     credential-status volume
- halt.json                (dispatcher writes)    (venice/agentmail/siyuan
- conservation-mode.json                           proxies write status-only
- armed.json                                       probe results)
-   | read-only
-   v
-heartbeat-dispatcher  -> skips everything while halted or unarmed,
-                         enforces daily caps, raises the all-failed alarm
+   | writes                ^ reads                 ^ reads          ^ drains
+   v                       |                       |                |
+control-state            cred-venice,           venice-meter     alert-spool
+ halt.json               cred-agentmail,        (venice-proxy    (dispatcher
+ conservation-mode.json  cred-siyuan            writes)          writes, when
+ armed.json              (one per gateway,                       heartbeats
+   | read-only            each gateway writes                    are on)
+   v                      only its own)
+venice-proxy  -> refuses chat/completions while halted or unarmed;
+                 meters every call; hard daily ceiling
+dispatcher    -> (heartbeats profile only) skips everything while halted
+                 or unarmed; caps; all-failed alarm
 ```
 
-`opencode-serve` (Jill) mounts none of the three volumes and cannot reach
+`opencode-serve` (Jill) mounts none of these volumes and cannot reach
 `jill-control`. That sidecar is not on `jill-internal` and listens on no
-port. The boot self-test (`selftest/contain.sh`) checks all of this from
-inside serve.
+port. `selftest/contain.sh` checks all of this from inside serve at every
+boot.
 
 ## Kill switch
 
@@ -33,159 +45,143 @@ Send one of these as a whole message in the control room:
 
 | Word | Effect |
 |---|---|
-| `halt [2h] [reason]` (also `mute`, `silence`) | Every heartbeat is skipped from the next dispatcher tick, `critical` ones included |
+| `halt [2h] [reason]` (also `mute`, `silence`) | `venice-proxy` refuses every model call, chat included. Heartbeats (if on) are skipped, `critical` too |
 | `resume` (also `unmute`, `unhalt`) | Clears halt and conservation |
-| `conserve [2h] [reason]` (also `throttle`, `conservation on`) | Only `critical` heartbeats run |
+| `conserve [2h] [reason]` (also `throttle`, `conservation on`) | Heartbeats: only `critical` ones run. Chat is unaffected |
 | `unconserve` (also `conservation off`) | Clears conservation |
 | `status` | Reports both flags |
 
-A duration (`30m`, `2h`, `3d`) sets an auto-lift. With no duration the flag
-stays set until you say `resume`.
+- **Duration.** A duration (`30m`, `2h`, `3d`, at least `1m`) sets an auto-lift. `halt 0m` is refused with an ack, because it would lift immediately. With no duration the flag stays until `resume`.
+- **Who.** Only `MATRIX_PRINCIPAL` (your full Matrix user id) is obeyed. Display names are never compared.
+- **Ignored entirely:** edits, a control word inside a sentence, and encrypted events.
+- **Age rule.** `halt` and `conserve` are honoured at any age, in the order sent: a late stop is still a stop. `resume` and `unconserve` older than 10 minutes are NOT applied, and the room gets an ack saying so; send them again if you still mean them. A stale `status` is ignored silently.
 
-Only `MATRIX_PRINCIPAL` (your full Matrix user id) is obeyed. Display names
-are never compared. The following are ignored: messages older than 10
-minutes, edits, a control word inside a sentence, and encrypted events.
-
-**What halt does not stop:** chat with Jill through her bridge (only you
-drive that), and the one scheduled run already in progress (it finishes, up
-to about 20 minutes). The dispatcher checks the flag at the start of every
-tick, before every run and before every retry. The halt gate is the
-dispatcher's. The ack says so.
+**What halt does not stop:** a tool call already executing finishes. This
+room keeps listening, so `resume` still works.
 
 **Fail-closed rules**
 
-- A `halt.json` that cannot be parsed, or whose auto-lift time cannot be
-  parsed, reads as halted.
-- In compose the dispatcher also needs a fresh `armed.json`
-  (`CONTROL_REQUIRE_ARMED=1`). `jill-control` rewrites it after every
-  successful read of the control room. If it is older than 15 minutes, the
-  kill switch is not listening, so nothing fires and one alert goes out.
-- The dispatcher does not start until `jill-control` passes its boot
-  self-test and reports healthy.
+- **Malformed flag file.** It reads as halted if it cannot be parsed, has an `enabled` that is not the boolean `true`/`false`, or has an `auto_lift_after` that is not exactly `YYYY-MM-DDTHH:MM:SSZ`.
+- **Bad file types.** A flag, cursor, meter or probe file that is a symlink, a FIFO or larger than 64 KB is not read; a flag in that state reads as halted.
+- **Unarmed switch.** `venice-proxy` and the dispatcher both need a fresh `armed.json` (`CONTROL_REQUIRE_ARMED=1`). `jill-control` rewrites it after every successful read of the control room. If it is older than 15 minutes, the switch is not listening, so model calls and heartbeats stop.
+- **Boot.** `jill-control` retries its boot self-test with backoff (5s up to 5 min) until it passes: token valid, both rooms joined and unencrypted, control room readable. It reports healthy only after that.
 
 ### Why an unencrypted control room
 
 Jill's chat room is end-to-end encrypted (Sean, 2026-11-20). `jill-control`
-holds no Megolm keys, so it cannot read an encrypted room. A switch that
-silently never fires is worse than none. It refuses to arm on an encrypted
-room, the same rule as the chassis listener.
+holds no Megolm keys, so it cannot read an encrypted room, and a switch that
+silently never fires is worse than none. So the control room is a separate,
+unencrypted room.
 
-So the control room is a separate, unencrypted room. **The homeserver runs
-in Jax's Docker, so anything posted there is readable on Jax's side.** That
-is why every alert is content-free: fixed templates carrying heartbeat
-names, counts and dollar figures only. Never model output, gather data,
-prompt text or log lines. The E2EE chat bridge (package D, #50) is separate.
-It can carry content, and it can take over alert delivery later without any
-change to the spool format.
+**The homeserver runs in Jax's Docker, so anything posted there is readable
+on Jax's side, and a homeserver admin could forge a message from Sean.** For
+the first reason, every alert is content-free: fixed templates with names,
+counts and dollar figures only. The E2EE chat bridge (package D, #50) is
+separate and can take over alert delivery later with no change to the spool
+format.
 
-## Alerts
+## The Venice ceiling (the main spend control)
 
-The dispatcher writes `{"kind": "...", "text": "..."}` files into the
-spool. `jill-control` posts each one to `MATRIX_ALERTS_ROOM` (default: the
-control room) as `[Jill] <text>` and deletes it. Files it cannot parse go to
-`rejected/`. Undelivered alerts stay in the spool and are retried. At most
-`ALERTS_PER_HOUR` (default 20) are posted per hour.
+All of Jill's spend goes through `venice-proxy`, so the ceiling lives there:
 
-| kind | when |
-|---|---|
-| `spend-cap` | today's dispatcher spend reached `DISPATCHER_MAX_USD_PER_DAY` (once a day) |
-| `fire-cap` | a heartbeat hit its daily fire cap (once per heartbeat per day) |
-| `all-failed` | runs failing across several heartbeats (cooldown 4h) |
-| `recovered` | the first success after an `all-failed` |
-| `unarmed` | the kill switch stopped listening (once a day) |
-| `validator` | the Five Failure Modes validator quarantined an artifact (mode only) |
-| `spend-unmeasured` | a successful run reported no tokens and no cost, so the spend caps cannot see it (once a day) |
+| Setting | Default | What |
+|---|---|---|
+| `VENICE_MAX_USD_PER_DAY` | `5` | hard ceiling; past it every model call gets HTTP 429 until midnight UTC |
+| `VENICE_ALERT_USD_PER_DAY` | `1` | one Matrix alert a day when spend crosses it (read by jill-control) |
+| `VENICE_MAX_REQUESTS_PER_DAY` | `2000` | hard request ceiling |
+| `VENICE_UNMETERED_USD_PER_REQUEST` | `0.05` | charged for a successful response that carries no `usage` |
+| `VENICE_PRICES` | GLM 5.2 $1.40/$4.40/$0.26, GLM 5.3 Flash $0.17/$0.55/$0.03 per 1M tokens | in:out:cached; an unlisted model pays the highest listed rate |
 
-`jill-control` posts its own alerts too: one at boot ("Kill switch armed"),
-when an auto-lift clears a flag, and for credential stage changes.
+**How metering works**
 
-`DISCORD_OPS_WEBHOOK_URL`, when set, gets the same text as well.
+- **Count first.** A request is counted when it is forwarded.
+- **Settle from usage.** Its cost is settled from the `usage` object of the response. The gateway sets `stream_options.include_usage` on every streamed request, so streams report it too.
+- **No usage.** A response without usage is charged the flat amount, and jill-control alerts once that day.
+- **Unreadable meter.** A meter file that cannot be read stops every call for the day, with an alert.
+- **Overshoot.** A call that starts under the ceiling finishes, so the ceiling can be overshot by one call.
 
-## Dispatcher caps
+Prices are list prices seen 2026-11-21, partly from third-party pages.
+Confirm them against venice.ai/pricing.
+
+## Heartbeats (off by default)
+
+To turn them on: `cp HEARTBEATS.md.template HEARTBEATS.md`, then
+`docker compose --profile heartbeats up -d`. The dispatcher then:
+
+- runs `scheduled-tasks/dispatcher-selftest.sh` first, and refuses to loop if it fails;
+- skips everything while halted or unarmed, checked at tick start, before every run, before every retry, and before the validator and notification;
+- refuses to run if `heartbeat-state.json` is not a JSON object (one alert), and never writes an empty or invalid state;
+- refuses state writes, and stops the tick, if its state lock is held by a live process for 10s; an orphaned lock (no pid) is removed with an alert;
+- enforces caps:
 
 | Setting | Default | Scope |
 |---|---|---|
-| `DISPATCHER_MAX_USD_PER_DAY` | `5` | all heartbeats together, `critical` included |
-| `DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY` | `24` | each heartbeat that sets no `max_fires_per_day`; `0` turns the default off |
-| `max_fires_per_day:` (HEARTBEATS.md) | none | one heartbeat |
-| `max_usd_per_day:` (HEARTBEATS.md) | none | one heartbeat plus its validator runs |
+| `DISPATCHER_MAX_USD_PER_DAY` | `1`, alert at 50% | all heartbeats, `critical` included |
+| `DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY` | `24` | each heartbeat that sets no `max_fires_per_day`; `0` = off |
+| `max_fires_per_day:` / `max_usd_per_day:` | none | one heartbeat |
 
-Caps are absolute until the date rolls. A changed condition does not lift
-one. A cap suppresses the model run, not just a notification.
+**Telemetry**
 
-**Spend is estimated from tokens.** `opencode.json` carries no prices, so
-OpenCode reports `cost: 0`. A cap that sums zeros never trips. Each
-telemetry row records `cost_usd` as the larger of OpenCode's figure and
-`tokens x VENICE_PRICES`, plus `reported_cost_usd`. The default prices are
-Venice list prices for GLM 5.2 ($1.40 in, $4.40 out, $0.26 cached per
-million tokens) and GLM 5.3 Flash ($0.17 / $0.55 / $0.03), as seen
-2026-11-21. A model missing from the table is priced at the highest rate
-listed, so it is over-counted, never free.
+- **Clamping.** Spend comes from the dispatcher's telemetry. Every cost and token value is clamped to a non-negative number.
+- **Fail-closed.** Any of these reads as "cap reached", with an alert:
+  - a row with a value that is not one;
+  - an unparseable row;
+  - an unreadable telemetry file;
+  - a run that left no telemetry row.
+- **Estimated cost.** OpenCode reports `cost: 0` for an unpriced model, so `cost_usd` is the larger of that and tokens x `VENICE_PRICES`.
 
-**The cap covers the dispatcher only.** Chat through the bridge is not
-counted or capped.
+**All-runs-failed alarm** (chassis 22fdfd4): it fires once (4h cooldown)
+after 3 failed runs across at least 2 heartbeats. It never quotes stderr.
 
-The chassis's alert dedup (`realert_after`, `dedupe_key`) and suppression
-ledger are not ported.
+## Alerts
 
-## All-runs-failed alarm
+Two senders write to the alerts room (`MATRIX_ALERTS_ROOM`, default the
+control room), as `[Jill] <text>`:
 
-Ported from chassis 22fdfd4. The alarm fires once (4h cooldown) after
-`OPENCODE_GLOBAL_FAIL_THRESHOLD` (3) consecutive failed runs across at least
-`OPENCODE_GLOBAL_DISTINCT_THRESHOLD` (2) different heartbeats. Without it,
-each failing heartbeat opens its own circuit breaker and goes quiet, and the
-install looks healthy from outside. The first success clears it and posts a
-recovery. Unlike the chassis, the alert does not quote the last error line,
-because opencode's stderr can carry prompt text.
+- **jill-control:**
+  - the boot announcement and auto-lifts;
+  - the Venice meter: alert line, hard ceiling, responses without usage, unreadable meter;
+  - credential stage changes.
+- **The dispatcher (heartbeats on only):** spool files (`spend-cap`, `spend-half`, `fire-cap`, `all-failed`, `recovered`, `unarmed`, `validator`, `spend-unmeasured`, `state-invalid`, `state-lock`).
+
+At most `ALERTS_PER_HOUR` (20) are posted. Undelivered alerts are retried.
+Malformed spool files go to `rejected/`. Dollar figures are rounded to cents.
 
 ## Credential expiry
 
-Jill's keys live only in the gateways, so the gateways check them:
-
-| id | how | where the key lives |
+| id | probe (by the gateway holding the key) | stages beyond ok |
 |---|---|---|
-| `venice` | `GET /api/v1/api_keys/rate_limits` (free) every `CREDENTIAL_PROBE_SECONDS` | venice-proxy |
-| `agentmail` | `GET /v0/inboxes/<inbox>` | agentmail-proxy |
-| `siyuan` | `POST /api/notebook/lsNotebooks` | siyuan-proxy |
-| `matrix` | `whoami` with the control token | jill-control |
-| anything | an expiry date in `CREDENTIAL_EXPIRES`, e.g. `brave=2027-03-01,discord=2027-06-30` | n/a |
+| `venice` | `GET /api/v1/api_keys/rate_limits` (free); `data.accessPermitted: false` is `exhausted` | rejected (401/403), exhausted (402 or no access), rate_limited (429) |
+| `agentmail` | `GET /v0/inboxes/<inbox>` | same HTTP mapping |
+| `siyuan` | `POST /api/notebook/lsNotebooks` | same HTTP mapping |
+| `matrix` | `whoami` with the control token (jill-control) | rejected, unknown |
+| anything | a date in `CREDENTIAL_EXPIRES`, e.g. `brave=2027-03-01` | t7, t1, expired |
 
-A gateway writes `{route, result, http_status, checked_at, last_ok_at}` to
-`credential-status/<route>.json`. The record never holds the key or a
-response body. `jill-control` turns these into stages:
+Each gateway writes `{route, result, http_status, checked_at, last_ok_at}`
+to its OWN volume. It writes through a random `O_EXCL|O_NOFOLLOW` temp
+file. The record never holds the key or a response body.
 
-- `rejected` - the upstream answered 401 or 403.
-- `unknown` - no probe for 3 intervals, or no success for over a day.
-- `missing` - a credential in `CREDENTIAL_EXPECT` has no record after 2 intervals.
-- `t7` / `t1` / `expired` - from the dates in `CREDENTIAL_EXPIRES`.
-
-It alerts once per stage change. `rejected`, `expired`, `missing` and
-`unknown` re-alert every `CREDENTIAL_REALERT_DAYS` (3). A return to `ok`
-posts once and clears the record.
+`jill-control` mounts each volume read-only at
+`/state/credentials/<gateway>/`, so no gateway can fake another's record.
+It alerts on every stage change. A stage that does not resolve itself
+(rejected, exhausted, rate_limited, expired, missing, unknown) is alerted
+again every 3 days. A return to `ok` posts once.
 
 `CREDENTIAL_EXPECT` defaults to `venice`. Add `agentmail` and `siyuan` once
-their keys are set. Brave's key sits in `brave-mcp`, which is not a gateway
-and cannot be probed, so give it a date in `CREDENTIAL_EXPIRES`.
-
-No model is in this path on purpose. A dead Venice key means the model
-cannot run, so an alert that needed the model would never arrive.
+their keys are set.
 
 ## Setup
 
-1. Create a Matrix account for the switch (for example `@jill-control:<server>`) and an access token for it.
-2. Create an **unencrypted** room, invite the bot and yourself, and have the bot join.
-3. In `.env`: `MATRIX_CONTROL_TOKEN`, `MATRIX_PRINCIPAL` (your full user id), `MATRIX_CONTROL_ROOM` (the `!room:server` id). Optionally `MATRIX_HOMESERVER`, `MATRIX_ALERTS_ROOM`, `CREDENTIAL_EXPECT` and `CREDENTIAL_EXPIRES`.
-4. `docker compose up -d jill-control`, then `docker logs behalfbot-jill-control`. It says `ARMED`, or it lists exactly what is wrong. "Kill switch armed" appears in the room.
-5. Say `status` in the room to see the ack.
+1. Create a Matrix account for the switch, and an access token for it.
+2. Create an **unencrypted** room. Invite the bot and yourself, and have the bot join.
+3. In `.env`, set `MATRIX_CONTROL_TOKEN`, `MATRIX_PRINCIPAL` and `MATRIX_CONTROL_ROOM`. Optionally set the `VENICE_*` limits, `CREDENTIAL_EXPECT` and `CREDENTIAL_EXPIRES`.
+4. `docker compose up -d`, then `docker logs behalfbot-jill-control`. It logs `ARMED`, or exactly what is wrong. Until it is armed, `venice-proxy` refuses model calls.
+5. Say `status` in the room.
 
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests/control -v   # jill-control vs a fake homeserver
-python3 -m unittest discover -s tests/gateway -v   # includes the credential probe
+python3 -m unittest discover -s tests/gateway -v   # incl. venice gate + meter, credential probe
 bash scheduled-tasks/dispatcher-selftest.sh        # real dispatcher ticks, fake opencode
 ```
-
-The dispatcher self-test also runs in compose before the dispatcher loop
-starts (`SELFTEST_LIVE=1` adds the mount checks). A failure stops the
-dispatcher.

@@ -31,10 +31,15 @@ class Probe(unittest.TestCase):
     def test_result_mapping(self):
         with tempfile.TemporaryDirectory() as d:
             c = cfg("venice", d)
-            self.assertEqual(g.probe_once(c, lambda m, p, b: 200), ("ok", 200))
-            self.assertEqual(g.probe_once(c, lambda m, p, b: 401), ("rejected", 401))
-            self.assertEqual(g.probe_once(c, lambda m, p, b: 403), ("rejected", 403))
-            self.assertEqual(g.probe_once(c, lambda m, p, b: 503), ("error", 503))
+            r = lambda st, body=b"{}": (lambda m, p, b: (st, body))
+            self.assertEqual(g.probe_once(c, r(200)), ("ok", 200))
+            self.assertEqual(g.probe_once(c, r(401)), ("rejected", 401))
+            self.assertEqual(g.probe_once(c, r(403)), ("rejected", 403))
+            self.assertEqual(g.probe_once(c, r(503)), ("error", 503))
+            self.assertEqual(g.probe_once(c, r(402)), ("exhausted", 402))
+            self.assertEqual(g.probe_once(c, r(429)), ("rate_limited", 429))
+            self.assertEqual(g.probe_once(c, r(200, b'{"data": {"accessPermitted": false}}')), ("exhausted", 200))
+            self.assertEqual(g.probe_once(c, r(200, b'{"data": {"accessPermitted": true}}')), ("ok", 200))
 
             def down(m, p, b):
                 raise g.Deny(502, "upstream unreachable")
@@ -45,7 +50,7 @@ class Probe(unittest.TestCase):
         seen = {}
         with tempfile.TemporaryDirectory() as d:
             for route in ("venice", "agentmail", "siyuan"):
-                g.probe_once(cfg(route, d), lambda m, p, b, r=route: seen.setdefault(r, (m, p)) and 200)
+                g.probe_once(cfg(route, d), lambda m, p, b, r=route: (seen.setdefault(r, (m, p)) and 200, b"{}"))
         self.assertEqual(seen["venice"], ("GET", "/api/v1/api_keys/rate_limits"))
         self.assertEqual(seen["agentmail"], ("GET", "/v0/inboxes/jill-agent@agentmail.to"))
         self.assertEqual(seen["siyuan"], ("POST", "/api/notebook/lsNotebooks"))
@@ -59,6 +64,16 @@ class Probe(unittest.TestCase):
             raw = open(os.path.join(d, "venice.json")).read()
             self.assertNotIn(KEY, raw)
             self.assertEqual(set(json.loads(raw)), {"route", "result", "http_status", "checked_at", "last_ok_at"})
+
+    def test_status_write_refuses_planted_links_and_uses_a_random_temp(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg("venice", d)
+            target = os.path.join(d, "elsewhere")
+            os.symlink(target, os.path.join(d, "venice.json.tmp"))
+            g.write_probe(c, "ok", 200, now=1)
+            self.assertFalse(os.path.exists(target), "a planted temp symlink must not be followed")
+            self.assertEqual(json.load(open(os.path.join(d, "venice.json")))["result"], "ok")
+            self.assertEqual([n for n in os.listdir(d) if n.startswith(".venice")], [])
 
     def test_routes_without_a_probe_and_unset_dir(self):
         with tempfile.TemporaryDirectory() as d:

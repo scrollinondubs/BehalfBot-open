@@ -155,7 +155,7 @@ class Parsing(unittest.TestCase):
         self.assertEqual(c.parse_event(ev(), PRINCIPAL), ("halt", ""))
         self.assertEqual(c.parse_event(ev(sender="@mallory:example.org"), PRINCIPAL)[1], "sender")
         self.assertEqual(c.parse_event(ev(type="m.room.encrypted"), PRINCIPAL)[1], "encrypted")
-        self.assertEqual(c.parse_event(ev(origin_server_ts=now - 11 * 60 * 1000), PRINCIPAL)[1], "stale")
+        self.assertEqual(c.parse_event(ev(origin_server_ts=now - 11 * 60 * 1000), PRINCIPAL), ("halt", "stale"))
         edit = ev(content={"msgtype": "m.text", "body": "halt", "m.relates_to": {"rel_type": "m.replace"}})
         self.assertEqual(c.parse_event(edit, PRINCIPAL)[1], "edit")
         self.assertEqual(c.parse_event(ev(content={"msgtype": "m.notice", "body": "halt"}), PRINCIPAL)[1], "msgtype")
@@ -188,6 +188,33 @@ class Flags(unittest.TestCase):
                 f.write('{"enabled": tru')
             self.assertEqual(flags.state(p), "on", "an unreadable flag must read as on")
 
+    def test_f6_strict_schema(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "halt.json")
+            for enabled in ('"true"', "1", "null", '"false"'):
+                with open(p, "w") as f:
+                    f.write('{"enabled": %s}' % enabled)
+                self.assertEqual(flags.state(p), "on", "enabled=%s is not a boolean, so invalid, so on" % enabled)
+            for lift in ("2001-01-01T00:00:00+00:00", "2001-01-01 00:00:00Z", "2001-01-01", ""):
+                flags.write(p, True, "t", lift, None)
+                self.assertEqual(flags.state(p), "on", "auto_lift_after %r must be rejected" % lift)
+            with open(p, "w") as f:
+                f.write('{"enabled": false}')
+            self.assertEqual(flags.state(p), "off")
+
+    def test_f5_symlinks_and_fifos_are_not_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real.json")
+            flags.write(real, False)
+            link = os.path.join(d, "halt.json")
+            os.symlink(real, link)
+            self.assertEqual(flags.read(link)[1], False)
+            fifo = os.path.join(d, "fifo.json")
+            os.mkfifo(fifo)
+            started = time.time()
+            self.assertEqual(flags.read(fifo), ({}, False))
+            self.assertLess(time.time() - started, 2, "a FIFO must not block the reader")
+
 
 class KillSwitch(Base):
     def test_first_poll_takes_position_and_acts_on_nothing(self):
@@ -217,16 +244,57 @@ class KillSwitch(Base):
         self.assertEqual(flags.state(self.cons), "off")
         self.assertIn("RESUMED", self.hs.sent[-1][1])
 
-    def test_ignores_others_sentences_edits_and_stale(self):
+    def test_ignores_others_sentences_and_edits(self):
         self.ctl.poll_room()
         self.hs.say("halt", sender="@mallory:example.org")
         self.hs.say("we should halt this")
-        self.hs.say("halt", age_s=3600)
         self.hs.say("halt", content={"m.relates_to": {"rel_type": "m.replace"}})
         self.hs.say("halt", type="m.room.encrypted")
         self.ctl.poll_room()
         self.assertEqual(flags.state(self.halt), "off")
         self.assertEqual(self.hs.sent, [])
+
+    def test_f3_old_halt_and_conserve_are_honoured_in_order(self):
+        self.ctl.poll_room()
+        self.hs.say("conserve", age_s=7200)
+        self.hs.say("halt", age_s=3600)
+        self.ctl.poll_room()
+        self.assertEqual(flags.state(self.halt), "on", "a late halt is still a halt")
+        self.assertEqual(flags.state(self.cons), "on")
+        self.assertIn("CONSERVATION ON", self.hs.sent[0][1])
+        self.assertIn("HALTED", self.hs.sent[1][1])
+
+    def test_f3_old_resume_and_unconserve_are_ignored_with_an_ack(self):
+        flags.write(self.halt, True, "t", None, None)
+        flags.write(self.cons, True, "t", None, None)
+        self.ctl.poll_room()
+        self.hs.say("resume", age_s=3600)
+        self.hs.say("unconserve", age_s=3600)
+        self.hs.say("status", age_s=3600)
+        self.ctl.poll_room()
+        self.assertEqual(flags.state(self.halt), "on")
+        self.assertEqual(flags.state(self.cons), "on")
+        self.assertEqual(len(self.hs.sent), 2, "stale status is silent; stale lifts are acked")
+        self.assertTrue(all("Ignored a" in b for _, b in self.hs.sent))
+
+    def test_f3_halt_then_fresh_resume_in_one_batch(self):
+        self.ctl.poll_room()
+        self.hs.say("halt", age_s=3600)
+        self.hs.say("resume")
+        self.ctl.poll_room()
+        self.assertEqual(flags.state(self.halt), "off")
+
+    def test_f6_zero_duration_is_rejected(self):
+        self.assertEqual(c.parse_command("halt 0m")[0], "invalid")
+        self.ctl.poll_room()
+        self.hs.say("halt 0h")
+        self.ctl.poll_room()
+        self.assertEqual(flags.state(self.halt), "off")
+        self.assertIn("nothing changed", self.hs.sent[-1][1])
+
+    def test_f4_boot_fails_when_the_room_cannot_be_read(self):
+        self.ctl.poll_room = lambda: False
+        self.assertTrue(any("pagination" in f for f in c.boot(self.ctl)))
 
     def test_cursor_survives_restart(self):
         self.ctl.poll_room()
@@ -303,7 +371,8 @@ class Alerts(Base):
 
 class Credentials(Base):
     def status(self, route, **rec):
-        with open(os.path.join(self.cfg["cred_dir"], route + ".json"), "w") as f:
+        os.makedirs(os.path.join(self.cfg["cred_dir"], route), exist_ok=True)
+        with open(os.path.join(self.cfg["cred_dir"], route, route + ".json"), "w") as f:
             json.dump(dict({"route": route}, **rec), f)
 
     def test_stages(self):
@@ -319,6 +388,22 @@ class Credentials(Base):
         st = self.ctl.credential_stages()
         self.assertEqual(st["brave"][0], "t7")
         self.assertEqual(st["discord"][0], "expired")
+
+    def test_exhausted_and_rate_limited_alert_immediately(self):
+        now = time.time()
+        self.status("venice", result="exhausted", http_status=402, checked_at=now, last_ok_at=now - 60)
+        self.ctl.check_credentials()
+        self.assertIn("EXHAUSTED", self.hs.sent[-1][1])
+        self.status("venice", result="rate_limited", http_status=429, checked_at=now, last_ok_at=now - 60)
+        self.ctl.check_credentials()
+        self.assertIn("RATE_LIMITED", self.hs.sent[-1][1])
+
+    def test_f5_a_record_in_another_gateways_place_is_not_read(self):
+        now = time.time()
+        with open(os.path.join(self.cfg["cred_dir"], "venice.json"), "w") as f:
+            json.dump({"result": "ok", "checked_at": now, "last_ok_at": now}, f)
+        self.ctl.started -= 3 * self.cfg["probe_interval"]
+        self.assertEqual(self.ctl.credential_stages()["venice"][0], "missing")
 
     def test_missing_only_after_grace(self):
         self.assertNotIn("venice", self.ctl.credential_stages())
@@ -357,3 +442,32 @@ class Credentials(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MeterAlerts(Base):
+    def meter(self, **rec):
+        d = os.path.join(self.tmp.name, "meter")
+        os.makedirs(d, exist_ok=True)
+        self.cfg["meter_dir"] = d
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        with open(os.path.join(d, "meter-%s.json" % day), "w") as f:
+            f.write(rec.pop("_raw") if "_raw" in rec else json.dumps(rec))
+
+    def test_alert_line_then_ceiling_once_each_in_cents(self):
+        self.meter(usd=1.23456, requests=40, ceiling_usd=5, unmetered=0)
+        self.ctl.check_meter()
+        self.ctl.check_meter()
+        self.assertEqual(len(self.hs.sent), 1)
+        self.assertIn("$1.23", self.hs.sent[0][1])
+        self.assertNotIn("1.2345", self.hs.sent[0][1])
+        self.meter(usd=5.001, requests=90, ceiling_usd=5, unmetered=2)
+        self.ctl.check_meter()
+        bodies = " ".join(b for _, b in self.hs.sent)
+        self.assertIn("hard ceiling", bodies)
+        self.assertIn("carried no usage", bodies)
+        self.assertEqual(len(self.hs.sent), 3)
+
+    def test_unreadable_meter_alerts(self):
+        self.meter(_raw="{nope")
+        self.ctl.check_meter()
+        self.assertIn("cannot be read", self.hs.sent[0][1])

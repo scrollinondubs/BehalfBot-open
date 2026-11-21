@@ -19,6 +19,8 @@ the outage this exists to end.
 """
 import json
 import os
+import re
+import stat
 from datetime import datetime, timezone
 
 HALT = "halt.json"
@@ -30,9 +32,12 @@ def utcnow_iso(now=None):
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
 def parse_iso(ts):
-    """Epoch seconds, or None when unparseable."""
-    if not isinstance(ts, str) or not ts.strip():
+    """Epoch seconds, or None unless ts is exactly YYYY-MM-DDTHH:MM:SSZ."""
+    if not isinstance(ts, str) or not ISO_UTC.match(ts):
         return None
     raw = ts.strip().replace("Z", "+00:00")
     try:
@@ -50,15 +55,27 @@ MAX_BYTES = 64 * 1024
 def read(path):
     """(data, ok). ok is False when the file exists but is unreadable or
     larger than any flag, cursor or probe record has reason to be."""
+    # O_NOFOLLOW + O_NONBLOCK, then fstat: a symlink is refused, and a FIFO
+    # planted where a file should be can neither block this thread nor be
+    # read as data.
     try:
-        if os.path.getsize(path) > MAX_BYTES:
-            return {}, False
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return {}, True
-    except (OSError, ValueError):
+    except OSError:
         return {}, False
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+            return {}, False
+        with os.fdopen(fd, "rb") as fh:
+            fd = None
+            data = json.loads(fh.read(MAX_BYTES + 1).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}, False
+    finally:
+        if fd is not None:
+            os.close(fd)
     if not isinstance(data, dict):
         return {}, False
     return data, True
@@ -69,10 +86,13 @@ def state(path, now=None):
     data, ok = read(path)
     if not ok:
         return "on"
-    if data.get("enabled") is not True:
+    enabled = data.get("enabled", False)
+    if not isinstance(enabled, bool):
+        return "on"  # "true", 1, null: not a boolean, so invalid, so on
+    if enabled is not True:
         return "off"
     lift = data.get("auto_lift_after")
-    if lift in (None, ""):
+    if lift is None:
         return "on"
     epoch = parse_iso(lift)
     if epoch is None:

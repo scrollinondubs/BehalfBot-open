@@ -51,9 +51,11 @@
 #             listens for halt/resume from Sean, posts alerts and watches
 #             credential expiry. It is not on jill-internal and listens on
 #             no port. It shares only volumes, none of which serve mounts:
-#             control-state (it writes, dispatcher reads), alert-spool
-#             (dispatcher writes, it posts), credential-status (gateways
-#             write status-only probe results, it reads). docs/control.md.
+#             control-state (it writes; venice-proxy and dispatcher read),
+#             alert-spool (dispatcher writes, it posts), cred-<gateway>
+#             (each gateway writes its own probe result, it reads) and
+#             venice-meter (venice-proxy writes, it reads). venice-proxy
+#             refuses every model call while halted. docs/control.md.
 #
 #   Discord -> bridge -> api-proxy -> opencode-serve -> venice-proxy -> Venice
 #                                                    -> agentmail-proxy -> AgentMail
@@ -180,8 +182,20 @@ services:
       # Venice "private" inference only; keep in step with opencode.json.
       VENICE_MODELS: zai-org-glm-5-2,z-ai-glm-5-3-flash,zai-org-glm-5-1,kimi-k2-7-code,deepseek-v4-pro
       CREDENTIAL_STATUS_DIR: /state/credentials
+      # The main control (#49): every model call, chat included, is refused
+      # while halted or while the kill switch is not listening, and a daily
+      # meter enforces a hard ceiling from the responses' own usage.
+      CONTROL_DIR: /state/control
+      CONTROL_REQUIRE_ARMED: "1"
+      GATEWAY_STATE_DIR: /state/gateway
+      VENICE_MAX_USD_PER_DAY: ${VENICE_MAX_USD_PER_DAY:-5}
+      VENICE_MAX_REQUESTS_PER_DAY: ${VENICE_MAX_REQUESTS_PER_DAY:-2000}
+      VENICE_UNMETERED_USD_PER_REQUEST: ${VENICE_UNMETERED_USD_PER_REQUEST:-0.05}
+      VENICE_PRICES: ${VENICE_PRICES:-}
     volumes:
-      - credential-status:/state/credentials
+      - cred-venice:/state/credentials
+      - control-state:/state/control:ro
+      - venice-meter:/state/gateway
     networks: [jill-internal, jill-egress]
     <<: *gateway
 
@@ -199,7 +213,7 @@ services:
     volumes:
       - approvals:/state/approvals:ro
       - agentmail-state:/state/gateway
-      - credential-status:/state/credentials
+      - cred-agentmail:/state/credentials
     networks: [jill-internal, jill-egress]
     <<: *gateway
 
@@ -227,7 +241,7 @@ services:
       UPSTREAM_KEY: ${SIYUAN_TOKEN:-}
       CREDENTIAL_STATUS_DIR: /state/credentials
     volumes:
-      - credential-status:/state/credentials
+      - cred-siyuan:/state/credentials
     networks: [jill-internal, jill-egress]
     <<: *gateway
 
@@ -273,10 +287,17 @@ services:
       CREDENTIAL_STATUS_DIR: /state/credentials
       CREDENTIAL_EXPECT: ${CREDENTIAL_EXPECT:-venice}
       CREDENTIAL_EXPIRES: ${CREDENTIAL_EXPIRES:-}
+      VENICE_METER_DIR: /state/venice/meter
+      VENICE_ALERT_USD_PER_DAY: ${VENICE_ALERT_USD_PER_DAY:-1}
     volumes:
       - control-state:/state/control
       - alert-spool:/state/alerts
-      - credential-status:/state/credentials:ro
+      # One volume per gateway, each read-only here: no gateway can write
+      # another's credential record.
+      - cred-venice:/state/credentials/venice:ro
+      - cred-agentmail:/state/credentials/agentmail:ro
+      - cred-siyuan:/state/credentials/siyuan:ro
+      - venice-meter:/state/venice:ro
     networks: [jill-callers]
     tmpfs: [/tmp]
     healthcheck:
@@ -325,15 +346,16 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # Opt-in scheduled-work engine (docs/heartbeat-dispatcher.md). Start with:
+  # Scheduled-work engine, OFF by default (Sean, 2026-11-21: Jill launches
+  # with no heartbeats and runs only when he messages her). To turn it on:
   #   cp HEARTBEATS.md.template HEARTBEATS.md   # compose bind-mounts this file
-  #   docker compose --profile dispatcher up -d
+  #   docker compose --profile heartbeats up -d
   # Runs attach through api-proxy, so tools run in serve, inside containment.
   heartbeat-dispatcher:
     build: .
     image: behalfbot-open:latest
     container_name: behalfbot-heartbeat-dispatcher
-    profiles: [dispatcher]
+    profiles: [heartbeats]
     command:
       - bash
       - -c
@@ -363,7 +385,7 @@ services:
       CONTROL_REQUIRE_ARMED: "1"
       ALERT_SPOOL_DIR: /state/alerts
       SELFTEST_LIVE: "1"
-      DISPATCHER_MAX_USD_PER_DAY: ${DISPATCHER_MAX_USD_PER_DAY:-5}
+      DISPATCHER_MAX_USD_PER_DAY: ${DISPATCHER_MAX_USD_PER_DAY:-1}
       DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY: ${DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY:-24}
       VENICE_PRICES: ${VENICE_PRICES:-}
     volumes:
@@ -421,4 +443,7 @@ volumes:
   fetch-state:      # consumed URL approvals, URL requests
   control-state:    # halt.json, conservation-mode.json, armed.json, cursors (jill-control writes)
   alert-spool:      # content-free alerts from the dispatcher, drained by jill-control
-  credential-status: # status-only credential probe results from the key-holding gateways
+  cred-venice:      # status-only credential probe result, venice-proxy writes
+  cred-agentmail:   # ... agentmail-proxy writes
+  cred-siyuan:      # ... siyuan-proxy writes
+  venice-meter:     # venice-proxy's daily spend meter (jill-control reads it)
