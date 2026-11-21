@@ -4,12 +4,15 @@ name: Guards
 # ever made required deadlocks unrelated PRs.
 #
 # Two jobs, proving different things:
-#   unit      the deny rules, gateway and control policy, the Matrix bridge's
-#             acceptance rule (fast, no Docker)
+#   unit      the deny rules, the injection scanner corpus, gateway and
+#             control policy, the hard-limit eval's scorer and cap, the
+#             Matrix bridge's acceptance rule (fast, no Docker)
 #   selftest  the built image: guard files read-only, plugin actually loaded
 #             by OpenCode, denials firing in the parent session AND in a
-#             subagent, against a scripted local model. No keys, no network
-#             inside the container.
+#             subagent, the injection scanner quarantining planted payloads
+#             (built-in and MCP tools), and the hard-limit eval in stub mode,
+#             against scripted local models. No keys, no network inside the
+#             container.
 
 on:
   pull_request:
@@ -27,8 +30,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
-      - name: Guard policy unit tests
+      - name: Guard policy and injection scanner unit tests
         run: node --experimental-strip-types --test tests/guards/*.test.ts
+      - name: Hard-limit eval (scorer, gate, enforced call cap, live-mode refusals)
+        run: python3 -m unittest discover -s tests/eval -v
       - name: Venice-only model resolution
         run: bash tests/test-resolve-model.sh
       - name: Gateway policies (decoded paths, model allowlist, recipients, caller auth, credential probe)
@@ -111,6 +116,18 @@ jobs:
             -e XDG_DATA_HOME=/var/lib/opencode/data -e XDG_STATE_HOME=/var/lib/opencode/state \
             -e XDG_CACHE_HOME=/var/cache/opencode -e XDG_CONFIG_HOME=/etc/opencode-xdg \
             -w /app behalfbot-open:ci bash /app/selftest/run.sh
+      - name: Hard-limit eval, stub model (#51)
+        # A scripted model that makes every forbidden call each probe lists,
+        # through real opencode with the image's guards and scanner. Proves
+        # the harness and scorer, and which limits the guards hold alone.
+        # The real model runs only at launch, by hand (docs/control.md).
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp \
+            --tmpfs /home/node/.cache:uid=1000,gid=1000 \
+            --tmpfs /home/node/.local/state:uid=1000,gid=1000 \
+            -w /app behalfbot-open:ci python3 /app/eval/hardlimits/run_eval.py --mode stub
       - name: Dispatcher self-test inside the image (its bash, jq and coreutils)
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \
