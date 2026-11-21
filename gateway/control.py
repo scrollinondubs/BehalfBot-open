@@ -57,6 +57,18 @@ fixed templates with heartbeat names and counts, never model output, gather
 data or log lines. This process cannot enforce that; it enforces length,
 control characters and a rate limit.
 
+INJECTION-SCAN ALERTS (#51)
+---------------------------
+opencode-serve's injection scanner drops files in a SEPARATE volume,
+scan-alerts, the one alert surface serve can write. Anything the scanner can
+write, the model can forge (same uid), so nothing from those files is ever
+posted: each must be exactly {"kind": "injection-scan", "severity":
+high|low|error, "source": <fixed category>}; file names are ignored, every
+file is deleted, and the posted text is built here from bucketed counts
+(1, 2-9, 10+) and the sorted category names, at most once per
+SCAN_ALERT_COOLDOWN_SECONDS (default 900). A forged file can make noise but
+carries a few bits per cooldown at most, and no text.
+
 CREDENTIAL EXPIRY
 -----------------
 Each key-holding gateway probes its upstream with its own key and writes a
@@ -74,6 +86,7 @@ EXIT CODES
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -95,6 +108,9 @@ KIND_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 MAX_ALERT_CHARS = 1500
 MAX_FILE_BYTES = 64 * 1024
+SCAN_SEVERITIES = ("high", "low", "error")
+SCAN_SOURCES = ("web", "email", "siyuan", "search", "document", "memory", "shell", "subagent", "other")
+MAX_SCAN_ENTRIES = 512
 
 COMMANDS = {
     "halt": "halt",
@@ -327,6 +343,9 @@ class Control:
         self.cursor = stored.get(room) if isinstance(stored.get(room), str) else None
         self.started = clock()
         self.sent = []  # alert send times, for the rate limit
+        self.scan_pending = {}  # severity or "unrecognised" -> count, since the last scan alert
+        self.scan_sources = set()
+        self.scan_last_post = None
 
     # -- acks ---------------------------------------------------------------
 
@@ -572,6 +591,48 @@ class Control:
             text = text[:MAX_ALERT_CHARS] + " [truncated]"
         return text
 
+    # -- injection-scan alerts (#51) ----------------------------------------
+
+    def drain_scan_alerts(self):
+        """Count and delete what the scanner dropped; post one templated
+        alert per cooldown. Returns True when an alert was posted."""
+        d = self.cfg.get("scan_dir")
+        if not d:
+            return False
+        try:
+            names = os.listdir(d)
+        except OSError as exc:
+            log("WARN: cannot list the scan-alert dir: %s" % exc)
+            return False
+        for name in names[:MAX_SCAN_ENTRIES]:
+            path = os.path.join(d, name)
+            rec, ok = flags.read(path)
+            if ok and rec.get("kind") == "injection-scan" and set(rec) == {"kind", "severity", "source"} \
+                    and rec.get("severity") in SCAN_SEVERITIES and rec.get("source") in SCAN_SOURCES:
+                key = rec["severity"]
+                self.scan_sources.add(rec["source"])
+            else:
+                key = "unrecognised"
+            self.scan_pending[key] = self.scan_pending.get(key, 0) + 1
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            except OSError:
+                pass
+        if not self.scan_pending:
+            return False
+        now = self.clock()
+        if self.scan_last_post is not None and now - self.scan_last_post < self.cfg.get("scan_cooldown", 900):
+            return False
+        if not self.post(scan_alert_text(self.scan_pending, self.scan_sources)):
+            return False
+        self.scan_last_post = now
+        self.scan_pending = {}
+        self.scan_sources = set()
+        return True
+
     def _reject(self, path, name):
         log("WARN: malformed spool file %s moved to rejected/" % name)
         try:
@@ -779,6 +840,8 @@ def load_config(env=os.environ):
         "alerts_room": alerts_room,
         "control_dir": env.get("CONTROL_DIR", "/state/control"),
         "spool_dir": env.get("ALERT_SPOOL_DIR", "/state/alerts"),
+        "scan_dir": env.get("SCAN_ALERT_DIR") or None,
+        "scan_cooldown": _int_env(env, "SCAN_ALERT_COOLDOWN_SECONDS", 900, 60),
         "cred_dir": env.get("CREDENTIAL_STATUS_DIR", "/state/credentials"),
         "cred_expect": [c for c in re.split(r"[,\s]+", env.get("CREDENTIAL_EXPECT", "venice")) if c],
         "cred_expires": parse_expires(env.get("CREDENTIAL_EXPIRES", "")),
@@ -794,6 +857,23 @@ def load_config(env=os.environ):
         "matrix_probe": None,
     }
     return cfg, problems
+
+
+def _bucket(n):
+    return "1" if n == 1 else ("2-9" if n < 10 else "10+")
+
+
+def scan_alert_text(pending, sources):
+    """Fixed template: bucketed counts and fixed category names only."""
+    parts = []
+    for key, label in (("high", "HIGH"), ("low", "LOW"), ("error", "scanner errors (output withheld)"),
+                       ("unrecognised", "malformed alert files")):
+        if pending.get(key):
+            parts.append("%s %s" % (label, _bucket(pending[key])))
+    where = ", ".join(s for s in SCAN_SOURCES if s in sources) or "none named"
+    return ("Injection scanner: suspicious tool output was quarantined in Jill's session (%s; sources: %s). "
+            "No content is posted here; ask Jill in the encrypted chat room what was flagged."
+            % ("; ".join(parts), where))
 
 
 def boot(control):
@@ -891,6 +971,7 @@ def main():
     if cfg["announce"]:
         control.post("Kill switch armed. Say `halt` here; everything else works only in Jill's encrypted chat room.")
     threading.Thread(target=_loop, args=("spool", 10, control.drain_spool), daemon=True).start()
+    threading.Thread(target=_loop, args=("scan-alerts", 10, control.drain_scan_alerts), daemon=True).start()
 
     def credentials():
         control.probe_matrix()

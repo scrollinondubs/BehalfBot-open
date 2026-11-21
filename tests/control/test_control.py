@@ -334,6 +334,96 @@ class Alerts(Base):
         self.assertTrue(os.path.exists(os.path.join(self.cfg["spool_dir"], "1.json")))
 
 
+class ScanAlerts(Base):
+    """#51: the scan-alert dir is writable by opencode-serve, so by the model.
+    Nothing from it may reach the room except fixed categories and buckets."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = os.path.join(self.tmp.name, "scan")
+        os.makedirs(self.scan)
+        self.cfg["scan_dir"] = self.scan
+        self.cfg["scan_cooldown"] = 900
+        self.now = [1000.0]
+        self.ctl.clock = lambda: self.now[0]
+
+    def drop(self, name, obj):
+        with open(os.path.join(self.scan, name), "w") as f:
+            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+    def test_valid_files_post_one_templated_alert_and_are_deleted(self):
+        self.drop("a.json", {"kind": "injection-scan", "severity": "high", "source": "email"})
+        self.drop("b.json", {"kind": "injection-scan", "severity": "low", "source": "web"})
+        self.drop("c.json", {"kind": "injection-scan", "severity": "low", "source": "web"})
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.assertEqual(len(self.hs.sent), 1)
+        body = self.hs.sent[0][1]
+        self.assertIn("HIGH 1", body)
+        self.assertIn("LOW 2-9", body)
+        self.assertIn("sources: web, email", body)
+        self.assertEqual(os.listdir(self.scan), [])
+
+    def test_no_content_from_a_forged_file_reaches_the_room(self):
+        secret = "SEAN-TAX-ID-123456789"
+        self.drop(secret + ".json", {"kind": "injection-scan", "severity": "high", "source": secret})
+        self.drop("x.json", {"kind": "injection-scan", "severity": "high", "source": "web", "text": secret})
+        self.drop("y.json", {"kind": "spend-cap", "text": secret})
+        self.drop("z.json", "not json " + secret)
+        os.makedirs(os.path.join(self.scan, secret))
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        body = self.hs.sent[0][1]
+        self.assertNotIn(secret, body)
+        self.assertIn("malformed alert files 2-9", body)
+        self.assertEqual(os.listdir(self.scan), [])
+
+    def test_counts_are_bucketed(self):
+        for i in range(37):
+            self.drop("%d.json" % i, {"kind": "injection-scan", "severity": "low", "source": "shell"})
+        self.ctl.drain_scan_alerts()
+        self.assertIn("LOW 10+", self.hs.sent[0][1])
+        self.assertNotIn("37", self.hs.sent[0][1])
+
+    def test_cooldown_coalesces_then_posts(self):
+        self.drop("1.json", {"kind": "injection-scan", "severity": "low", "source": "web"})
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.now[0] += 60
+        self.drop("2.json", {"kind": "injection-scan", "severity": "error", "source": "siyuan"})
+        self.assertFalse(self.ctl.drain_scan_alerts(), "inside the cooldown nothing is posted")
+        self.assertEqual(os.listdir(self.scan), [], "but the file is still consumed")
+        self.now[0] += 900
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.assertEqual(len(self.hs.sent), 2)
+        self.assertIn("scanner errors (output withheld) 1", self.hs.sent[1][1])
+        self.assertIn("sources: siyuan", self.hs.sent[1][1])
+
+    def test_undelivered_alert_is_kept_pending(self):
+        self.hs.token = "rotated"
+        self.drop("1.json", {"kind": "injection-scan", "severity": "high", "source": "web"})
+        self.assertFalse(self.ctl.drain_scan_alerts())
+        self.hs.token = TOKEN
+        self.assertTrue(self.ctl.drain_scan_alerts())
+
+    def test_a_symlink_is_removed_not_followed(self):
+        target = os.path.join(self.tmp.name, "keep.json")
+        with open(target, "w") as f:
+            json.dump({"kind": "injection-scan", "severity": "low", "source": "web"}, f)
+        os.symlink(target, os.path.join(self.scan, "l.json"))
+        self.ctl.drain_scan_alerts()
+        self.assertTrue(os.path.exists(target))
+        self.assertIn("malformed alert files 1", self.hs.sent[0][1])
+
+    def test_unset_dir_is_a_no_op(self):
+        self.cfg["scan_dir"] = None
+        self.assertFalse(self.ctl.drain_scan_alerts())
+
+    def test_config_reads_the_env(self):
+        env = {"MATRIX_CONTROL_TOKEN": TOKEN, "MATRIX_PRINCIPAL": PRINCIPAL, "MATRIX_CONTROL_ROOM": ROOM,
+               "SCAN_ALERT_DIR": "/state/scan-alerts", "SCAN_ALERT_COOLDOWN_SECONDS": "5"}
+        cfg, _ = c.load_config(env)
+        self.assertEqual(cfg["scan_dir"], "/state/scan-alerts")
+        self.assertEqual(cfg["scan_cooldown"], 60, "the cooldown has a floor")
+
+
 class Credentials(Base):
     def status(self, route, **rec):
         os.makedirs(os.path.join(self.cfg["cred_dir"], route), exist_ok=True)

@@ -1,5 +1,5 @@
 {
-  "_comment": "Every case must be harmless if its guard FAILS: missing paths, .invalid hosts, no credentials. expect: deny (result carries [guardrails]), ok (result carries selftest-ok), allowed (result came back without a denial), contained (the script ran, printed selftest-ok and no selftest-escaped), any.",
+  "_comment": "Every case must be harmless if its guard FAILS: missing paths, .invalid hosts, no credentials. expect: deny (result carries [guardrails]), ok (result carries selftest-ok), allowed (result came back without a denial), contained (the script ran, printed selftest-ok and no selftest-escaped), flagged (the result came back wrapped in the injection scanner's quarantine banner, #51; this is what proves the scanner plugin LOADED), clean (the result came back, not denied and NOT flagged), any.",
   "parent": [
     {
       "id": "p_control",
@@ -199,6 +199,64 @@
       }
     },
     {
+      "id": "p_inject_read",
+      "expect": "flagged",
+      "tool": "read",
+      "args": {
+        "filePath": "/tmp/selftest-fixture/injection.txt"
+      }
+    },
+    {
+      "id": "p_inject_bash",
+      "expect": "flagged",
+      "tool": "bash",
+      "args": {
+        "command": "cat /tmp/selftest-fixture/injection.txt",
+        "description": "injection via shell output"
+      }
+    },
+    {
+      "id": "p_inject_mcp_siyuan",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "20261121"
+      }
+    },
+    {
+      "id": "p_inject_mcp_brave",
+      "expect": "flagged",
+      "tool": "brave-search_brave_web_search",
+      "args": {
+        "query": "weather lisbon"
+      }
+    },
+    {
+      "id": "p_clean_mcp",
+      "expect": "clean",
+      "tool": "siyuan_sql_query",
+      "args": {
+        "stmt": "SELECT 1"
+      }
+    },
+    {
+      "id": "p_clean_read",
+      "expect": "clean",
+      "tool": "read",
+      "args": {
+        "filePath": "/tmp/selftest-fixture/selftest-ok.txt"
+      }
+    },
+    {
+      "id": "p_siyuan_write",
+      "expect": "deny",
+      "tool": "siyuan_create_doc",
+      "args": {
+        "path": "/x",
+        "markdown": "x"
+      }
+    },
+    {
       "id": "p_task_atfile",
       "expect": "deny",
       "tool": "task",
@@ -307,6 +365,22 @@
       "args": {
         "pattern": "PASSWORD",
         "path": "/workspace/.selftest-proc-c"
+      }
+    },
+    {
+      "id": "c_inject_read",
+      "expect": "flagged",
+      "tool": "read",
+      "args": {
+        "filePath": "/tmp/selftest-fixture/injection.txt"
+      }
+    },
+    {
+      "id": "c_inject_mcp",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "20261121"
       }
     }
   ]

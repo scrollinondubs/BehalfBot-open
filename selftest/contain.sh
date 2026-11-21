@@ -92,7 +92,9 @@ if t curl -s http://brave-mcp:8080/mcp; then out brave-mcp-direct; fi
 # Control (#49): the kill switch, the alert spool and the credential probes
 # live in volumes serve never mounts, behind a sidecar serve cannot reach. If
 # serve could write a flag it could lift its own halt; if it could write the
-# spool, alerts would be an egress path to Sean's homeserver.
+# spool, alerts would be an egress path to Sean's homeserver. /state/scan-alerts
+# (#51) is deliberately NOT in this list: serve writes it, and jill-control
+# reads it as fixed enums only, so it carries no text (gateway/control.py).
 for d in /state/control /state/alerts /state/credentials /state/credentials/venice \
          /state/credentials/agentmail /state/credentials/siyuan /state/venice; do
   if [ -e "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null | grep -vxE 'venice|agentmail|siyuan')" ]; then
