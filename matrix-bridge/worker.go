@@ -47,6 +47,9 @@ type WorkerRequest struct {
 	Unsupported bool               `json:"unsupported"`
 	Activate    []string           `json:"activate,omitempty"`
 	AlertKind   string             `json:"alert_kind,omitempty"`
+	// ReceivedAt is this bridge's clock when the message was accepted; model
+	// replies quote it (round 6b N2).
+	ReceivedAt float64 `json:"received_at,omitempty"`
 }
 
 type WorkerResponse struct {

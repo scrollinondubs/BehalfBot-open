@@ -356,6 +356,12 @@ services:
       BRIDGE_WORKER_UID: "1000"
       BRIDGE_WORKER_GID: "1000"
       WORKER_STATE_DIR: /state/matrix-worker
+      # The chat step (PDF parsing, model replies) runs as a third uid that
+      # cannot write approvals, the halt or meter flags, or the alert spool,
+      # nor read the worker's codes (round 6b N6).
+      BRIDGE_CHAT_UID: "1001"
+      BRIDGE_CHAT_GID: "1001"
+      BRIDGE_SESSIONS_FILE: /state/matrix-chat/sessions.json
       DEFAULT_MODEL: ${DEFAULT_MODEL:-venice/zai-org-glm-5-2}
       OPENCODE_SERVER_URL: http://api-proxy:4748
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
@@ -371,6 +377,7 @@ services:
     volumes:
       - matrix-bridge-state:/state/matrix-bridge
       - matrix-worker-state:/state/matrix-worker
+      - matrix-chat-state:/state/matrix-chat
       - control-state:/state/control
       - alert-spool:/state/alerts
       - approvals:/state/approvals
@@ -513,7 +520,8 @@ volumes:
   matrix-bridge-state: # Jill's Matrix device keys, cross-signing state, access token, the pin
                        # of Sean's master key, handled event ids, opencode session map.
                        # Mounted ONLY into matrix-bridge and matrix-bridge-setup. root 0700.
-  matrix-worker-state: # the worker's one-time codes and opencode session map (node)
+  matrix-worker-state: # the worker's one-time codes (node 0700)
+  matrix-chat-state:   # the chat step's opencode session map (uid 1001)
   dispatcher-state: # heartbeat state, logs, telemetry, briefings
   approvals:        # Sean's one-shot approvals (matrix-bridge/dispatcher write, gateways read)
   agentmail-state:  # draft snapshots (what a send delivers), consumed approvals

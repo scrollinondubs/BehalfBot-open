@@ -86,7 +86,11 @@ COPY --from=matrix-bridge-build /out/matrix-bridge /opt/jill/bin/matrix-bridge
 #   /state/matrix-bridge              root 0700: the Matrix bridge runs as root
 #                                     with only CAP_SETUID/CAP_SETGID and starts
 #                                     its worker as node, which cannot read it
-#   /state/{matrix-worker,dispatcher,gateway,approvals,control,alerts,credentials,venice}
+#   /state/matrix-worker              node 0700: the worker's one-time codes
+#   /state/matrix-chat                1001:1000 2770: the chat step (uid 1001)
+#                                     keeps its session map here; the worker
+#                                     (gid 1000) may reset it
+#   /state/{dispatcher,gateway,approvals,control,alerts,credentials,venice}
 #                                     node, per-container volumes
 RUN git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
@@ -95,7 +99,7 @@ RUN git init -q /app \
     && git -C /app add -A && git -C /app commit -qm "image snapshot" \
     && mkdir -p /etc/opencode-xdg/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode \
         /data /workspace /home/node/.local/state /home/node/.cache \
-        /state/matrix-bridge /state/matrix-worker /state/dispatcher /state/gateway /state/approvals \
+        /state/matrix-bridge /state/matrix-worker /state/matrix-chat /state/dispatcher /state/gateway /state/approvals \
         /state/control /state/alerts /state/credentials /state/venice \
         /state/credentials/venice /state/credentials/agentmail /state/credentials/siyuan \
     && cp /app/.opencode/.gitignore /etc/opencode-xdg/opencode/.gitignore \
@@ -106,7 +110,9 @@ RUN git init -q /app \
     && chown -R node:node /var/lib/opencode /var/cache/opencode /data /workspace \
         /home/node/.local/state /home/node/.cache /state \
     && chmod 0700 /var/lib/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode /data \
-    && chown root:root /state/matrix-bridge && chmod 0700 /state/matrix-bridge
+    && chown root:root /state/matrix-bridge && chmod 0700 /state/matrix-bridge \
+    && chmod 0700 /state/matrix-worker \
+    && chown 1001:1000 /state/matrix-chat && chmod 2770 /state/matrix-chat
 
 USER node
 ENV HOME=/home/node \

@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -32,6 +35,7 @@ type Config struct {
 	JillUser   id.UserID
 	StateDir   string
 	Worker     WorkerSpec
+	ChatWorker WorkerSpec
 	MaxAttach  int64
 	ReadyFile  string
 	NoSAS      bool
@@ -48,6 +52,14 @@ func LoadConfig() (Config, []string) {
 			Argv: []string{"python3", "-I", envOr("BRIDGE_WORKER", "/app/bridge/matrix_worker.py")},
 			UID:  int(envInt("BRIDGE_WORKER_UID", 0)), GID: int(envInt("BRIDGE_WORKER_GID", 0)),
 		},
+		// The chat step parses uploaded PDFs and relays model output: it runs
+		// as a third uid that can write neither approvals nor the halt and
+		// meter flags (round 6b N6). Defaults to the worker uid off-container.
+		ChatWorker: WorkerSpec{
+			Argv: []string{"python3", "-I", envOr("BRIDGE_WORKER", "/app/bridge/matrix_worker.py")},
+			UID:  int(envInt("BRIDGE_CHAT_UID", envInt("BRIDGE_WORKER_UID", 0))),
+			GID:  int(envInt("BRIDGE_CHAT_GID", envInt("BRIDGE_WORKER_GID", 0))),
+		},
 		MaxAttach: envInt("BRIDGE_MAX_ATTACHMENT_BYTES", 10_000_000),
 		ReadyFile: envOr("BRIDGE_READY_FILE", "/tmp/bridge-ready"),
 	}
@@ -58,10 +70,24 @@ func LoadConfig() (Config, []string) {
 	if len(c.Room) < 3 || c.Room[0] != '!' {
 		problems = append(problems, "MATRIX_JILL_ROOM must be a room id (!id:server), not an alias")
 	}
-	if c.Worker.UID > 0 && (c.Worker.GID <= 0 || c.Worker.UID == os.Getuid()) {
-		problems = append(problems, "BRIDGE_WORKER_UID/GID must name a uid and gid other than the bridge's own")
-	}
+	problems = append(problems, workerUIDProblems(os.Getuid(), c.Worker, c.ChatWorker)...)
 	return c, problems
+}
+
+// workerUIDProblems refuses any configuration in which a worker would run
+// with the bridge's own uid, and above all as root next to the keys
+// (round 6b N5).
+func workerUIDProblems(bridgeUID int, workers ...WorkerSpec) []string {
+	var out []string
+	for _, w := range workers {
+		switch {
+		case bridgeUID == 0 && w.UID <= 0:
+			out = append(out, "running as root, so BRIDGE_WORKER_UID/GID (and BRIDGE_CHAT_UID/GID) must name a non-root uid and gid for the worker")
+		case w.UID > 0 && (w.GID <= 0 || w.UID == bridgeUID):
+			out = append(out, "worker uid/gid must be set together and differ from the bridge's own uid")
+		}
+	}
+	return out
 }
 
 func envOr(k, def string) string {
@@ -152,6 +178,7 @@ type Bridge struct {
 	// principal's pinned-trusted devices or the pin change, and after
 	// rotateAfterMessages messages or rotateAfter, whatever the room state
 	// says.
+	workerMu  sync.Mutex
 	sendMu    sync.Mutex
 	sessKey   string
 	sessCount int
@@ -301,10 +328,64 @@ func (b *Bridge) onDecrypted(ctx context.Context, evt *event.Event) {
 		return
 	}
 	logf("accept event=%s device=%s", evt.ID, dev.DeviceID)
+	if c, ok := evt.Content.Parsed.(*event.MessageEventContent); ok && c.MsgType == event.MsgText && IsHalt(c.Body) {
+		// A halt skips the queue and its length limit, and is persisted
+		// before it is handled, so a crash or restart cannot lose it after
+		// its event id was claimed (round 6b N8).
+		req := WorkerRequest{EventID: evt.ID.String(), Room: b.cfg.Room.String(), Text: c.Body,
+			ReceivedAt: float64(time.Now().UnixNano()) / 1e9}
+		if err := b.savePendingHalt(req); err != nil {
+			logf("ERROR: could not persist halt %s: %v", evt.ID, err)
+		}
+		b.process(context.WithoutCancel(ctx), req)
+		b.clearPendingHalt(req.EventID)
+		return
+	}
 	select {
 	case b.commands <- evt:
 	default:
 		logf("drop event=%s reason=queue-full", evt.ID)
+		go b.send(context.WithoutCancel(ctx), "[bridge] Too many messages are waiting; that one was dropped. A `halt` always gets through.")
+	}
+}
+
+var haltRE = regexp.MustCompile(`(?i)^\s*[!.?,;:]*\s*(halt|mute|silence)(\s|[!.?,;:]|$)`)
+
+// IsHalt matches the halt words the worker's parser accepts.
+func IsHalt(body string) bool { return haltRE.MatchString(body) }
+
+type pendingHalt struct {
+	Req WorkerRequest `json:"req"`
+}
+
+func (b *Bridge) pendingHaltPath(eventID string) string {
+	sum := sha256.Sum256([]byte(eventID))
+	return filepath.Join(b.cfg.StateDir, "pending-halt-"+hex.EncodeToString(sum[:8])+".json")
+}
+
+func (b *Bridge) savePendingHalt(req WorkerRequest) error {
+	return writeJSON0600(b.pendingHaltPath(req.EventID), pendingHalt{Req: req})
+}
+
+func (b *Bridge) clearPendingHalt(eventID string) {
+	if err := os.Remove(b.pendingHaltPath(eventID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		logf("WARN: could not clear pending halt: %v", err)
+	}
+}
+
+// replayPendingHalts applies halts that were accepted but not finished
+// before a restart.
+func (b *Bridge) replayPendingHalts(ctx context.Context) {
+	matches, _ := filepath.Glob(filepath.Join(b.cfg.StateDir, "pending-halt-*.json"))
+	for _, m := range matches {
+		var p pendingHalt
+		if err := readJSON(m, &p); err != nil || !IsHalt(p.Req.Text) {
+			logf("WARN: unreadable pending halt %s; applying a plain halt", filepath.Base(m))
+			p.Req = WorkerRequest{Room: b.cfg.Room.String(), Text: "halt", ReceivedAt: float64(time.Now().Unix())}
+		}
+		logf("applying a halt accepted before the restart (event %s)", p.Req.EventID)
+		b.process(ctx, p.Req)
+		_ = os.Remove(m)
 	}
 }
 
@@ -328,10 +409,10 @@ func (b *Bridge) chatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case req := <-b.chats:
-			resp, err := RunWorker(context.WithoutCancel(ctx), b.cfg.Worker, "chat", req, 15*time.Minute)
+			resp, err := RunWorker(context.WithoutCancel(ctx), b.cfg.ChatWorker, "chat", req, 15*time.Minute)
 			if err != nil {
 				logf("WARN: worker chat step failed: %v", err)
-				b.send(ctx, "The bridge could not get a reply (worker error).")
+				b.send(ctx, "[bridge] The bridge could not get a reply (worker error).")
 				continue
 			}
 			b.deliver(ctx, resp)
@@ -361,6 +442,7 @@ func (b *Bridge) handle(ctx context.Context, evt *event.Event) {
 	}
 	req := WorkerRequest{
 		EventID: evt.ID.String(), EventTS: float64(evt.Timestamp) / 1000, Room: b.cfg.Room.String(),
+		ReceivedAt: float64(time.Now().UnixNano()) / 1e9,
 	}
 	switch content.MsgType {
 	case event.MsgText:
@@ -384,18 +466,26 @@ func (b *Bridge) handle(ctx context.Context, evt *event.Event) {
 		req.Notes = append(req.Notes, fmt.Sprintf("(skipped %s: unsupported message type)", name))
 		req.Unsupported = true
 	}
+	b.process(ctx, req)
+}
 
+// process runs the command step for one message. Command steps never
+// overlap (the halt fast path and the queue share this lock), so the
+// worker's code store has one writer at a time.
+func (b *Bridge) process(ctx context.Context, req WorkerRequest) {
+	b.workerMu.Lock()
+	defer b.workerMu.Unlock()
 	resp, err := RunWorker(ctx, b.cfg.Worker, "command", req, 60*time.Second)
 	if err != nil {
 		logf("WARN: worker command step failed: %v", err)
-		b.send(ctx, "The bridge could not process that message (worker error). Nothing was forwarded to the model.")
+		b.send(ctx, "[bridge] The bridge could not process that message (worker error). Nothing was forwarded to the model.")
 		return
 	}
 	if !resp.Handled {
 		select {
 		case b.chats <- req:
 		default:
-			b.send(ctx, "Too many messages are waiting for the model; that one was dropped.")
+			b.send(ctx, "[bridge] Too many messages are waiting for the model; that one was dropped.")
 		}
 		return
 	}
@@ -571,6 +661,7 @@ func NewBridge(ctx context.Context, cfg Config) (*Bridge, error) {
 	// Whatever session is in the store was created under an earlier state
 	// of the room or the pin (setup included): never reuse it (round 6 H1).
 	b.discardSession(ctx)
+	b.replayPendingHalts(ctx)
 	go b.commandLoop(ctx)
 	go b.chatLoop(ctx)
 	if l, _ := LoadLock(cfg.StateDir); l != nil {

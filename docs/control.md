@@ -80,6 +80,27 @@ proves nothing.
 - A held-back `resume`, delivered days later, gets a fresh code and does
   nothing.
 
+A halt from the control room (jill-control writes the same `halt.json`)
+voids every confirm issued before it, too (round 6b N4).
+
+**A halt is never lost (round 6b N8).** A `halt` skips the command queue
+and its length limit. The bridge writes it to its state, with fsync, before
+handling it, and replays it after a restart. The flag file itself is
+fsynced before the ack is sent.
+
+**Residual risk for Sean to accept: delayed chat (round 6b N2).** The
+homeserver admin cannot read or forge the chat. It can delay one of your
+ordinary messages and deliver it later, for example a "yes, go ahead" sent
+about something else. It cannot do this to anything that lifts a stop,
+hands back budget or approves an email, because those need a fresh
+`confirm` code.
+
+So you can spot a delay, every reply from Jill opens with
+`Jill, re "<first 60 characters of your message>" (received <time> UTC):`.
+The time is when the bridge received your message. A reply that quotes
+something you sent long ago, or at an odd time, was delayed: say `halt` and
+check. Bridge messages start with `[bridge]`; a reply from Jill never does.
+
 The chat bridge handles commands one at a time, in the order received
 (round 6 M1). It also drops messages more than 10 minutes old, though that
 check rests on the server's timestamp.

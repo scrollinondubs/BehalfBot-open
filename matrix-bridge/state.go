@@ -53,11 +53,37 @@ func writeJSON0600(path string, v any) error {
 	if err != nil {
 		return err
 	}
+	return writeFileSync(path, append(data, '\n'))
+}
+
+// writeFileSync writes, fsyncs, renames into place and fsyncs the directory:
+// once it returns, the file survives a crash (round 6b N8).
+func writeFileSync(path string, data []byte) error {
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func readJSON(path string, v any) error {

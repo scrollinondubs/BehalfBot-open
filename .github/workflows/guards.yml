@@ -81,19 +81,22 @@ jobs:
       - name: Matrix bridge worker isolation (round 6 M4)
         # As compose runs it: root with only SETUID/SETGID, no new privileges,
         # read-only root. The worker uid must not be able to list or read the
-        # bridge state; the bridge must refuse to run the worker as itself.
+        # bridge state; the chat uid must not be able to write approvals, flags
+        # or alerts; the bridge must refuse to run as root without them (N5).
         run: |
           docker run --rm --network none --read-only --user 0:0 --cap-drop ALL \
             --cap-add SETUID --cap-add SETGID --security-opt no-new-privileges \
-            --tmpfs /tmp -v /state/matrix-bridge \
+            --tmpfs /tmp -v /state/matrix-bridge -v /state/matrix-worker -v /state/matrix-chat \
+            -v /state/approvals -v /state/control -v /state/alerts \
             -e BRIDGE_WORKER_UID=1000 -e BRIDGE_WORKER_GID=1000 \
+            -e BRIDGE_CHAT_UID=1001 -e BRIDGE_CHAT_GID=1001 \
             -e MATRIX_PRINCIPAL=@s:test.local -e 'MATRIX_JILL_ROOM=!r:test.local' \
             behalfbot-open:ci /opt/jill/bin/matrix-bridge isolation-check
-          if docker run --rm --network none --read-only --cap-drop ALL --tmpfs /tmp -v /state/matrix-bridge \
-            -e BRIDGE_WORKER_UID=1000 -e BRIDGE_WORKER_GID=1000 \
+          if docker run --rm --network none --read-only --user 0:0 --cap-drop ALL \
+            --cap-add SETUID --cap-add SETGID --tmpfs /tmp -v /state/matrix-bridge \
             -e MATRIX_PRINCIPAL=@s:test.local -e 'MATRIX_JILL_ROOM=!r:test.local' \
             behalfbot-open:ci /opt/jill/bin/matrix-bridge isolation-check; then
-            echo "the bridge ran its worker as its own uid"; exit 1
+            echo "the bridge ran as root with no worker uid"; exit 1
           fi
       - name: Boot self-test (serve's uid and caps, read-only rootfs, no network)
         run: |

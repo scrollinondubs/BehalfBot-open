@@ -487,14 +487,58 @@ def take_code(code, kind, ttl, now=None):
     return rec
 
 
-def cancel_pending(now=None):
-    """A halt cancels every un-safe action still waiting for `confirm`."""
+def cancel_pending(now=None, before=None):
+    """A halt cancels every un-safe action still waiting for `confirm`
+    (issued before `before`, when given)."""
     now = time.time() if now is None else now
     codes = _load_codes(now)
     for rec in codes.values():
-        if rec.get("kind") == "confirm":
+        if rec.get("kind") == "confirm" and (before is None or rec["created_at"] < before):
             rec["used"] = True
     _save_codes(codes)
+
+
+def sync_halt(now=None):
+    """A halt from anywhere (the control room writes the same flag) voids
+    every confirm issued before it (round 6b N4). Run before every command."""
+    path = os.path.join(CONTROL_DIR, flags.HALT)
+    if not flags.is_on(path):
+        return
+    data, ok = flags.read(path)
+    precise = data.get("enabled_epoch") if ok else None
+    if isinstance(precise, (int, float)) and not isinstance(precise, bool):
+        before = precise
+    else:
+        # Written without enabled_epoch (older writer): enabled_at has
+        # one-second resolution, so that whole second counts as before the
+        # halt. Unreadable means "now".
+        epoch = flags.parse_iso(data.get("enabled_at")) if ok else None
+        before = (epoch + 1) if epoch is not None else (time.time() if now is None else now)
+    cancel_pending(now, before=before)
+
+
+def retire_codes(match, now=None):
+    """Mark used every live code whose record satisfies match(code, rec)."""
+    now = time.time() if now is None else now
+    codes = _load_codes(now)
+    hit = []
+    for code, rec in codes.items():
+        if not rec.get("used") and match(code, rec):
+            rec["used"] = True
+            hit.append(code)
+    if hit:
+        _save_codes(codes)
+    return hit
+
+
+def leaked_codes(texts, now=None):
+    """Retire, and return, every live code (or the sha of a draft with a live
+    screen or pending approval) that appears in these texts (round 6b N1).
+    A code that reached the model could be put on a forged screen."""
+    hay = "\n".join(t.lower() for t in texts if t)
+    if not hay:
+        return []
+    return retire_codes(lambda code, rec: code in hay or (rec.get("sha") and rec["sha"] in hay), now)
 
 
 def show_draft(draft_id):
@@ -506,6 +550,8 @@ def show_draft(draft_id):
         return ["No snapshot of draft %s: only drafts written through agentmail-proxy can be sent."
                 % esc_field(draft_id)], []
     _, sha, refusal = render_draft(draft_id, content)
+    # Only the newest screen for a draft is approvable (round 6b N1).
+    retire_codes(lambda code, rec: rec.get("kind") == "screen" and rec.get("draft_id") == draft_id)
     if refusal:
         return [render_draft(draft_id, content)[0]], []
     code = new_code("screen", draft_id=draft_id, sha=sha)
@@ -604,11 +650,31 @@ IMMEDIATE = ("halt", "conserve", "status")
 NEEDS_CONFIRM = ("resume", "unconserve", "reset-meter", "reset-meter-spend")
 
 
+# Every message the bridge itself writes starts with this. A model reply
+# always starts with its own header line (model_reply), so no model output
+# can begin like a bridge message (round 6b N1).
+BRIDGE_PREFIX = "[bridge] "
+LEAKED_REPLY = ("That message contains an approval code or the sha256 of a pending draft, so it was not sent to "
+                "Jill, and those codes are now void. Use `show draft <id>` again to get a fresh screen.")
+
+
 def handled(replies, codes=()):
-    return {"handled": True, "replies": list(replies), "activate": list(codes)}
+    return {"handled": True, "replies": [BRIDGE_PREFIX + r for r in replies], "activate": list(codes)}
+
+
+def _attachment_texts(req):
+    out = []
+    for a in req.get("attachments") or []:
+        if attachment_kind(a.get("mime"), a.get("name")) == "text":
+            try:
+                out.append(base64.b64decode(a.get("data_b64") or "").decode("utf-8", errors="replace"))
+            except ValueError:
+                pass
+    return out
 
 
 def handle_command(req):
+    sync_halt()
     text = normalise(req)
     lowered = text.lower()
     if lowered in NEW_SESSION:
@@ -643,6 +709,9 @@ def handle_command(req):
             return handled([_control().apply(command, duration, reason)])
         except OSError:
             return handled(["Could not apply `%s` - writing the flag file failed." % command])
+    if leaked_codes([text] + _attachment_texts(req)):
+        log.info("message held back: it carries a live code (event %s)", req.get("event_id"))
+        return handled([LEAKED_REPLY])
     if halted():
         log.info("halted: message not forwarded (event %s)", req.get("event_id"))
         return handled([HALTED_REPLY])
@@ -731,11 +800,33 @@ class OpencodeClient:
             return False
 
 
+BRIDGE_LIKE = re.compile(r"(?im)^([ \t>]*)\[\s*bridge\s*\]")
+
+
+def model_reply(reply, req):
+    """Chunks of a model reply, each opening with a header line the model
+    cannot write: the first one quotes what it answers and when the bridge
+    received that (round 6b N1, N2). Lines in the reply that start like a
+    bridge message are defused."""
+    asked = " ".join((req.get("text") or "").split()) or "(attachment)"
+    quote = esc(asked[:60]) + ("..." if len(asked) > 60 else "")
+    at = req.get("received_at")
+    when = time.strftime("%H:%M:%S UTC", time.gmtime(at if isinstance(at, (int, float)) else time.time()))
+    safe = BRIDGE_LIKE.sub(lambda m: m.group(1) + "(bridge?)", reply)
+    chunks = chunk_message(safe, MATRIX_CHUNK - 200)
+    first = 'Jill, re "%s" (received %s):\n' % (quote, when)
+    return [first + chunks[0]] + ["Jill (continued):\n" + c for c in chunks[1:]]
+
+
+def bridge_says(*texts):
+    return {"handled": True, "replies": [BRIDGE_PREFIX + t for t in texts]}
+
+
 async def handle_chat(req, client=None):
     if halted():
-        return {"handled": True, "replies": [HALTED_REPLY]}
+        return bridge_says(HALTED_REPLY)
     if PROVIDER_ID != "venice" or not MODEL_ID:
-        return {"handled": True, "replies": ["DEFAULT_MODEL must be a venice/ model (BehalfBot-open#46)."]}
+        return bridge_says("DEFAULT_MODEL must be a venice/ model (BehalfBot-open#46).")
     try:
         import aiohttp
         transport_errors = (aiohttp.ClientError, RuntimeError, OSError)
@@ -744,7 +835,7 @@ async def handle_chat(req, client=None):
     text = normalise(req)
     blocks, notes, fatal = gather_documents(req.get("attachments") or [])
     if fatal:
-        return {"handled": True, "replies": [fatal]}
+        return bridge_says(fatal)
     notes = list(req.get("notes") or []) + notes
     parts = []
     if blocks:
@@ -759,19 +850,19 @@ async def handle_chat(req, client=None):
         sid, is_new = await client.get_session(req.get("room", ""))
         reply = await client.prompt(sid, (SECURITY_PREAMBLE + body) if is_new else body)
     except asyncio.TimeoutError:
-        return {"handled": True, "replies": ["The model timed out ({}s). Try again or say `new`.".format(int(HTTP_TIMEOUT))]}
+        return bridge_says("The model timed out ({}s). Try again or say `new`.".format(int(HTTP_TIMEOUT)))
     except transport_errors as exc:
         log.warning("opencode error: %s", type(exc).__name__)
         if not await client.health():
-            return {"handled": True, "replies": ["opencode server is unreachable - is the stack running?"]}
-        return {"handled": True, "replies": ["opencode error: {}".format(str(exc)[:300])]}
+            return bridge_says("opencode server is unreachable - is the stack running?")
+        return bridge_says("opencode error: {}".format(str(exc)[:300]))
     finally:
         await client.close()
     if halted():
         # A halt that arrived while the model was working: the reply is not
         # delivered (round 6 L6).
-        return {"handled": True, "replies": ["Halted while that reply was being written; it was discarded."]}
-    return {"handled": True, "replies": chunk_message(reply)}
+        return bridge_says("Halted while that reply was being written; it was discarded.")
+    return {"handled": True, "replies": model_reply(reply, req)}
 
 
 def write_alert(kind, text):
@@ -795,7 +886,11 @@ def main(argv=None):
         print("usage: matrix_worker.py command|chat|activate|alert < request.json", file=sys.stderr)
         return 64
     req = json.loads(sys.stdin.read() or "{}")
-    os.makedirs(WORKER_STATE, exist_ok=True)
+    # Flag and approval files must stay readable by the other services and
+    # the chat uid, whatever umask the bridge runs with.
+    os.umask(0o022)
+    if argv[0] in ("command", "activate"):
+        os.makedirs(WORKER_STATE, exist_ok=True)
     if argv[0] == "alert":
         write_alert(req.get("alert_kind"), req.get("text"))
         resp = {"handled": True, "replies": [], "activate": []}

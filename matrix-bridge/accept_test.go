@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"testing"
 
 	"maunium.net/go/mautrix/id"
@@ -163,5 +164,58 @@ func TestRecipientKeyChangesWithMembersDevicesAndPin(t *testing.T) {
 		if other == base {
 			t.Fatal("a change of pin, member or device must rotate the session")
 		}
+	}
+}
+
+func TestWorkerUIDProblems(t *testing.T) {
+	ok := WorkerSpec{UID: 1000, GID: 1000}
+	cases := []struct {
+		name   string
+		bridge int
+		specs  []WorkerSpec
+		bad    bool
+	}{
+		{"root with separate worker and chat uids", 0, []WorkerSpec{ok, {UID: 1001, GID: 1001}}, false},
+		{"root, worker uid unset (round 6b N5)", 0, []WorkerSpec{{}}, true},
+		{"root, worker uid 0", 0, []WorkerSpec{{UID: 0, GID: 1000}}, true},
+		{"root, chat uid unset", 0, []WorkerSpec{ok, {}}, true},
+		{"uid without gid", 0, []WorkerSpec{{UID: 1000}}, true},
+		{"worker uid equals the bridge uid", 1000, []WorkerSpec{ok}, true},
+		{"laptop: non-root, no worker uid", 501, []WorkerSpec{{}, {}}, false},
+	}
+	for _, c := range cases {
+		if got := len(workerUIDProblems(c.bridge, c.specs...)) > 0; got != c.bad {
+			t.Errorf("%s: problems=%v, want %v", c.name, got, c.bad)
+		}
+	}
+}
+
+func TestIsHalt(t *testing.T) {
+	for _, s := range []string{"halt", "HALT", " halt now", "halt 2h travelling", "mute", "silence!", "Halt."} {
+		if !IsHalt(s) {
+			t.Errorf("%q should be a halt", s)
+		}
+	}
+	for _, s := range []string{"halting", "should we halt?", "resume", "", "halftime"} {
+		if IsHalt(s) {
+			t.Errorf("%q should not be a halt", s)
+		}
+	}
+}
+
+func TestPendingHaltSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	b := &Bridge{cfg: Config{StateDir: dir}}
+	req := WorkerRequest{EventID: "$h1", Text: "halt", Room: "!r"}
+	if err := b.savePendingHalt(req); err != nil {
+		t.Fatal(err)
+	}
+	var p pendingHalt
+	if err := readJSON(b.pendingHaltPath("$h1"), &p); err != nil || p.Req.Text != "halt" {
+		t.Fatalf("pending halt not persisted: %v %+v", err, p)
+	}
+	b.clearPendingHalt("$h1")
+	if _, err := os.Stat(b.pendingHaltPath("$h1")); !os.IsNotExist(err) {
+		t.Fatal("pending halt not cleared")
 	}
 }

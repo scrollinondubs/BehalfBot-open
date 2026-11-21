@@ -145,7 +145,7 @@ func rtBase(t *testing.T, ctx context.Context, tag, jillHS string) *rtEnv {
 	e.cfg = Config{
 		Homeserver: jillHS, Principal: e.seanID, Room: e.room, JillUser: e.jillID,
 		StateDir: filepath.Join(e.work, "jill-state"),
-		Worker:   WorkerSpec{Argv: []string{"python3", "-I", worker}}, MaxAttach: 1 << 20, ReadyFile: filepath.Join(e.work, "ready"),
+		Worker:   WorkerSpec{Argv: []string{"python3", "-I", worker}}, ChatWorker: WorkerSpec{Argv: []string{"python3", "-I", worker}}, MaxAttach: 1 << 20, ReadyFile: filepath.Join(e.work, "ready"),
 	}
 	e.tty = &rtPrompter{inner: &jillTTY{sean: e.sas}}
 	return e

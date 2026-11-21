@@ -184,7 +184,18 @@ printed on a screen for exactly that `(id, sha256)`, under these conditions:
 - the code has not been used, and an attempt uses it up.
 
 The model never sees bridge screens, so a screen Jill imitates in chat
-carries no valid code (round 6 H2). After `confirm`, the approval is
+carries no valid code (round 6 H2). If a message of yours contains a live
+code, or the sha256 of a draft with a live screen, it is not sent to Jill:
+the bridge says so and voids those codes (round 6b N1). A newer
+`show draft` for a draft voids its older screen's code.
+
+**Marked output (round 6b N1, N2).**
+
+- Every message the bridge writes starts with `[bridge]`.
+- Every reply from Jill starts with
+  `Jill, re "<your message, 60 chars>" (received <time> UTC):`.
+- Lines in Jill's text that begin like a bridge message are defused, so
+  model output can never pass for the bridge. After `confirm`, the approval is
 written bound to the typed sha256 (TTL 15 minutes, `DRAFT_APPROVAL_TTL`),
 without re-reading the draft. If Jill changes the draft after you looked,
 the gateway's send check fails and the approval is used up.
@@ -199,14 +210,30 @@ worker cannot switch back.
 
 - The bridge state (access token, pickle key, crypto store) is root `0700`.
   The worker cannot list or read it.
-- The worker keeps its codes and sessions in the separate
-  `matrix-worker-state` volume.
+- The worker keeps its codes in the separate `matrix-worker-state` volume
+  (0700).
+- The chat step runs as a third uid, 1001 (round 6b N6). It parses uploaded
+  PDFs and relays model output, and keeps its session map in
+  `matrix-chat-state`. It cannot write approvals, the halt or meter flags or
+  the alert spool, and cannot read the worker's codes or the bridge state.
+- The bridge refuses to start as root unless both of those uids are set
+  (round 6b N5).
 - Alerts are written through the worker, which owns the spool.
 - The service has `mem_limit` 512m and `pids_limit` 128.
 - PDF parsing happens only in the worker.
 
 `matrix-bridge isolation-check` proves the isolation, and CI runs it in the
-built image.
+built image. It includes a positive control: the worker uid can write where
+it must, so the chat uid's denials come from the uid split, not from a
+read-only mount.
+
+**Why the bridge does not write approvals or flags itself (round 6b N6
+as specified).** The bridge runs as root with no `DAC_OVERRIDE`. The
+approvals, control and alert volumes belong to `node`, because jill-control,
+the dispatcher and the gateways share them. Letting the bridge write there
+would mean either giving it `DAC_OVERRIDE` or re-owning three shared
+volumes. The third uid removes the same risk, a parser bug writing an
+approval or lifting a halt, without that.
 
 ## Chat
 

@@ -126,9 +126,9 @@ func newPeer(t *testing.T, ctx context.Context, hs string, creds *Creds, minTrus
 func (p *peer) find(substr string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, b := range p.got {
-		if strings.Contains(b, substr) {
-			return b
+	for i := len(p.got) - 1; i >= 0; i-- {
+		if strings.Contains(p.got[i], substr) {
+			return p.got[i]
 		}
 	}
 	return ""
@@ -317,7 +317,7 @@ func TestE2E(t *testing.T) {
 	cfg := Config{
 		Homeserver: hs, Principal: seanID, Room: room, JillUser: jillID,
 		StateDir: filepath.Join(work, "jill-state"),
-		Worker:   WorkerSpec{Argv: []string{"python3", "-I", worker}}, MaxAttach: 1 << 20, ReadyFile: filepath.Join(work, "ready"),
+		Worker:   WorkerSpec{Argv: []string{"python3", "-I", worker}}, ChatWorker: WorkerSpec{Argv: []string{"python3", "-I", worker}}, MaxAttach: 1 << 20, ReadyFile: filepath.Join(work, "ready"),
 	}
 
 	// 1. Setup: login, cross-signing, SAS with Sean, pin.
@@ -362,14 +362,34 @@ func TestE2E(t *testing.T) {
 
 	// 3. Encrypted round trip through the bridge and the stub model.
 	hello := say("hello jill, round trip")
-	expect("stub-reply: hello jill, round trip")
+	reply := expect("stub-reply: hello jill, round trip")
+	if !strings.HasPrefix(reply, `Jill, re "hello jill, round trip" (received `) {
+		t.Fatalf("model reply does not open with the quote and receive time:\n%s", reply)
+	}
 	if !strings.Contains(logs.String(), "accept event="+hello.String()) {
 		t.Fatal("no accept line for the round trip")
 	}
 
-	// 4. Approval screen and approve with a fixture snapshot.
+	// 4. Approval screen and approve with a fixture snapshot. A message that
+	// carries a live code never reaches the model, and voids the code
+	// (round 6b N1).
 	say("show draft " + draftID)
-	screen := expect("DRAFT \"" + draftID + "\"")
+	first := expect("DRAFT \"" + draftID + "\"")
+	if !strings.HasPrefix(first, "[bridge] DRAFT") {
+		t.Fatalf("bridge output is not marked:\n%s", first)
+	}
+	pasted := regexp.MustCompile(`approve draft \S+ [0-9a-f]{64} (\S+)`).FindStringSubmatch(first)
+	if pasted == nil {
+		t.Fatal("no code on the first screen")
+	}
+	say("is this right? " + pasted[1])
+	expect("not sent to Jill")
+	say("show draft " + draftID)
+	waitUntil(t, 60*time.Second, "a second screen", func() bool {
+		s := sean.find("DRAFT \"" + draftID + "\"")
+		return s != "" && !strings.Contains(s, pasted[1])
+	})
+	screen := sean.find("DRAFT \"" + draftID + "\"")
 	lines := strings.Split(strings.TrimSpace(screen), "\n")
 	last := lines[len(lines)-1]
 	if !strings.HasPrefix(last, "sha256 ") || !strings.Contains(screen, `"hidden@evil.example"`) || !strings.Contains(screen, `\u{202e}`) {
