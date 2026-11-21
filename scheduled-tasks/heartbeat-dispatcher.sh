@@ -268,7 +268,26 @@ _mtime() {
     stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo ""
 }
 
+# flock(1), where present (the image, Linux hosts), is kernel-enforced and
+# released when the holder dies, so it has no orphans. The mkdir lock below
+# is the fallback for hosts without it (stock macOS), or when
+# DISPATCHER_STATE_LOCK=mkdir. fd 9 is used so bash 3.2 can run this too.
+STATE_LOCK_KIND=""
+
 _state_lock_acquire() {
+    if [[ "${DISPATCHER_STATE_LOCK:-auto}" != "mkdir" ]] && command -v flock >/dev/null 2>&1; then
+        exec 9>>"${STATE_FILE}.flock"
+        if flock -w "${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10}" 9; then
+            STATE_LOCK_KIND=flock
+            return 0
+        fi
+        exec 9>&-
+        STATE_LOCK_FAILED=1
+        _state_lock_alert "ERROR state lock held >${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10}s - write refused; this tick fires nothing more" \
+            "The dispatcher could not take its state lock in time, so it refused the write and stopped firing for this tick. Another dispatcher may be running."
+        return 1
+    fi
+    STATE_LOCK_KIND=mkdir
     local lock_dir="${STATE_FILE}.lock" waited=0 holder="" made
     while ! mkdir "$lock_dir" 2>/dev/null; do
         holder=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
@@ -299,6 +318,10 @@ _state_lock_acquire() {
 }
 
 _state_lock_release() {
+    if [[ "$STATE_LOCK_KIND" == flock ]]; then
+        exec 9>&-
+        return 0
+    fi
     rm -f "${STATE_FILE}.lock/pid" 2>/dev/null || true
     rmdir "${STATE_FILE}.lock" 2>/dev/null || true
 }

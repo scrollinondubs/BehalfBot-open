@@ -256,7 +256,7 @@ mkdir -p "$SB/state/scheduled-tasks"
 echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
 mkdir "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
 touch -t 202001010000 "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
-tick
+tick DISPATCHER_STATE_LOCK=mkdir
 [[ "$(calls)" == 1 && "$(alerts state-lock)" == 1 ]] && logged "orphaned state lock" \
     && ok "F6 orphaned lock (no pid): removed with an alert, then the tick ran" \
     || bad "F6 orphaned lock: calls=$(calls) alerts=$(alerts state-lock)"
@@ -265,12 +265,27 @@ new_sandbox held-lock "hb-a|"
 mkdir -p "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
 echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
 echo $$ > "$SB/state/scheduled-tasks/heartbeat-state.json.lock/pid"
-tick
+tick DISPATCHER_STATE_LOCK=mkdir
 rm -f "$SB/state/scheduled-tasks/heartbeat-state.json.lock/pid"
 rmdir "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
 [[ "$(calls)" == 0 && "$(alerts state-lock)" == 1 ]] && logged "write refused" \
-    && ok "F6 lock held by a live process: writes refused, nothing fired, one alert" \
+    && ok "F6 mkdir lock held by a live process: writes refused, nothing fired, one alert" \
     || bad "F6 held lock: calls=$(calls) alerts=$(alerts state-lock)"
+
+if command -v flock >/dev/null 2>&1; then
+    new_sandbox held-flock "hb-a|"
+    mkdir -p "$SB/state/scheduled-tasks"
+    echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
+    flock "$SB/state/scheduled-tasks/heartbeat-state.json.flock" sleep 30 &
+    holder_pid=$!
+    sleep 0.5
+    tick DISPATCHER_STATE_LOCK_WAIT_SECONDS=2
+    kill "$holder_pid" 2>/dev/null
+    wait "$holder_pid" 2>/dev/null
+    [[ "$(calls)" == 0 && "$(alerts state-lock)" == 1 ]] && logged "write refused" \
+        && ok "F6 flock held by a live process: writes refused, nothing fired, one alert" \
+        || bad "F6 held flock: calls=$(calls) alerts=$(alerts state-lock)"
+fi
 
 # --- per-heartbeat fire cap -----------------------------------------------
 new_sandbox fire-cap "hb-a|max_fires_per_day: 1"
@@ -377,24 +392,30 @@ fi
 # --- state lock -------------------------------------------------------------
 # 40 writers at once is far past what a tick does; give them time so the
 # test measures lost updates, not the (correct) refusal after the wait.
-new_sandbox state-lock "hb-a|"
-(
-    export BEHALFBOT_HOME="$SB/home" BEHALFBOT_STATE_HOME="$SB/state" DISPATCHER_TEST_SOURCE=1
-    export DISPATCHER_STATE_LOCK_WAIT_SECONDS=120
-    # shellcheck source=/dev/null
-    source "$DISPATCHER"
-    init_state
-    for i in $(seq 1 20); do
-        ( set_state "race-$i" "v" "$i"; echo "race-$i rc=$?" >> "$SB/writers.log" ) 2>> "$SB/writers.err" &
-        ( increment_fire_count "count-$i"; echo "count-$i rc=$?" >> "$SB/writers.log" ) 2>> "$SB/writers.err" &
-    done
-    wait
-)
-lost=$(jq '[range(1;21) as $i | select(.["race-\($i)"].v != "\($i)" or .["count-\($i)"].fire_count != "1")] | length' \
-    "$SB/state/scheduled-tasks/heartbeat-state.json" 2>/dev/null || echo 40)
+# Both lock kinds are exercised: flock (where present) and the mkdir
+# fallback.
 logcount() { cat "$SB"/state/logs/scheduled/*-dispatcher.log 2>/dev/null | grep -c "$1"; }
-[[ "$lost" == 0 ]] && ok "state lock: 40 concurrent writes, none lost" \
-    || bad "state lock: $lost write(s) missing (refused: $(logcount "write refused"), discarded: $(logcount "discarded"), orphan removals: $(logcount "orphaned"), dead-holder recoveries: $(logcount "dead holder"), writers finished: $(wc -l < "$SB/writers.log" 2>/dev/null | tr -d ' ')/40, missing: $(jq -r '[range(1;21) as $i | select(.["race-\($i)"].v != "\($i)") | "race-\($i)"] + [range(1;21) as $i | select(.["count-\($i)"].fire_count != "1") | "count-\($i)"] | join(",")' "$SB/state/scheduled-tasks/heartbeat-state.json" 2>/dev/null), stderr: $(tr '\n' ' ' < "$SB/writers.err" 2>/dev/null | cut -c1-400))"
+for kind in auto mkdir; do
+    new_sandbox "state-lock-$kind" "hb-a|"
+    (
+        export BEHALFBOT_HOME="$SB/home" BEHALFBOT_STATE_HOME="$SB/state" DISPATCHER_TEST_SOURCE=1
+        export DISPATCHER_STATE_LOCK_WAIT_SECONDS=120 DISPATCHER_STATE_LOCK="$kind"
+        # shellcheck source=/dev/null
+        source "$DISPATCHER"
+        init_state
+        for i in $(seq 1 20); do
+            ( set_state "race-$i" "v" "$i"; echo "race-$i rc=$?" >> "$SB/writers.log" ) 2>> "$SB/writers.err" &
+            ( increment_fire_count "count-$i"; echo "count-$i rc=$?" >> "$SB/writers.log" ) 2>> "$SB/writers.err" &
+        done
+        wait
+    )
+    missing=$(jq -r '[range(1;21) as $i | select(.["race-\($i)"].v != "\($i)") | "race-\($i)"]
+        + [range(1;21) as $i | select(.["count-\($i)"].fire_count != "1") | "count-\($i)"] | join(",")' \
+        "$SB/state/scheduled-tasks/heartbeat-state.json" 2>/dev/null || echo unreadable)
+    label="state lock ($kind$([[ "$kind" == auto ]] && command -v flock >/dev/null 2>&1 && echo ": flock"))"
+    [[ -z "$missing" ]] && ok "$label: 40 concurrent writes, none lost" \
+        || bad "$label: lost $missing (refused: $(logcount "write refused"), discarded: $(logcount "discarded"), orphan removals: $(logcount "orphaned"), dead-holder recoveries: $(logcount "dead holder"), writers finished: $(wc -l < "$SB/writers.log" | tr -d ' ')/40, stderr: $(tr '\n' ' ' < "$SB/writers.err" | cut -c1-300))"
+done
 
 # --- live mounts (compose only) ---------------------------------------------
 if [[ "${SELFTEST_LIVE:-0}" == 1 ]]; then
