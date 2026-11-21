@@ -631,6 +631,7 @@ invoke_opencode() {
             ((([$steps[].tokens.input // 0] | add // 0) * $price[0]
               + ([$steps[].tokens.output // 0] | add // 0) * $price[1]
               + ([$steps[].tokens.reasoning // 0] | add // 0) * $price[1]
+              + ([$steps[].tokens.cache.write // 0] | add // 0) * $price[0]
               + ([$steps[].tokens.cache.read // 0] | add // 0) * $price[2]) / 1000000) as $estimated |
             {
                 ts: $ts,
@@ -654,6 +655,18 @@ invoke_opencode() {
         over_budget=$(jq -n --argjson c "${run_cost:-0}" --argjson b "${budget:-0}" '$c > $b' 2>/dev/null || echo false)
         if [[ "$over_budget" == "true" ]]; then
             log "WARN $heartbeat_name - run cost \$$run_cost exceeded advisory budget \$$budget"
+        fi
+
+        # A successful run that reports neither tokens nor cost means spend is
+        # not being measured (the provider returned no usage), so every
+        # dollar cap is blind. Say so loudly, once a day.
+        if [[ $exit_code -eq 0 ]] && tail -n 1 "$telemetry_file" 2>/dev/null \
+            | jq -e '.cost_usd == 0 and .input_tokens == 0 and .output_tokens == 0 and .cache_read_tokens == 0 and .cache_create_tokens == 0' >/dev/null 2>&1; then
+            log "WARN $heartbeat_name - the run reported no token usage and no cost; spend caps cannot see it"
+            if [[ "$(get_state "_dispatcher" "unmeasured_alert_date")" != "$DATE" ]]; then
+                set_state "_dispatcher" "unmeasured_alert_date" "$DATE"
+                alert_ops spend-unmeasured "A run of ${heartbeat_name} reported no token usage and no cost, so the daily spend caps cannot see Jill's spend. Check that Venice returns usage on streamed responses."
+            fi
         fi
 
         rm -f "$tmp_events"
@@ -790,6 +803,7 @@ run_output_validator() {
             [([$s[].cost // 0] | add // 0),
              ((([$s[].tokens.input // 0] | add // 0) * $price[0] + ([$s[].tokens.output // 0] | add // 0) * $price[1]
                + ([$s[].tokens.reasoning // 0] | add // 0) * $price[1]
+               + ([$s[].tokens.cache.write // 0] | add // 0) * $price[0]
                + ([$s[].tokens.cache.read // 0] | add // 0) * $price[2]) / 1000000)] | max' \
             "$validator_events" 2>/dev/null || echo 0)
         printf '%s\n' "{\"ts\":\"$ts_iso\",\"heartbeat\":\"${name}-validator\",\"model\":\"$validator_model\",\"cost_usd\":${cost_usd:-0},\"input_tokens\":0,\"output_tokens\":0,\"cache_read_tokens\":0,\"cache_create_tokens\":0,\"wall_seconds\":0,\"exit_code\":0}" \
@@ -1226,6 +1240,14 @@ main() {
             set_state "$name" "circuit_open_until" ""
         fi
 
+        # The halt gate is checked again here, not only at tick start: a tick
+        # walks every heartbeat, and each run can take 20 minutes, so a halt
+        # sent mid-tick must stop the heartbeats that have not fired yet.
+        if is_halted; then
+            log "HALTED mid-tick - $name and every later heartbeat skipped"
+            break
+        fi
+
         log "FIRE $name - invoking opencode run (model=$model, budget=\$$budget advisory)"
 
         if [[ "$DRY_RUN" == "true" ]]; then
@@ -1257,6 +1279,10 @@ ${gathered_data}
         local invoke_success=false
         local attempt
         for attempt in 1 2 3; do
+            if [[ $attempt -gt 1 ]] && is_halted; then
+                log "HALTED - retry $attempt of $name skipped"
+                break
+            fi
             if invoke_opencode "$prompt_input" "$output_file" "$model" "$budget" "$name" "$cwd"; then
                 invoke_success=true
                 break

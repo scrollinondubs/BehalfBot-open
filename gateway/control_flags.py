@@ -44,9 +44,15 @@ def parse_iso(ts):
     return int(dt.timestamp())
 
 
+MAX_BYTES = 64 * 1024
+
+
 def read(path):
-    """(data, ok). ok is False when the file exists but is unreadable."""
+    """(data, ok). ok is False when the file exists but is unreadable or
+    larger than any flag, cursor or probe record has reason to be."""
     try:
+        if os.path.getsize(path) > MAX_BYTES:
+            return {}, False
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:

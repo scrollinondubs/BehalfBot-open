@@ -273,6 +273,13 @@ class Alerts(Base):
         self.assertEqual(self.hs.sent, [])
         self.assertEqual(len(os.listdir(os.path.join(self.cfg["spool_dir"], "rejected"))), 3)
 
+    def test_oversized_files_are_not_read(self):
+        self.spool("1.json", {"kind": "x", "text": "y" * (c.MAX_FILE_BYTES + 1)})
+        self.assertEqual(self.ctl.drain_spool(), 0)
+        with open(self.halt, "w") as f:
+            f.write(" " * (flags.MAX_BYTES + 1))
+        self.assertEqual(flags.state(self.halt), "on", "an oversized flag file must read as on")
+
     def test_control_chars_and_length_are_bounded(self):
         self.spool("1.json", {"kind": "x", "text": "a\x1b[2Jb\x00" + "y" * 5000})
         self.ctl.drain_spool()
