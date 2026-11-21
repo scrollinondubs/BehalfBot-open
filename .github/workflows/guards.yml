@@ -1,0 +1,48 @@
+name: Guards
+
+# No paths filter, same reasoning as shell-lint.yml: a filtered check that is
+# ever made required deadlocks unrelated PRs.
+#
+# Two jobs, proving different things:
+#   unit      the deny rules themselves (fast, no Docker)
+#   selftest  the built image: guard files read-only, plugin actually loaded
+#             by OpenCode, denials firing in the parent session AND in a
+#             subagent, against a scripted local model. No keys, no network
+#             inside the container.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Guard policy unit tests
+        run: node --experimental-strip-types --test tests/guards/*.test.ts
+      - name: Venice-only model resolution
+        run: bash tests/test-resolve-model.sh
+
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t behalfbot-open:ci .
+      - name: Boot self-test (read-only rootfs, no network)
+        run: |
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp \
+            --tmpfs /home/node/.cache:uid=1000,gid=1000 \
+            --tmpfs /home/node/.local/state:uid=1000,gid=1000 \
+            -v /home/node/.local/share/opencode -v /data -v /workspace \
+            -e VENICE_API_KEY=held-by-venice-proxy \
+            -w /app behalfbot-open:ci bash /app/selftest/run.sh

@@ -29,3 +29,6 @@ __pycache__/
 mvp-run-output.json
 docker/
 docs/
+
+# Unit tests run on the host / in CI, not in the image.
+tests/

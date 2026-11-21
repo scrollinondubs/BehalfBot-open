@@ -1,0 +1,13 @@
+{
+  "_comment": "Read by .opencode/guards/policy.ts from the image's own config/ dir (root-owned, read-only). Missing or unreadable means deny. Hosts match exactly or as a dot-boundary subdomain of an entry.",
+  "egress_hosts": [
+    "api.agentmail.to"
+  ],
+  "write_roots": [
+    "/workspace",
+    "/tmp"
+  ],
+  "agentmail_recipients": [
+    "sean@grid7.com"
+  ]
+}

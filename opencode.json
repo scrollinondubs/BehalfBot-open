@@ -3,6 +3,8 @@
   "model": "venice/zai-org-glm-5-2",
   "small_model": "venice/z-ai-glm-5-3-flash",
   "instructions": [
+    "/app/AGENTS.md",
+    "/app/.opencode/instructions/response-style.md",
     ".opencode/instructions/response-style.md"
   ],
   "autoupdate": false,
@@ -12,7 +14,7 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "Venice AI",
       "options": {
-        "baseURL": "https://api.venice.ai/api/v1",
+        "baseURL": "{env:VENICE_BASE_URL}",
         "apiKey": "{env:VENICE_API_KEY}"
       },
       "whitelist": [
@@ -37,6 +39,11 @@
   },
   "permission": {
     "edit": "allow",
+    "external_directory": {
+      "*": "deny",
+      "/workspace/**": "allow",
+      "/tmp/**": "allow"
+    },
     "bash": {
       "*": "allow",
       "rm -rf *": "deny",
