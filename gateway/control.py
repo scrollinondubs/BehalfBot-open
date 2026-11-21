@@ -107,6 +107,7 @@ COMMANDS = {
     "conservation off": "unconserve",
     "status": "status",
     "reset meter": "reset-meter",
+    "reset meter spend": "reset-meter-spend",
 }
 
 STAGE_RANK = {"ok": 0, "t7": 1, "t1": 2, "unknown": 3, "missing": 4, "rate_limited": 5, "exhausted": 6,
@@ -114,7 +115,7 @@ STAGE_RANK = {"ok": 0, "t7": 1, "t1": 2, "unknown": 3, "missing": 4, "rate_limit
 RENAG_STAGES = ("unknown", "missing", "rate_limited", "exhausted", "rejected", "expired")
 # Red-team F3: a halt or conserve is honoured whatever its age (a late stop
 # is still a stop); only the commands that LIFT a stop, and status, expire.
-AGE_LIMITED = ("resume", "unconserve", "status", "reset-meter")
+AGE_LIMITED = ("resume", "unconserve", "status", "reset-meter", "reset-meter-spend")
 
 
 def log(msg):
@@ -149,13 +150,15 @@ def parse_command(content):
     parts = text.split()
     lowered = [p.lower() for p in parts]
     command, rest = None, []
-    if len(lowered) >= 2 and "%s %s" % (lowered[0], lowered[1]) in COMMANDS:
+    if len(lowered) >= 3 and " ".join(lowered[:3]) in COMMANDS:
+        command, rest = COMMANDS[" ".join(lowered[:3])], parts[3:]
+    elif len(lowered) >= 2 and "%s %s" % (lowered[0], lowered[1]) in COMMANDS:
         command, rest = COMMANDS["%s %s" % (lowered[0], lowered[1])], parts[2:]
     elif lowered[0] in COMMANDS:
         command, rest = COMMANDS[lowered[0]], parts[1:]
     if command is None:
         return None
-    if command in ("resume", "unconserve", "status", "reset-meter") and rest:
+    if command in ("resume", "unconserve", "status", "reset-meter", "reset-meter-spend") and rest:
         return None
     duration = None
     if rest:
@@ -339,7 +342,7 @@ class Control:
         return "\n".join([line("halt", self.halt_file), line("conservation", self.conservation_file), "",
                           "halt | resume | conserve | unconserve | status | reset meter"])
 
-    def apply(self, command, duration, reason):
+    def apply(self, command, duration, reason, event_ts=None):
         by = "%s:%s" % (self.SOURCE, self.cfg["principal"])
         if command == "status":
             return self.describe_state()
@@ -356,14 +359,22 @@ class Control:
             lift = "Auto-lift %s." % duration if duration else "No auto-lift - stays on until you say `resume`."
             return ("CONSERVATION ON. Heartbeats marked `normal` and `background` are skipped from the next "
                     "tick; `critical` ones still run.\n%s\nIf you want everything to stop, say `halt`." % lift)
-        if command == "reset-meter":
+        if command in ("reset-meter", "reset-meter-spend"):
             # venice-proxy owns the meter; this only records the request in
             # control-state (read-only there), and the proxy applies it once
-            # on its next call (red-team N3).
+            # on its next call (red-team N3). The request is keyed on the
+            # Matrix event's own time, so replaying the same event after a
+            # restart changes nothing (R3-3).
+            spend = command == "reset-meter-spend"
+            at = event_ts if isinstance(event_ts, (int, float)) and not isinstance(event_ts, bool) else self.clock()
             write_json_atomic(os.path.join(self.cfg["control_dir"], "meter-reset.json"),
-                              {"requested_at": int(self.clock()), "by": by})
-            return ("METER RESET requested. venice-proxy zeroes today's Venice spend and request counts on its "
-                    "next call; the daily ceiling then applies again from zero.")
+                              {"requested_at": at, "spend": spend, "by": by})
+            if spend:
+                return ("METER RESET (requests AND spend) requested. venice-proxy zeroes today's request count, "
+                        "rate window and dollar spend on its next call, so up to the full daily ceiling can be "
+                        "spent again today.")
+            return ("METER RESET (requests) requested. venice-proxy zeroes today's request count and rate window "
+                    "on its next call. Today's dollar spend is kept; `reset meter spend` clears that too.")
         if command == "unconserve":
             flags.write(self.conservation_file, False)
             return "Conservation off. Normal and background heartbeats resume at the next tick."
@@ -429,13 +440,15 @@ class Control:
                 text = None
             try:
                 if text is None:
-                    text = self.apply(command, duration, reason)
+                    ts = ev.get("origin_server_ts")
+                    text = self.apply(command, duration, reason,
+                                      event_ts=ts / 1000 if isinstance(ts, (int, float)) and not isinstance(ts, bool) else None)
             except OSError as exc:
                 log("ERROR: could not write state for %s: %s" % (command, exc))
                 text = "Could not apply `%s` - writing the flag file failed." % command
             try:
                 self.matrix.send_text(room, text)
-            except MatrixError as exc:
+            except Exception as exc:  # any ack failure: log it, keep the cursor moving (R3-3)
                 log("WARN: ack failed: %s" % exc)
         end = data.get("end")
         if end and end != self.cursor:
@@ -618,7 +631,13 @@ class Control:
             if isinstance(req, int) and isinstance(max_req, int) and req >= max_req:
                 alerts.append(("requests", "Jill reached the daily Venice request ceiling (%d calls). venice-proxy "
                                            "refuses model calls until midnight UTC. Say `reset meter` to clear "
-                                           "today's meter." % max_req))
+                                           "today's request count (spend is kept)." % max_req))
+            over = rec.get("over_hold")
+            if isinstance(over, int) and not isinstance(over, bool) and over > 0:
+                alerts.append(("over_hold", "TRIPWIRE: %d Venice bill(s) today came to more than the amount held "
+                                            "for the call, so the size-based hold is not holding. After 2 in a day "
+                                            "venice-proxy holds the whole context window per call for the rest of "
+                                            "the day." % over))
         changed = False
         for key, text in alerts:
             if not sent.get(key) and self.post(text):

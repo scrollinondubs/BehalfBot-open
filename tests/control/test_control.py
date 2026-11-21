@@ -506,3 +506,60 @@ class ResetMeter(Base):
         with open(self.halt, "w") as f:
             f.write("{}")
         self.assertEqual(flags.state(self.halt), "on")
+
+
+class Round3(Base):
+    def test_r3_3_reset_is_keyed_on_the_event_time_so_replay_is_idempotent(self):
+        self.ctl.poll_room()
+        self.hs.say("reset meter", age_s=30)
+        ev_ts = self.hs.events[-1]["origin_server_ts"] / 1000
+        self.ctl.poll_room()
+        req, _ = flags.read(os.path.join(self.cfg["control_dir"], "meter-reset.json"))
+        self.assertAlmostEqual(req["requested_at"], ev_ts, places=3)
+        self.assertIs(req["spend"], False)
+        again = c.Control(self.cfg, c.Matrix(self.hs.url, TOKEN))
+        again.cursor = None
+        again.apply("reset-meter", None, None, event_ts=ev_ts)
+        req2, _ = flags.read(os.path.join(self.cfg["control_dir"], "meter-reset.json"))
+        self.assertEqual(req2["requested_at"], req["requested_at"], "a replay writes the same key")
+
+    def test_r3_3_any_ack_failure_still_applies_once_and_moves_on(self):
+        self.ctl.poll_room()
+        boom = []
+
+        def explode(room, text):
+            boom.append(text)
+            raise RuntimeError("socket blew up")
+
+        self.ctl.matrix.send_text = explode
+        self.hs.say("halt")
+        self.ctl.poll_room()
+        self.assertEqual(flags.state(self.halt), "on")
+        cursor = self.ctl.cursor
+        self.ctl.poll_room()
+        self.assertEqual(len(boom), 1, "the halt must not be re-run after a failed ack")
+        self.assertEqual(self.ctl.cursor, cursor)
+
+    def test_r3_4_reset_meter_spend_word(self):
+        self.assertEqual(c.parse_command("reset meter spend")[0], "reset-meter-spend")
+        self.assertEqual(c.parse_command("reset meter")[0], "reset-meter")
+        self.ctl.poll_room()
+        self.hs.say("reset meter spend")
+        self.ctl.poll_room()
+        req, _ = flags.read(os.path.join(self.cfg["control_dir"], "meter-reset.json"))
+        self.assertIs(req["spend"], True)
+        self.assertIn("AND spend", self.hs.sent[-1][1])
+
+    def test_over_hold_tripwire_alerts_once_a_day(self):
+        d = os.path.join(self.tmp.name, "meter")
+        os.makedirs(d)
+        self.cfg["meter_dir"] = d
+        path = os.path.join(d, "meter-%s.json" % time.strftime("%Y-%m-%d", time.gmtime()))
+        with open(path, "w") as f:
+            json.dump({"usd": 0.1, "requests": 3, "max_requests": 2000, "ceiling_usd": 5, "over_hold": 1}, f)
+        self.ctl.check_meter()
+        with open(path, "w") as f:
+            json.dump({"usd": 0.2, "requests": 4, "max_requests": 2000, "ceiling_usd": 5, "over_hold": 2}, f)
+        self.ctl.check_meter()
+        trips = [b for _, b in self.hs.sent if "TRIPWIRE" in b]
+        self.assertEqual(len(trips), 1)

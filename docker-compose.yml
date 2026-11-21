@@ -168,6 +168,10 @@ services:
     <<: &gateway
       read_only: true
       cap_drop: [ALL]
+      # A gateway parses caller-controlled bodies; a bounded memory limit
+      # turns a memory bomb into a refused request or a restart, not a host
+      # problem (red-team R3-1). venice-proxy's meter survives a restart.
+      mem_limit: 512m
       restart: unless-stopped
       security_opt:
         - no-new-privileges:true

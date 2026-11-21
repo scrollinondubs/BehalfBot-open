@@ -10,6 +10,7 @@ import json
 import math
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -166,15 +167,16 @@ class Live(unittest.TestCase):
     # N1 ---------------------------------------------------------------------
 
     def test_n1_parallel_calls_never_pass_the_ceiling(self):
-        # The red team's shape: every call really costs $0.84 (600k prompt
-        # tokens, whatever the body), upstream is slow, many calls at once.
+        # The bound's worst case (red team tight3 T2): Venice bills one token
+        # per request byte plus the whole output cap, on a 200 KB request.
+        big = {"model": MODEL, "messages": [{"role": "user", "content": "z" * 200_000}]}
         for n in (40, 60):
             with self.subTest(n=n):
-                up_reset(delay=0.3, usage={"prompt_tokens": 600_000, "completion_tokens": 0})
+                up_reset(delay=0.3)
                 self.tmp.cleanup()
                 self.tmp = tempfile.TemporaryDirectory()
                 c, port = self.gateway(VENICE_MAX_USD_PER_DAY="5", VENICE_MAX_IN_FLIGHT="8")
-                codes = self.parallel(port, n)
+                codes = self.parallel(port, n, big)
                 rec = self.meter(c)
                 self.assertLessEqual(rec["usd"], 5.0, "settled spend passed the ceiling")
                 self.assertGreater(codes.count(429), 0)
@@ -196,10 +198,9 @@ class Live(unittest.TestCase):
         self.call(port, {"model": MODEL, "messages": [], "max_tokens": 50_000})
         self.call(port, {"model": MODEL, "messages": [], "max_completion_tokens": 300})
         first, second, third = UP["bodies"]
-        self.assertEqual(first["max_completion_tokens"], 1000)
-        self.assertNotIn("max_tokens", first)
+        self.assertEqual((first["max_tokens"], first["max_completion_tokens"]), (1000, 1000))
         self.assertEqual((second["max_tokens"], second["max_completion_tokens"]), (1000, 1000))
-        self.assertEqual(third["max_completion_tokens"], 300)
+        self.assertEqual((third["max_tokens"], third["max_completion_tokens"]), (300, 300))
         status, _ = self.call(port, {"model": MODEL, "messages": [], "max_tokens": -1})
         self.assertEqual(status, 400)
 
@@ -236,8 +237,8 @@ class Live(unittest.TestCase):
         c, port = self.gateway()
         self.call(port)
         rec = self.meter(c)
-        hold = c["meter"].hold_for(MODEL, len(json.dumps(dict(CHAT, max_completion_tokens=8192))))
-        self.assertAlmostEqual(rec["usd"], hold, places=6)
+        body = len(json.dumps(dict(CHAT, max_completion_tokens=8192, max_tokens=8192)))
+        self.assertAlmostEqual(rec["usd"], c["meter"].hold_for(MODEL, body), places=4)
         self.assertGreater(rec["usd"], 0.03)
         self.assertEqual(rec["unmetered"], 1)
 
@@ -286,16 +287,116 @@ class Live(unittest.TestCase):
         self.assertEqual(codes.count(429), 5)
         self.assertEqual(self.meter(c)["usd"], 0)
 
-    def test_n3_reset_meter_request_zeroes_today_once(self):
+    def test_r3_4_reset_meter_clears_requests_and_reset_spend_clears_dollars(self):
         up_reset(usage={"prompt_tokens": 1_000_000, "completion_tokens": 0})
-        c, port = self.gateway(VENICE_MAX_USD_PER_DAY="2")
-        self.assertEqual(self.call(port)[0], 200)
+        c, port = self.gateway(VENICE_MAX_USD_PER_DAY="1.42", VENICE_MAX_REQUESTS_PER_DAY="5")
+        self.assertEqual(self.call(port)[0], 200)  # bills $1.40
         self.assertEqual(self.call(port)[0], 429)
-        g.safe_write_json(os.path.join(c["control_dir"], "meter-reset.json"), {"requested_at": time.time()})
-        self.assertEqual(self.call(port)[0], 200)
+        reset = os.path.join(c["control_dir"], "meter-reset.json")
+        g.safe_write_json(reset, {"requested_at": time.time() - 5})
+        self.assertEqual(self.call(port)[0], 429, "`reset meter` must not wipe spend")
         rec = self.meter(c)
-        self.assertEqual(rec["requests"], 1)
-        self.assertIn("reset_applied_at", rec)
+        self.assertEqual(rec["requests"], 0)
+        self.assertAlmostEqual(rec["usd"], 1.40)
+        g.safe_write_json(reset, {"requested_at": time.time() - 1, "spend": True})
+        up_reset(usage={"prompt_tokens": 10, "completion_tokens": 10})
+        self.assertEqual(self.call(port)[0], 200)
+        self.assertLess(self.meter(c)["usd"], 0.001)
+        before = self.meter(c)["requests"]
+        self.call(port)
+        self.assertEqual(self.meter(c)["requests"], before + 1, "a replayed reset is applied once")
+
+    # Tighter hold + tripwire ---------------------------------------------------
+
+    def test_hold_is_request_size_based_and_falls_back_after_two_overruns(self):
+        up_reset(usage={"prompt_tokens": 600_000, "completion_tokens": 0})
+        c, port = self.gateway(VENICE_MAX_USD_PER_DAY="50")
+        m = c["meter"]
+        small = m.hold_for(MODEL, 200)
+        self.assertLess(small, 0.05)
+        self.assertAlmostEqual(m.hold_for(MODEL, 2_000_000), m.hold_for(MODEL, 0, full=True))
+        self.call(port)
+        self.call(port)
+        rec = self.meter(c)
+        self.assertEqual(rec["over_hold"], 2)
+        captured = []
+        orig = m.hold_for
+        m.hold_for = lambda model, body_len=0, full=False: captured.append(full) or orig(model, body_len, full)
+        self.call(port)
+        self.assertEqual(captured, [True], "after two overruns the day uses full-context holds")
+
+    def test_r3_4_models_is_cached_for_ten_minutes(self):
+        c, port = self.gateway()
+        for _ in range(5):
+            self.assertEqual(self.call(port, method="GET", path="/api/v1/models")[0], 200)
+        self.assertEqual(len(UP["headers"]), 1, "upstream saw one /models call, the rest came from the cache")
+        self.assertEqual(self.meter(c)["requests"], 1)
+
+    # R3-1 ---------------------------------------------------------------------
+
+    def test_r3_1_venice_body_limit_and_container_bomb(self):
+        c, port = self.gateway()
+        self.assertEqual(c["max_body"], 4 * 1024 * 1024)
+        s = socket.create_connection(("127.0.0.1", port))
+        s.sendall(b"POST /api/v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-length: 5000000\r\n\r\n")
+        self.assertIn(b" 413 ", s.recv(200))
+        s.close()
+        bomb = b'{"model": "%s", "messages": [' % MODEL.encode() + b",".join([b"[]"] * 60_000) + b"]}"
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        conn.request("POST", "/api/v1/chat/completions", body=bomb, headers={"content-type": "application/json"})
+        self.assertEqual(conn.getresponse().status, 413)
+        conn.close()
+
+    # R3-2 ---------------------------------------------------------------------
+
+    def test_r3_2_stalled_readers_release_their_slots(self):
+        up_reset(mode="sse", chunks=400, chunk_pad=60_000)
+        old = (g.WRITE_TIMEOUT, g.DRAIN_SECONDS)
+        g.WRITE_TIMEOUT, g.DRAIN_SECONDS = 1, 2
+        self.addCleanup(lambda: (setattr(g, "WRITE_TIMEOUT", old[0]), setattr(g, "DRAIN_SECONDS", old[1])))
+        c, port = self.gateway(VENICE_MAX_IN_FLIGHT="3")
+        socks = []
+        raw = json.dumps(dict(CHAT, stream=True)).encode()
+        for _ in range(3):
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            s.connect(("127.0.0.1", port))
+            s.sendall(b"POST /api/v1/chat/completions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\n"
+                      b"content-length: %d\r\n\r\n" % len(raw) + raw)
+            socks.append(s)  # never read
+        time.sleep(1)
+        self.assertEqual(c["meter"].in_flight, 3)
+        for _ in range(150):
+            if c["meter"].in_flight == 0:
+                break
+            time.sleep(0.1)
+        for s in socks:
+            s.close()
+        self.assertEqual(c["meter"].in_flight, 0, "stalled readers must not pin their holds")
+        self.assertAlmostEqual(c["meter"].held, 0.0)
+
+    def test_garbage_from_upstream_is_a_502_and_charges_the_hold(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        self.addCleanup(srv.close)
+
+        def garbage():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                conn.recv(65536)
+                conn.sendall(b"NOT-HTTP garbage\r\n\r\n")
+                conn.close()
+
+        threading.Thread(target=garbage, daemon=True).start()
+        c, port = self.gateway(UPSTREAM_URL="http://127.0.0.1:%d" % srv.getsockname()[1])
+        self.assertEqual(self.call(port)[0], 502)
+        rec = self.meter(c)
+        self.assertGreater(rec["usd"], 0.03, "an unknown outcome is charged the hold")
+        self.assertEqual(c["meter"].in_flight, 0)
 
     # N5 ---------------------------------------------------------------------
 
@@ -340,6 +441,22 @@ class Gate(unittest.TestCase):
                     f.write(doc)
                 with self.assertRaises(g.Deny, msg=doc):
                     run(c)
+
+    def test_r3_5_armed_at_nan_infinite_or_future_is_unarmed(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = cfg(d, CONTROL_REQUIRE_ARMED="1")
+            for raw in ('{"armed_at": NaN}', '{"armed_at": Infinity}', '{"armed_at": %d}' % (time.time() + 3600)):
+                with open(os.path.join(c["control_dir"], "armed.json"), "w") as f:
+                    f.write(raw)
+                with self.assertRaises(g.Deny, msg=raw):
+                    run(c)
+
+    def test_r3_5_boot_refuses_a_ceiling_below_one_minimum_hold(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit):
+                cfg(d, VENICE_MAX_USD_PER_DAY="0.01")
+            cfg(d, VENICE_MAX_USD_PER_DAY="0")  # 0 deliberately refuses every call
+            cfg(d, VENICE_MAX_USD_PER_DAY="0.05")
 
     def test_unarmed_refuses_and_default_age_is_90s(self):
         with tempfile.TemporaryDirectory() as d:
@@ -399,3 +516,92 @@ class Rollover(unittest.TestCase):
             m.settle(MODEL, hold, 200, {"prompt_tokens": 1_000_000, "completion_tokens": 0}, day)
             self.assertAlmostEqual(json.load(open(m._path(day)))["usd"], 1.40)
             self.assertFalse(os.path.exists(m._path()), "the new day must start clean")
+
+
+class Restart(unittest.TestCase):
+    """R3-1: kill venice-proxy with 3 calls in flight, restart it; the holds
+    are folded into the spend and the ceiling still holds."""
+
+    def test_r3_1_unit_recover_folds_holds(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = g.Meter(d, 1.0, 100, g.parse_prices(g.DEFAULT_PRICES))
+            holds = [a.reserve(MODEL, 100_000)[0] for _ in range(3)]
+            b = g.Meter(d, 1.0, 100, g.parse_prices(g.DEFAULT_PRICES))  # the restarted process
+            held, flying = b.recover()
+            self.assertAlmostEqual(held, sum(holds), places=6)
+            self.assertEqual(flying, 3)
+            rec = json.load(open(b._path()))
+            self.assertAlmostEqual(rec["usd"], sum(holds), places=6)
+            self.assertEqual((rec["unmetered"], rec["in_flight"], rec["held_usd"]), (3, 0, 0))
+            self.assertEqual(b.recover(), (0.0, 0), "a second boot must not fold twice")
+
+    def test_r3_1_kill_with_three_in_flight_then_restart(self):
+        up = ThreadingHTTPServer(("127.0.0.1", 0), Fake)
+        up.daemon_threads = True
+        threading.Thread(target=up.serve_forever, daemon=True).start()
+        self.addCleanup(up.shutdown)
+        up_reset(delay=30)
+        with tempfile.TemporaryDirectory() as d:
+            sock = socket.socket()
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            env = dict(os.environ, GATEWAY_ROUTE="venice", UPSTREAM_KEY="k", VENICE_MODELS=MODEL,
+                       UPSTREAM_URL="http://127.0.0.1:%d" % up.server_address[1], GATEWAY_LISTEN="127.0.0.1:%d" % port,
+                       GATEWAY_STATE_DIR=os.path.join(d, "state"), CONTROL_DIR=os.path.join(d, "control"),
+                       VENICE_MAX_USD_PER_DAY="0.5")
+            env.pop("CREDENTIAL_STATUS_DIR", None)
+            os.makedirs(env["CONTROL_DIR"])
+            script = os.path.join(HERE, "..", "..", "gateway", "gateway.py")
+
+            def start():
+                p = subprocess.Popen([sys.executable, script], env=env, stderr=subprocess.DEVNULL)
+                for _ in range(100):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                        return p
+                    except OSError:
+                        time.sleep(0.05)
+                return p
+
+            def post():
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+                    conn.request("POST", "/api/v1/chat/completions", body=json.dumps(
+                        {"model": MODEL, "messages": [{"role": "user", "content": "w" * 30_000}]}).encode(),
+                        headers={"content-type": "application/json"})
+                    return conn.getresponse().status
+                except OSError:
+                    return None
+
+            p = start()
+            for _ in range(3):
+                threading.Thread(target=post, daemon=True).start()
+            meter_dir = os.path.join(d, "state", "meter")
+            for _ in range(100):
+                try:
+                    rec = json.load(open(os.path.join(meter_dir, os.listdir(meter_dir)[0])))
+                    if rec.get("in_flight") == 3:
+                        break
+                except (OSError, ValueError, IndexError):
+                    pass
+                time.sleep(0.05)
+            self.assertEqual(rec["in_flight"], 3)
+            held = rec["held_usd"]
+            p.kill()
+            p.wait()
+            UP["delay"] = 0
+            p = start()
+            try:
+                rec = json.load(open(os.path.join(meter_dir, os.listdir(meter_dir)[0])))
+                self.assertAlmostEqual(rec["usd"], held, places=6, msg="the holds of the killed calls are spend")
+                self.assertEqual(rec["unmetered"], 3)
+                # Ceiling $0.50, $0.30ish already spent by the folded holds:
+                # the next calls are refused before settled spend can pass it.
+                codes = [post() for _ in range(6)]
+                rec = json.load(open(os.path.join(meter_dir, os.listdir(meter_dir)[0])))
+                self.assertIn(429, codes)
+                self.assertLessEqual(rec["usd"] + rec["held_usd"], 0.5 + 1e-9, "no overshoot after the restart")
+            finally:
+                p.kill()
+                p.wait()
