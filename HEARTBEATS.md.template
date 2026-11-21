@@ -31,6 +31,8 @@ Each heartbeat is one `##` heading + a fenced ` ```yaml ` block. The dispatcher 
 | `criticality` | yes | `critical` (runs in conservation mode), `normal`, `background` |
 | `cwd` | no | Working directory for the run (passed as `opencode run --dir`). Defaults to the repo root |
 | `output_validator` | no | `true` to run the Five Failure Modes small-model check on the output |
+| `max_fires_per_day` | no | Daily ceiling on model runs for this heartbeat. Defaults to `DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY` (24 in compose). Absolute until the date rolls |
+| `max_usd_per_day` | no | Daily spend ceiling for this heartbeat, from the dispatcher's telemetry. All heartbeats together are also capped by `DISPATCHER_MAX_USD_PER_DAY` (docs/control.md) |
 | `condition_prompt` | no | Required when condition=ask_model. Question to send to Ollama |
 | `jitter` | no | Random offset added to daily schedules (e.g. `30m`, `1h`). Deterministic per day+name |
 
