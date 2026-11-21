@@ -126,6 +126,8 @@ DRY_RUN=true bash scheduled-tasks/heartbeat-dispatcher.sh   # host one-shot
 docker compose --profile dispatcher up -d    # containerized 15-min loop
 ```
 
+In compose the dispatcher only runs with an armed Matrix kill switch (`jill-control`). It also enforces daily fire and spend caps, alarms when every run is failing, and posts content-free alerts to Matrix. A boot self-test proves each of these first. See [docs/control.md](docs/control.md).
+
 Full writeup: [docs/heartbeat-dispatcher.md](docs/heartbeat-dispatcher.md). The companion `scripts/dispatch-trigger.sh` routes keyword-prefixed inbound messages (registered in `triggers.yaml`) to shell handlers deterministically, without a model round trip.
 
 ## Discord bridge (channel layer, Phase 4)
