@@ -51,6 +51,11 @@ cp .env.example .env        # fill VENICE_API_KEY, OPENCODE_SERVER_PASSWORD, MAT
 bash docker/boot.sh         # ensures Colima is up, then docker compose up -d
 ```
 
+Jill's own launch (her macOS user, her Colima, secrets typed by Sean, the
+live eval as the gate) is one ordered runbook: [docs/LAUNCH.md](docs/LAUNCH.md),
+with `launch/colima-setup.sh`, `launch/setup-secrets.sh` and
+`launch/preflight.sh`.
+
 Two services on a private compose network:
 
 - `opencode-serve` - headless opencode v1.17.13, GLM-5.2 via Venice. Not
