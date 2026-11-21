@@ -197,9 +197,11 @@ is_conservation_mode() { flag_on "$CONSERVATION_FILE" "CONSERVATION"; }
 kill_switch_unarmed() {
     [[ "${CONTROL_REQUIRE_ARMED:-0}" == "1" ]] || return 1
     local armed_at max_age now
-    armed_at=$(jq -r '.armed_at // 0' "$ARMED_FILE" 2>/dev/null) || armed_at=0
+    # A number only: a string armed_at is rejected (red-team N6).
+    armed_at=$(jq -r 'if (.armed_at | type) == "number" then (.armed_at | floor) else 0 end' "$ARMED_FILE" 2>/dev/null) \
+        || armed_at=0
     [[ "$armed_at" =~ ^[0-9]+$ ]] || armed_at=0
-    max_age="${CONTROL_ARMED_MAX_AGE_SECONDS:-900}"
+    max_age="${CONTROL_ARMED_MAX_AGE_SECONDS:-90}"
     now=$(date +%s)
     (( now - armed_at > max_age ))
 }
@@ -300,8 +302,9 @@ _state_update() {
     _state_lock_release
 }
 
+# Non-empty AND a JSON object: jq 1.6 accepts a zero-byte file (red-team N4).
 state_valid() {
-    jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1
+    [[ -s "$STATE_FILE" ]] && jq -e 'type == "object"' "$STATE_FILE" >/dev/null 2>&1
 }
 
 set_state() {
@@ -688,11 +691,19 @@ invoke_opencode() {
         fi
 
         # A successful run that reports neither tokens nor cost means spend is
-        # not being measured (the provider returned no usage), so every
-        # dollar cap is blind. Say so loudly, once a day.
+        # not being measured (the provider returned no usage). It is charged
+        # a pessimistic amount, DISPATCHER_UNMEASURED_RUN_USD (default 0.25),
+        # as its own telemetry row so the caps count it (red-team N6), and
+        # alerted once a day.
         if [[ $exit_code -eq 0 ]] && tail -n 1 "$telemetry_file" 2>/dev/null \
             | jq -e '.cost_usd == 0 and .input_tokens == 0 and .output_tokens == 0 and .cache_read_tokens == 0 and .cache_create_tokens == 0' >/dev/null 2>&1; then
-            log "WARN $heartbeat_name - the run reported no token usage and no cost; spend caps cannot see it"
+            local charge="${DISPATCHER_UNMEASURED_RUN_USD:-0.25}"
+            [[ "$charge" =~ ^[0-9]+([.][0-9]+)?$ ]] || charge=0.25
+            jq -cn --arg ts "$ts_iso" --arg name "$heartbeat_name" --arg model "$model" --argjson c "$charge" \
+                '{ts: $ts, heartbeat: $name, model: $model, cost_usd: $c, unmeasured_charge: true}' >> "$telemetry_file" \
+                || set_state "_dispatcher" "telemetry_fault_date" "$DATE"
+            rows_before=$((rows_before + 1))
+            log "WARN $heartbeat_name - the run reported no token usage and no cost; charged \$$charge against the caps"
             if [[ "$(get_state "_dispatcher" "unmeasured_alert_date")" != "$DATE" ]]; then
                 set_state "_dispatcher" "unmeasured_alert_date" "$DATE"
                 alert_ops spend-unmeasured "A run of ${heartbeat_name} reported no token usage and no cost, so the daily spend caps cannot see Jill's spend. Check that Venice returns usage on streamed responses."

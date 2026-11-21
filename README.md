@@ -36,7 +36,7 @@ What this repo proves today:
 Jill runs on Venice AI only (BehalfBot-open#46). `opencode.json` sets `enabled_providers: ["venice"]` and whitelists Venice models whose `privacy` is `private` (default `venice/zai-org-glm-5-2`, small model `venice/z-ai-glm-5-3-flash`). There is no Anthropic or OpenRouter block, and the heartbeat dispatcher and Discord bridge both refuse any model that is not `venice/<id>`.
 
 ```bash
-bash scripts/run.sh --model venice/kimi-k2-7-code "your prompt"
+bash scripts/run.sh --model venice/z-ai-glm-5-3-flash "your prompt"
 ```
 
 ## Quick start (Docker - canonical)

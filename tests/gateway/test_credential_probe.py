@@ -79,7 +79,7 @@ class Probe(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             self.assertNotIn("fetch", g.PROBES)
             self.assertNotIn("api", g.PROBES)
-        c = g.load_config({"GATEWAY_ROUTE": "venice", "UPSTREAM_KEY": KEY, "VENICE_MODELS": "m"})
+        c = g.load_config({"GATEWAY_ROUTE": "venice", "UPSTREAM_KEY": KEY, "VENICE_MODELS": "zai-org-glm-5-2"})
         self.assertIsNone(c["credential_dir"])
 
 

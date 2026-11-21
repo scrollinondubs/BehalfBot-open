@@ -106,6 +106,7 @@ COMMANDS = {
     "unconserve": "unconserve",
     "conservation off": "unconserve",
     "status": "status",
+    "reset meter": "reset-meter",
 }
 
 STAGE_RANK = {"ok": 0, "t7": 1, "t1": 2, "unknown": 3, "missing": 4, "rate_limited": 5, "exhausted": 6,
@@ -113,7 +114,7 @@ STAGE_RANK = {"ok": 0, "t7": 1, "t1": 2, "unknown": 3, "missing": 4, "rate_limit
 RENAG_STAGES = ("unknown", "missing", "rate_limited", "exhausted", "rejected", "expired")
 # Red-team F3: a halt or conserve is honoured whatever its age (a late stop
 # is still a stop); only the commands that LIFT a stop, and status, expire.
-AGE_LIMITED = ("resume", "unconserve", "status")
+AGE_LIMITED = ("resume", "unconserve", "status", "reset-meter")
 
 
 def log(msg):
@@ -154,7 +155,7 @@ def parse_command(content):
         command, rest = COMMANDS[lowered[0]], parts[1:]
     if command is None:
         return None
-    if command in ("resume", "unconserve", "status") and rest:
+    if command in ("resume", "unconserve", "status", "reset-meter") and rest:
         return None
     duration = None
     if rest:
@@ -336,7 +337,7 @@ class Control:
             return " - ".join(bits)
 
         return "\n".join([line("halt", self.halt_file), line("conservation", self.conservation_file), "",
-                          "halt | resume | conserve | unconserve | status"])
+                          "halt | resume | conserve | unconserve | status | reset meter"])
 
     def apply(self, command, duration, reason):
         by = "%s:%s" % (self.SOURCE, self.cfg["principal"])
@@ -355,6 +356,14 @@ class Control:
             lift = "Auto-lift %s." % duration if duration else "No auto-lift - stays on until you say `resume`."
             return ("CONSERVATION ON. Heartbeats marked `normal` and `background` are skipped from the next "
                     "tick; `critical` ones still run.\n%s\nIf you want everything to stop, say `halt`." % lift)
+        if command == "reset-meter":
+            # venice-proxy owns the meter; this only records the request in
+            # control-state (read-only there), and the proxy applies it once
+            # on its next call (red-team N3).
+            write_json_atomic(os.path.join(self.cfg["control_dir"], "meter-reset.json"),
+                              {"requested_at": int(self.clock()), "by": by})
+            return ("METER RESET requested. venice-proxy zeroes today's Venice spend and request counts on its "
+                    "next call; the daily ceiling then applies again from zero.")
         if command == "unconserve":
             flags.write(self.conservation_file, False)
             return "Conservation off. Normal and background heartbeats resume at the next tick."
@@ -414,7 +423,7 @@ class Control:
                 sent = ev.get("origin_server_ts", 0) / 1000
                 text = ("Ignored a `%s` sent at %s: it is more than %d minutes old, and an old message must not "
                         "lift a stop. Send it again if you still mean it.\n%s" % (
-                            command, flags.utcnow_iso(datetime.fromtimestamp(sent, timezone.utc)),
+                            command.replace("-", " "), flags.utcnow_iso(datetime.fromtimestamp(sent, timezone.utc)),
                             MAX_EVENT_AGE_S // 60, self.describe_state()))
             else:
                 text = None
@@ -603,8 +612,13 @@ class Control:
                 alerts.append(("ceiling", "Venice spend today reached the $%.2f hard ceiling. venice-proxy now refuses "
                                           "every model call until midnight UTC." % ceiling))
             if isinstance(rec.get("unmetered"), int) and rec["unmetered"] > 0:
-                alerts.append(("unmetered", "%d Venice response(s) today carried no usage, so each was charged a flat "
-                                            "amount. The meter may be off." % rec["unmetered"]))
+                alerts.append(("unmetered", "%d Venice call(s) today ended with no usable usage, so each was charged "
+                                            "its full hold." % rec["unmetered"]))
+            req, max_req = rec.get("requests"), rec.get("max_requests")
+            if isinstance(req, int) and isinstance(max_req, int) and req >= max_req:
+                alerts.append(("requests", "Jill reached the daily Venice request ceiling (%d calls). venice-proxy "
+                                           "refuses model calls until midnight UTC. Say `reset meter` to clear "
+                                           "today's meter." % max_req))
         changed = False
         for key, text in alerts:
             if not sent.get(key) and self.post(text):

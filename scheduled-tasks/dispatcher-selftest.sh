@@ -222,6 +222,14 @@ printf '{"armed_at": %s}\n' "$(date +%s)" > "$SB/control/armed.json"
 tick CONTROL_REQUIRE_ARMED=1
 [[ "$(calls)" -ge 1 ]] && ok "armed switch: fires" || bad "armed switch: still blocked"
 
+new_sandbox armed-string "hb-a|"
+printf '{"armed_at": "%s"}\n' "$(date +%s)" > "$SB/control/armed.json"
+tick CONTROL_REQUIRE_ARMED=1
+printf '{"armed_at": %s}\n' "$(( $(date +%s) - 120 ))" > "$SB/control/armed.json"
+tick CONTROL_REQUIRE_ARMED=1
+[[ "$(calls)" == 0 ]] && ok "N6 a string armed_at, or one older than the 90s default, reads as unarmed" \
+    || bad "N6 armed_at: $(calls) run(s) fired"
+
 new_sandbox unarmed-midtick "hb-a|" "hb-b|"
 printf '{"armed_at": %s}\n' "$(date +%s)" > "$SB/control/armed.json"
 touch "$SB/unarm-on-call"
@@ -239,6 +247,16 @@ tick
     && [[ "$(cat "$SB/state/scheduled-tasks/heartbeat-state.json")" == "[]" ]] \
     && ok "F2 invalid state file: nothing fired, one alert, the file was left for a human" \
     || bad "F2 invalid state file: calls=$(calls) alerts=$(alerts state-invalid)"
+
+new_sandbox state-zero-byte "hb-a|"
+mkdir -p "$SB/state/scheduled-tasks"
+: > "$SB/state/scheduled-tasks/heartbeat-state.json"
+tick DISPATCHER_MAX_USD_PER_DAY=0.01
+tick DISPATCHER_MAX_USD_PER_DAY=0.01
+[[ "$(calls)" == 0 && "$(alerts state-invalid)" == 1 && "$(alerts spend-cap)" == 0 && "$(alerts spend-half)" == 0 ]] \
+    && [[ ! -s "$SB/state/scheduled-tasks/heartbeat-state.json" ]] \
+    && ok "N4 zero-byte state file: nothing fired, one alert, no spend alerts, file left for a human" \
+    || bad "N4 zero-byte state: calls=$(calls) state-invalid=$(alerts state-invalid) spend=$(alerts spend-cap)"
 
 new_sandbox state-empty-write "hb-a|"
 (
@@ -339,7 +357,7 @@ tick
 new_sandbox telemetry-badrun "hb-a|" "hb-b|"
 touch "$SB/badcost"
 tick
-[[ "$(calls)" == 1 ]] && jq -e '.invalid == true and .cost_usd >= 0' "$SB"/state/logs/telemetry/*-usage.jsonl >/dev/null \
+[[ "$(calls)" == 1 ]] && jq -se 'any(.[]; .invalid == true and .cost_usd >= 0)' "$SB"/state/logs/telemetry/*-usage.jsonl >/dev/null \
     && ok "F1 a run reporting a negative cost and string tokens is clamped, marked invalid, and caps the day" \
     || bad "F1 bad run telemetry: calls=$(calls)"
 
@@ -359,6 +377,18 @@ tick
 [[ "$(alerts spend-unmeasured)" == 1 ]] && logged "reported no token usage" \
     && ok "unmeasured spend: a run with no usage raised one alert over four runs" \
     || bad "unmeasured spend: $(alerts spend-unmeasured) alert(s)"
+charged=$(jq -s '[.[] | select(.unmeasured_charge == true) | .cost_usd] | add // 0' "$SB"/state/logs/telemetry/*-usage.jsonl)
+awk -v c="$charged" 'BEGIN { exit !(c >= 0.99) }' \
+    && ok "N6 each run with no usage is charged \$0.25 against the caps (\$$charged over 4 runs)" \
+    || bad "N6 unmeasured runs charged \$$charged"
+
+new_sandbox unmeasured-cap "hb-a|"
+touch "$SB/nousage"
+tick DISPATCHER_MAX_USD_PER_DAY=0.5
+tick DISPATCHER_MAX_USD_PER_DAY=0.5
+tick DISPATCHER_MAX_USD_PER_DAY=0.5
+[[ "$(calls)" == 2 ]] && ok "N6 unmeasured runs trip the dollar cap (2 runs at \$0.25 against \$0.50)" \
+    || bad "N6 unmeasured cap: $(calls) run(s)"
 
 # --- all-runs-failed alarm --------------------------------------------------
 new_sandbox all-failed "hb-a|" "hb-b|"

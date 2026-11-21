@@ -3,7 +3,7 @@
 #
 # Usage:
 #   bash scripts/run.sh "prompt text"
-#   bash scripts/run.sh --model venice/kimi-k2-7-code "prompt text"
+#   bash scripts/run.sh --model venice/z-ai-glm-5-3-flash "prompt text"
 #   bash scripts/run.sh --agent software-engineering "prompt text"
 #
 # Emits raw JSON events (one per line) to stdout, same role as

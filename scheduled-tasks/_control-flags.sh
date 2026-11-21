@@ -49,8 +49,8 @@ control_flag_state() {
     fi
     # `enabled` must be the boolean true, and auto_lift_after null or exactly
     # YYYY-MM-DDTHH:MM:SSZ. Anything else is invalid, so on (red-team F6).
-    _cf_enabled=$(jq -r 'if has("enabled") | not then "false"
-                         elif (.enabled | type) == "boolean" then (.enabled | tostring)
+    # A missing `enabled` is invalid too (red-team N6).
+    _cf_enabled=$(jq -r 'if (.enabled | type) == "boolean" then (.enabled | tostring)
                          else "invalid" end' "$_cf_flag" 2>/dev/null) || _cf_enabled="invalid"
     case "$_cf_enabled" in
         true) ;;

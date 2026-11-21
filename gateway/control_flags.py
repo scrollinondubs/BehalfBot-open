@@ -83,12 +83,14 @@ def read(path):
 
 def state(path, now=None):
     """'on', 'off' or 'expired' (on, but past its auto-lift). Never writes."""
+    if not os.path.lexists(path):
+        return "off"
     data, ok = read(path)
     if not ok:
         return "on"
-    enabled = data.get("enabled", False)
+    enabled = data.get("enabled")
     if not isinstance(enabled, bool):
-        return "on"  # "true", 1, null: not a boolean, so invalid, so on
+        return "on"  # missing, "true", 1, null: not a boolean, so invalid, so on
     if enabled is not True:
         return "off"
     lift = data.get("auto_lift_after")

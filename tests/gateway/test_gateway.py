@@ -364,7 +364,8 @@ class Live(unittest.TestCase):
         self.assertEqual(seen["auth"], "Bearer real-key-not-for-callers")
         self.assertEqual(seen["path"], "/api/v1/chat/completions")
         self.assertEqual(json.loads(seen["body"]), {"model": "zai-org-glm-5-2", "messages": [], "stream": True,
-                                                  "stream_options": {"include_usage": True}})
+                                                  "stream_options": {"include_usage": True},
+                                                  "max_completion_tokens": 8192})
         self.assertNotEqual(seen["body"], raw.encode())
         self.assertNotIn("set-cookie", hdrs)
 

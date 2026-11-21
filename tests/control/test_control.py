@@ -464,10 +464,45 @@ class MeterAlerts(Base):
         self.ctl.check_meter()
         bodies = " ".join(b for _, b in self.hs.sent)
         self.assertIn("hard ceiling", bodies)
-        self.assertIn("carried no usage", bodies)
+        self.assertIn("no usable usage", bodies)
         self.assertEqual(len(self.hs.sent), 3)
 
     def test_unreadable_meter_alerts(self):
         self.meter(_raw="{nope")
         self.ctl.check_meter()
         self.assertIn("cannot be read", self.hs.sent[0][1])
+
+
+class ResetMeter(Base):
+    def test_n3_reset_meter_writes_a_request_and_acks(self):
+        self.assertEqual(c.parse_command("reset meter")[0], "reset-meter")
+        self.assertIsNone(c.parse_command("reset meter please"))
+        self.ctl.poll_room()
+        self.hs.say("reset meter")
+        self.ctl.poll_room()
+        req, ok = flags.read(os.path.join(self.cfg["control_dir"], "meter-reset.json"))
+        self.assertAlmostEqual(req["requested_at"], time.time(), delta=5)
+        self.assertIn("METER RESET", self.hs.sent[-1][1])
+
+    def test_n3_reset_meter_is_principal_only_and_ages_like_resume(self):
+        self.ctl.poll_room()
+        self.hs.say("reset meter", sender="@mallory:example.org")
+        self.hs.say("reset meter", age_s=3600)
+        self.ctl.poll_room()
+        self.assertFalse(os.path.exists(os.path.join(self.cfg["control_dir"], "meter-reset.json")))
+        self.assertIn("Ignored a `reset meter`", self.hs.sent[-1][1])
+
+    def test_n3_request_ceiling_alerts(self):
+        d = os.path.join(self.tmp.name, "meter")
+        os.makedirs(d)
+        self.cfg["meter_dir"] = d
+        with open(os.path.join(d, "meter-%s.json" % time.strftime("%Y-%m-%d", time.gmtime())), "w") as f:
+            json.dump({"usd": 0, "requests": 2000, "max_requests": 2000, "ceiling_usd": 5}, f)
+        self.ctl.check_meter()
+        self.assertIn("request ceiling", self.hs.sent[-1][1])
+
+    def test_n6_flag_without_enabled_is_on_but_absent_is_off(self):
+        self.assertEqual(flags.state(self.halt), "off")
+        with open(self.halt, "w") as f:
+            f.write("{}")
+        self.assertEqual(flags.state(self.halt), "on")

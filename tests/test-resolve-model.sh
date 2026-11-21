@@ -31,8 +31,8 @@ expect venice/zai-org-glm-5-2 opus
 expect venice/zai-org-glm-5-2 sonnet
 expect venice/zai-org-glm-5-2 ""
 expect venice/z-ai-glm-5-3-flash haiku
-expect venice/kimi-k2-7-code venice/kimi-k2-7-code
-expect venice/zai-org-glm-5-1 sonnet HEARTBEAT_MODEL_SONNET=venice/zai-org-glm-5-1
+expect venice/z-ai-glm-5-3-flash venice/z-ai-glm-5-3-flash
+expect venice/z-ai-glm-5-3-flash sonnet HEARTBEAT_MODEL_SONNET=venice/z-ai-glm-5-3-flash
 expect REFUSE anthropic/claude-sonnet-4-5
 expect REFUSE openrouter/z-ai/glm-5.2
 expect REFUSE gpt-5

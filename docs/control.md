@@ -50,20 +50,21 @@ Send one of these as a whole message in the control room:
 | `conserve [2h] [reason]` (also `throttle`, `conservation on`) | Heartbeats: only `critical` ones run. Chat is unaffected |
 | `unconserve` (also `conservation off`) | Clears conservation |
 | `status` | Reports both flags |
+| `reset meter` | Zeroes today's Venice meter (spend and request counts). `jill-control` records the request in control-state; `venice-proxy` applies it once, on its next call |
 
 - **Duration.** A duration (`30m`, `2h`, `3d`, at least `1m`) sets an auto-lift. `halt 0m` is refused with an ack, because it would lift immediately. With no duration the flag stays until `resume`.
 - **Who.** Only `MATRIX_PRINCIPAL` (your full Matrix user id) is obeyed. Display names are never compared.
 - **Ignored entirely:** edits, a control word inside a sentence, and encrypted events.
-- **Age rule.** `halt` and `conserve` are honoured at any age, in the order sent: a late stop is still a stop. `resume` and `unconserve` older than 10 minutes are NOT applied, and the room gets an ack saying so; send them again if you still mean them. A stale `status` is ignored silently.
+- **Age rule.** `halt` and `conserve` are honoured at any age, in the order sent: a late stop is still a stop. `resume`, `unconserve` and `reset meter` older than 10 minutes are NOT applied, and the room gets an ack saying so; send them again if you still mean them. A stale `status` is ignored silently.
 
 **What halt does not stop:** a tool call already executing finishes. This
 room keeps listening, so `resume` still works.
 
 **Fail-closed rules**
 
-- **Malformed flag file.** It reads as halted if it cannot be parsed, has an `enabled` that is not the boolean `true`/`false`, or has an `auto_lift_after` that is not exactly `YYYY-MM-DDTHH:MM:SSZ`.
+- **Malformed flag file.** A flag file that exists reads as halted if it cannot be parsed, has no `enabled`, has an `enabled` that is not the boolean `true`/`false`, or has an `auto_lift_after` that is not exactly `YYYY-MM-DDTHH:MM:SSZ`. A flag file that does not exist is off.
 - **Bad file types.** A flag, cursor, meter or probe file that is a symlink, a FIFO or larger than 64 KB is not read; a flag in that state reads as halted.
-- **Unarmed switch.** `venice-proxy` and the dispatcher both need a fresh `armed.json` (`CONTROL_REQUIRE_ARMED=1`). `jill-control` rewrites it after every successful read of the control room. If it is older than 15 minutes, the switch is not listening, so model calls and heartbeats stop.
+- **Unarmed switch.** `venice-proxy` and the dispatcher both need a fresh `armed.json` (`CONTROL_REQUIRE_ARMED=1`) with a numeric `armed_at`. `jill-control` rewrites it after every successful read of the control room (every 15s). If it is older than `CONTROL_ARMED_MAX_AGE_SECONDS` (default 90), the switch is not listening, so model calls and heartbeats stop.
 - **Boot.** `jill-control` retries its boot self-test with backoff (5s up to 5 min) until it passes: token valid, both rooms joined and unencrypted, control room readable. It reports healthy only after that.
 
 ### Why an unencrypted control room
@@ -86,22 +87,29 @@ All of Jill's spend goes through `venice-proxy`, so the ceiling lives there:
 
 | Setting | Default | What |
 |---|---|---|
-| `VENICE_MAX_USD_PER_DAY` | `5` | hard ceiling; past it every model call gets HTTP 429 until midnight UTC |
-| `VENICE_ALERT_USD_PER_DAY` | `1` | one Matrix alert a day when spend crosses it (read by jill-control) |
-| `VENICE_MAX_REQUESTS_PER_DAY` | `2000` | hard request ceiling |
-| `VENICE_UNMETERED_USD_PER_REQUEST` | `0.05` | charged for a successful response that carries no `usage` |
-| `VENICE_PRICES` | GLM 5.2 $1.40/$4.40/$0.26, GLM 5.3 Flash $0.17/$0.55/$0.03 per 1M tokens | in:out:cached; an unlisted model pays the highest listed rate |
+| `VENICE_MAX_USD_PER_DAY` | `5` | hard ceiling (finite, checked at boot) |
+| `VENICE_ALERT_USD_PER_DAY` | `1` | one Matrix alert a day when settled spend crosses it (jill-control) |
+| `VENICE_MAX_IN_FLIGHT` | `4` | calls open at once |
+| `VENICE_MAX_REQUESTS_PER_MINUTE` | `30` | rate limit |
+| `VENICE_MAX_REQUESTS_PER_DAY` | `2000` | request ceiling; one Matrix alert when reached |
+| `VENICE_MAX_OUTPUT_TOKENS` | `8192` | output cap injected as `max_completion_tokens` (covers reasoning); a larger `max_tokens` / `max_completion_tokens` is clamped |
+| `VENICE_PRICES` | GLM 5.2 $1.40/$4.40/$0.26, GLM 5.3 Flash $0.17/$0.55/$0.03 per 1M tokens | in:out:cached. Every model in `VENICE_MODELS` must have a price, or the proxy refuses to start |
 
-**How metering works**
+**How a call is metered**
 
-- **Count first.** A request is counted when it is forwarded.
-- **Settle from usage.** Its cost is settled from the `usage` object of the response. The gateway sets `stream_options.include_usage` on every streamed request, so streams report it too.
-- **No usage.** A response without usage is charged the flat amount, and jill-control alerts once that day.
-- **Unreadable meter.** A meter file that cannot be read stops every call for the day, with an alert.
-- **Overshoot.** A call that starts under the ceiling finishes, so the ceiling can be overshot by one call.
+1. **Hold.** At `reserve`, the proxy holds a pessimistic amount for the call: the request's byte length plus 2,000 as prompt tokens, plus the output cap, at the model's prices. A text prompt cannot have more tokens than bytes.
+2. **Refuse.** The call is refused (HTTP 429) if settled + held + its hold would pass the ceiling, if 4 calls are already in flight, past 30 calls in a minute, or past the daily request ceiling.
+3. **Settle.** When the response ends, the hold is swapped for the cost in its `usage`. Streams are made to report usage, and SSE lines are parsed as they pass, so a usage chunk at the end of any size of stream is seen. A JSON body over 4 MB is searched from its tail.
+4. **No usage, or unknown outcome.** The whole hold is charged. That covers a missing or unparseable `usage`, an upstream that could not be read to the end, and a crash.
+5. **Caller hangs up.** If the caller drops mid-stream, the proxy keeps reading upstream for up to 60s and 64 MB to see the usage; otherwise it charges the hold.
 
-Prices are list prices seen 2026-11-21, partly from third-party pages.
-Confirm them against venice.ai/pricing.
+So settled spend stays under the ceiling, unless Venice bills more tokens than the request's size and the output cap allow. That would mean its usage is wrong, and the `unmetered`/meter alerts are the place to notice it. `GET /api/v1/models` is gated by halt, counted against the limits, and forwards none of the caller's headers.
+
+**Unreadable meter.** A meter file that cannot be read, or holds a non-finite or negative number, refuses every call for the day, with an alert.
+
+**Lockout recovery.** A request storm (for example 400s) is slowed by the per-minute limit and alerted at the daily ceiling. Sean's `reset meter` clears the day.
+
+**Allowed models.** Prices are list prices seen 2026-11-21, partly from third-party pages; confirm them against venice.ai/pricing. `zai-org-glm-5-1`, `kimi-k2-7-code` and `deepseek-v4-pro` were removed from the allowlist (here and in `opencode.json`), because no price could be sourced with confidence.
 
 ## Heartbeats (off by default)
 
@@ -110,7 +118,7 @@ To turn them on: `cp HEARTBEATS.md.template HEARTBEATS.md`, then
 
 - runs `scheduled-tasks/dispatcher-selftest.sh` first, and refuses to loop if it fails;
 - skips everything while halted or unarmed, checked at tick start, before every run, before every retry, and before the validator and notification;
-- refuses to run if `heartbeat-state.json` is not a JSON object (one alert), and never writes an empty or invalid state;
+- refuses to run if `heartbeat-state.json` is empty or not a JSON object (one alert, before any other alert logic), and never writes an empty or invalid state;
 - requires `flock` for its state lock (the image has it): without it, the dispatcher refuses to start, sends one alert and exits non-zero. A lock held for 10s (`DISPATCHER_STATE_LOCK_WAIT_SECONDS`) refuses the write and stops the tick, with an alert;
 - enforces caps:
 
@@ -123,6 +131,7 @@ To turn them on: `cp HEARTBEATS.md.template HEARTBEATS.md`, then
 **Telemetry**
 
 - **Clamping.** Spend comes from the dispatcher's telemetry. Every cost and token value is clamped to a non-negative number.
+- **No usage.** A run that reports no tokens and no cost is charged `DISPATCHER_UNMEASURED_RUN_USD` (default $0.25) as its own telemetry row, so the caps count it, and alerted once a day.
 - **Fail-closed.** Any of these reads as "cap reached", with an alert:
   - a row with a value that is not one;
   - an unparseable row;
@@ -140,7 +149,7 @@ control room), as `[Jill] <text>`:
 
 - **jill-control:**
   - the boot announcement and auto-lifts;
-  - the Venice meter: alert line, hard ceiling, responses without usage, unreadable meter;
+  - the Venice meter: alert line, hard ceiling, request ceiling, calls charged their full hold, unreadable meter;
   - credential stage changes.
 - **The dispatcher (heartbeats on only):** spool files (`spend-cap`, `spend-half`, `fire-cap`, `all-failed`, `recovered`, `unarmed`, `validator`, `spend-unmeasured`, `state-invalid`, `state-lock`, `no-flock`).
 
