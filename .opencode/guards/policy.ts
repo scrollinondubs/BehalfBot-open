@@ -425,12 +425,22 @@ export function isSecretVarName(name: string): boolean {
  */
 const PROC_PATH = /\/pro(?:c\b|[^a-z0-9_]|$)|\/pr(?:o)?['"\\$*?[{]|\/p['"\\$*?[{]/i
 // Relative to / (`cd / && cat proc/1/environ`, `cd proc`, `cd /; cd pr*`):
-// proc/ as a path start, `cd proc`, or a glob or quote cut from it.
-const PROC_RELATIVE = /(?:^|[\s'"=:<>(;&|])(?:\.{1,2}\/)*(?:proc\/|pr(?:oc?)?['"\\$*?[{])|\bcd\s+(?:\.{1,2}\/)*['"]?proc(?:$|[\s;&|)'"\/])/i
+// proc/ as a path start, `cd proc`, or a glob or quote cut from it and used
+// as a directory (`pr*/1/environ`, `'proc'/self`).
+const PROC_RELATIVE = /(?:^|[\s'"=:<>(;&|])(?:\.{1,2}\/)*(?:proc\/|pr(?:oc?)?['"\\$*?[{][^\s;&|<>()]*\/)|\bcd\s+(?:\.{1,2}\/)*['"]?proc(?:$|[\s;&|)'"\/])/i
+// A bare cut (`pr*`, `pr''oc`) names /proc only from /, so it is denied only
+// when the shell may be there: a cd/pushd/popd, a ../, / as an argument
+// (`find / ...`, `env -C /`), or a workdir of /. `ls pr*.md` in the session
+// directory is a glob over Sean's files (L62-1).
+const PROC_CUT = /(?:^|[\s'"=:<>(;&|])(?:\.{1,2}\/)*pr(?:oc?)?['"\\$*?[{]/i
+const ROOTWARD = /(?:^|[\s;&|(`{])(?:cd|pushd|popd)\b|\.\.(?:\/|$|[\s;&|)])|(?:^|[\s=]|-C)\/(?:$|[\s;&|)])/
 const WILD_NAME = /[e?*][n?*][v?*][i?*][r?*][o?*][n?*]|[c?*][m?*][d?*][l?*][i?*][n?*][e?*]/gi
 
-export function procDenied(cmd: string): boolean {
+export function procDenied(cmd: string, dir = ""): boolean {
+  const cwd = dir ? path.resolve(dir) : ""
+  if (/^\/proc(?:\/|$)/.test(cwd)) return true
   if (PROC_PATH.test(cmd) || PROC_RELATIVE.test(cmd)) return true
+  if (PROC_CUT.test(cmd) && (cwd === "/" || ROOTWARD.test(cmd))) return true
   const flat = cmd.replace(/\[(\w)\]/g, "$1")
   for (const m of flat.matchAll(WILD_NAME)) {
     if (/[?*]/.test(m[0])) return true
@@ -439,8 +449,8 @@ export function procDenied(cmd: string): boolean {
   return false
 }
 
-function secretBashDenied(cmd: string): string | null {
-  if (procDenied(cmd))
+function secretBashDenied(cmd: string, dir = ""): string | null {
+  if (procDenied(cmd, dir))
     return deny("secret-print-guard: /proc is off limits to tools (another process's environment or command line prints its secrets). Name the one variable you need instead.")
   for (const seg of segments(cmd, true)) {
     const s = seg
@@ -885,7 +895,7 @@ export function bashDenied(cmd: string, ctx: GuardContext, depth = 0): string | 
   }
   const checks = [
     () => shellWriteToGuardDenied(cmd),
-    () => secretBashDenied(cmd),
+    () => secretBashDenied(cmd, ctx.directory),
     () => rmDenied(cmd, ctx),
     () => gitDenied(cmd),
     () => httpDenied(cmd, ctx),
