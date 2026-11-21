@@ -27,12 +27,17 @@ Whole-message words from the principal in the control room:
     halt [<dur>] [<reason>]   aliases mute, silence. Every heartbeat skipped
                               from the next dispatcher tick, critical ones
                               included.
-    resume                    aliases unmute, unhalt. Clears halt AND
-                              conservation.
     conserve [<dur>] [...]    aliases throttle, "conservation on". Only
                               `critical` heartbeats run.
     unconserve                alias "conservation off".
     status                    Reports both flags. Changes nothing.
+    reset meter               Today's Venice request count.
+
+`resume` (unmute, unhalt) and `reset meter spend` are REFUSED here with an
+ack (#50): this room is unencrypted on a homeserver Jill does not control,
+so its admin could forge them. They work only in Jill's end-to-end
+encrypted chat room, through the Matrix bridge (matrix-bridge/). A forged
+`halt` only stops Jill, so it stays here.
 
 <dur> is <n>m / <n>h / <n>d and becomes auto_lift_after.
 
@@ -116,6 +121,10 @@ RENAG_STAGES = ("unknown", "missing", "rate_limited", "exhausted", "rejected", "
 # Red-team F3: a halt or conserve is honoured whatever its age (a late stop
 # is still a stop); only the commands that LIFT a stop, and status, expire.
 AGE_LIMITED = ("resume", "unconserve", "status", "reset-meter", "reset-meter-spend")
+# Commands that lift a stop or hand back budget, accepted only from the
+# encrypted chat room (bridge/matrix_worker.py): a homeserver admin can
+# forge anything posted in this unencrypted room.
+ENCRYPTED_ROOM_ONLY = ("resume", "reset-meter-spend")
 
 
 def log(msg):
@@ -340,7 +349,8 @@ class Control:
             return " - ".join(bits)
 
         return "\n".join([line("halt", self.halt_file), line("conservation", self.conservation_file), "",
-                          "halt | resume | conserve | unconserve | status | reset meter"])
+                          "here: halt | conserve | unconserve | status | reset meter",
+                          "encrypted chat room only: resume | reset meter spend"])
 
     def apply(self, command, duration, reason, event_ts=None):
         by = "%s:%s" % (self.SOURCE, self.cfg["principal"])
@@ -353,10 +363,10 @@ class Control:
                     "fails at its next model step. Heartbeats (if enabled) are skipped too.\n"
                     "%s\n"
                     "NOT covered by halt: a tool call already executing finishes; this room keeps listening.\n"
-                    "Say `resume` to lift, `status` to check." % lift)
+                    "Say `resume` in Jill's encrypted chat room to lift, `status` to check." % lift)
         if command == "conserve":
             flags.write(self.conservation_file, True, by, duration, reason)
-            lift = "Auto-lift %s." % duration if duration else "No auto-lift - stays on until you say `resume`."
+            lift = "Auto-lift %s." % duration if duration else "No auto-lift - stays on until you say `unconserve`."
             return ("CONSERVATION ON. Heartbeats marked `normal` and `background` are skipped from the next "
                     "tick; `critical` ones still run.\n%s\nIf you want everything to stop, say `halt`." % lift)
         if command in ("reset-meter", "reset-meter-spend"):
@@ -428,6 +438,12 @@ class Control:
                                                                ", stale" if why == "stale" else ""))
             if command == "invalid":
                 text = reason
+            elif command in ENCRYPTED_ROOM_ONLY:
+                if why == "stale":
+                    continue
+                text = ("Refused: `%s` is accepted only in Jill's end-to-end encrypted chat room. This room is not "
+                        "encrypted, so the homeserver could forge it. Nothing changed.\n%s" % (
+                            command.replace("-", " "), self.describe_state()))
             elif why == "stale" and command in AGE_LIMITED:
                 if command == "status":
                     continue
@@ -831,7 +847,7 @@ def main():
         fh.write("armed\n")
     log("boot self-test passed: token valid, rooms joined and unencrypted, control room readable. ARMED.")
     if cfg["announce"]:
-        control.post("Kill switch armed. Say `status`, `halt` or `resume` here.")
+        control.post("Kill switch armed. Say `status` or `halt` here; `resume` works only in Jill's encrypted chat room.")
     threading.Thread(target=_loop, args=("spool", 10, control.drain_spool), daemon=True).start()
 
     def credentials():

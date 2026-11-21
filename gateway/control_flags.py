@@ -9,8 +9,9 @@ with the same five keys:
 
 Timestamps are "%Y-%m-%dT%H:%M:%SZ" (UTC).
 
-Only the jill-control sidecar writes them (into the control-state volume).
-Every other reader mounts that volume read-only, so reading never rewrites:
+Two processes write them (into the control-state volume): the jill-control
+sidecar, and matrix-bridge for halt/resume/reset meter from Sean's encrypted
+chat room (#50). Every other reader mounts that volume read-only, so reading never rewrites:
 an expired auto-lift reads as "off" and the sidecar clears the file on its
 own loop. The failure direction is fixed: a file that exists but cannot be
 read or parsed, or carries an auto-lift time that cannot be parsed, reads as

@@ -224,7 +224,7 @@ class KillSwitch(Base):
         self.assertEqual(self.hs.sent, [])
         self.assertNotIn("9223372036854775807", self.ctl.cursor, "must not keep conduwuit's sentinel start")
 
-    def test_halt_status_resume_round_trip(self):
+    def test_halt_status_round_trip_and_resume_is_refused_here(self):
         self.ctl.poll_room()
         self.hs.say("halt 30m flying")
         self.ctl.poll_room()
@@ -240,9 +240,26 @@ class KillSwitch(Base):
         self.hs.say("conserve")
         self.hs.say("resume")
         self.ctl.poll_room()
-        self.assertEqual(flags.state(self.halt), "off")
+        self.assertEqual(flags.state(self.halt), "on", "resume must not lift a halt from the unencrypted room (#50)")
+        self.assertEqual(flags.state(self.cons), "on")
+        self.assertIn("Refused", self.hs.sent[-1][1])
+        self.assertIn("encrypted chat room", self.hs.sent[-1][1])
+        self.assertNotIn("RESUMED", "".join(b for _, b in self.hs.sent))
+        self.hs.say("unconserve")
+        self.ctl.poll_room()
         self.assertEqual(flags.state(self.cons), "off")
-        self.assertIn("RESUMED", self.hs.sent[-1][1])
+        self.assertEqual(flags.state(self.halt), "on")
+
+    def test_50_resume_aliases_and_spend_reset_are_refused_in_the_control_room(self):
+        flags.write(self.halt, True, "t", None, None)
+        self.ctl.poll_room()
+        for word in ("resume", "unmute", "unhalt", "Resume!", "reset meter spend"):
+            self.hs.say(word)
+        self.ctl.poll_room()
+        self.assertEqual(flags.state(self.halt), "on")
+        self.assertFalse(os.path.exists(os.path.join(self.cfg["control_dir"], "meter-reset.json")))
+        self.assertEqual(len(self.hs.sent), 5)
+        self.assertTrue(all(b.startswith("Refused") for _, b in self.hs.sent))
 
     def test_ignores_others_sentences_and_edits(self):
         self.ctl.poll_room()
@@ -274,15 +291,15 @@ class KillSwitch(Base):
         self.ctl.poll_room()
         self.assertEqual(flags.state(self.halt), "on")
         self.assertEqual(flags.state(self.cons), "on")
-        self.assertEqual(len(self.hs.sent), 2, "stale status is silent; stale lifts are acked")
-        self.assertTrue(all("Ignored a" in b for _, b in self.hs.sent))
+        self.assertEqual(len(self.hs.sent), 1, "stale status and stale encrypted-room-only words are silent")
+        self.assertIn("Ignored a `unconserve`", self.hs.sent[0][1])
 
     def test_f3_halt_then_fresh_resume_in_one_batch(self):
         self.ctl.poll_room()
         self.hs.say("halt", age_s=3600)
         self.hs.say("resume")
         self.ctl.poll_room()
-        self.assertEqual(flags.state(self.halt), "off")
+        self.assertEqual(flags.state(self.halt), "on", "resume is refused in the control room (#50)")
 
     def test_f6_zero_duration_is_rejected(self):
         self.assertEqual(c.parse_command("halt 0m")[0], "invalid")
@@ -300,10 +317,10 @@ class KillSwitch(Base):
         self.ctl.poll_room()
         self.hs.say("halt")
         self.ctl.poll_room()
-        self.hs.say("resume")
+        self.hs.say("conserve")
         again = c.Control(self.cfg, c.Matrix(self.hs.url, TOKEN))
         again.poll_room()
-        self.assertEqual(flags.state(self.halt), "off", "the restarted listener must pick up from its cursor")
+        self.assertEqual(flags.state(self.cons), "on", "the restarted listener must pick up from its cursor")
         self.assertEqual(sum("HALTED" in b for _, b in self.hs.sent), 1, "halt must not be replayed")
 
     def test_listen_once_marks_armed_and_lifts_expired(self):
@@ -546,9 +563,12 @@ class Round3(Base):
         self.ctl.poll_room()
         self.hs.say("reset meter spend")
         self.ctl.poll_room()
+        self.assertFalse(os.path.exists(os.path.join(self.cfg["control_dir"], "meter-reset.json")),
+                         "reset meter spend is accepted only in the encrypted chat room (#50)")
+        self.assertIn("Refused", self.hs.sent[-1][1])
+        self.ctl.apply("reset-meter-spend", None, None, event_ts=time.time())
         req, _ = flags.read(os.path.join(self.cfg["control_dir"], "meter-reset.json"))
         self.assertIs(req["spend"], True)
-        self.assertIn("AND spend", self.hs.sent[-1][1])
 
     def test_over_hold_tripwire_alerts_once_a_day(self):
         d = os.path.join(self.tmp.name, "meter")
