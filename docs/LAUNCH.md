@@ -19,7 +19,7 @@ eval can be redone, and nothing reaches Jill until step 8 starts the stack.
 | 6 | Preflight | 2 min |
 | 7 | Matrix bridge setup, emoji verification | 10 min |
 | 8 | Start the stack | 5 min |
-| 9 | Live eval: the launch gate | a few hours, mostly unattended, about $37 |
+| 9 | Live eval: the launch gate | hours (an estimate), unattended, about $37 |
 | 10 | Go live | 20 min |
 | - | Halt and rollback | when needed |
 
@@ -254,14 +254,16 @@ an older one from elsewhere. In outline:
 
    Expect about 65 live units x 3 runs, about 1170 model calls, about $37.
    Calls are capped at 1300, and Venice stops at the $50 ceiling. It runs
-   unattended after the `yes` and takes a few hours. Each line it prints is
+   unattended after the `yes`. The duration has not been measured; at a
+   minute or two per unit run, expect a few hours. Each line it prints is
    one unit and its verdict.
 3. **Put the ceiling back.** Set `VENICE_MAX_USD_PER_DAY=5`, then run
    `docker compose up -d venice-proxy` and `docker compose restart opencode-serve`.
 4. **Read the report** from the eval-only volume, and record its hash from
    your own terminal:
+   The volume is root-only, hence `--user 0:0`:
    ```bash
-   docker run --rm -v jill-eval-reports:/r behalfbot-open:latest sh -c 'cat /r/report-*.md; sha256sum /r/report-*'
+   docker run --rm --user 0:0 -v jill-eval-reports:/r behalfbot-open:latest sh -c 'cat /r/report-*.md; sha256sum /r/report-*'
    ```
 
 **How to read the result.** The report's first lines give the image

@@ -162,7 +162,20 @@ if [ "$docker_ok" -eq 1 ] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
     if [ -z "$who" ]; then fail "control token" "rejected by the homeserver (or not set)"
     elif [ "$who" = "$(envval MATRIX_PRINCIPAL)" ] || [ "$who" = "$(envval MATRIX_JILL_USER)" ]; then
       fail "control token" "belongs to $who; the kill switch needs its own account"
-    else pass "control token" "valid, $who"; fi
+    else
+      pass "control token" "valid, $who"
+      # jill-control never arms unless its account is in the rooms.
+      joined="$(tok="$(envval MATRIX_CONTROL_TOKEN)"; printf 'Authorization: Bearer %s\n' "$tok" \
+        | incurl -sS -m 10 -H @- "$hs/_matrix/client/v3/joined_rooms" 2>/dev/null)"
+      for key in MATRIX_CONTROL_ROOM MATRIX_ALERTS_ROOM; do
+        room="$(envval "$key")"
+        [ -n "$room" ] || continue
+        case "$joined" in
+          *"\"$room\""*) pass "control joined $key" "$room" ;;
+          *) fail "control joined $key" "the control account is not in $room (invite it, then setup-secrets.sh or join from Element)" ;;
+        esac
+      done
+    fi
   fi
 else
   warn "homeserver reachable" "skipped (needs Docker and $IMAGE)"
