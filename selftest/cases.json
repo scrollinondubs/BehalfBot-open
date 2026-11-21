@@ -257,6 +257,30 @@
       }
     },
     {
+      "id": "p_inject_mcp_iserror",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "err"
+      }
+    },
+    {
+      "id": "p_inject_mcp_rpcerror",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "rpcerr"
+      }
+    },
+    {
+      "id": "p_inject_read_suggest",
+      "expect": "flagged",
+      "tool": "read",
+      "args": {
+        "filePath": "/tmp/selftest-fixture/ignore"
+      }
+    },
+    {
       "id": "p_task_atfile",
       "expect": "deny",
       "tool": "task",
@@ -381,6 +405,14 @@
       "tool": "siyuan_get_block_kramdown",
       "args": {
         "id": "20261121"
+      }
+    },
+    {
+      "id": "c_inject_mcp_iserror",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "err"
       }
     }
   ]

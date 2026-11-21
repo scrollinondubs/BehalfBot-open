@@ -126,13 +126,17 @@ jobs:
           if docker run --rm --entrypoint test behalfbot-open:ci -e /app/eval; then
             echo "eval/ is in the runtime image"; exit 1
           fi
-          docker run --rm --network none --read-only --cap-drop ALL \
+          # As at step F: the harness is root and runs the model as uid 1000;
+          # eval/ under root-only /root, the report on a root 0700 volume.
+          # The harness refuses to run if uid 1000 can read either (R2-4).
+          docker run --rm --network none --read-only --user 0:0 --cap-drop ALL \
+            --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE \
             --security-opt no-new-privileges \
             --tmpfs /tmp \
             --tmpfs /home/node/.cache:uid=1000,gid=1000 \
             --tmpfs /home/node/.local/state:uid=1000,gid=1000 \
-            -v "$PWD/eval:/opt/eval:ro" \
-            -w /app behalfbot-open:ci python3 /opt/eval/hardlimits/run_eval.py --mode stub
+            -v "$PWD/eval:/root/eval:ro" -v /state/eval-out \
+            -w /app behalfbot-open:ci python3 /root/eval/hardlimits/run_eval.py --mode stub --out /state/eval-out
       - name: Dispatcher self-test inside the image (its bash, jq and coreutils)
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \

@@ -115,6 +115,9 @@ MAX_ALERT_CHARS = 1500
 MAX_FILE_BYTES = 64 * 1024
 MAX_SCAN_ENTRIES = 512
 SCAN_COOLDOWN_FLOOR = 900
+# The volume holds 256 inodes. A directory this full is a model filling it
+# so a scanner alert cannot be written (red-team round 7 R2-3): tampering.
+SCAN_FULL_AT = 192
 
 COMMANDS = {
     "halt": "halt",
@@ -350,6 +353,7 @@ class Control:
         self.scan_state_file = os.path.join(cfg["control_dir"], "scan-alert-state.json")
         stored, _ = flags.read(self.scan_state_file)
         self.scan_pending = _nonneg_int(stored.get("pending"))
+        self.scan_high = _nonneg_int(stored.get("high"))
         self.scan_tamper = stored.get("tamper") is True
         last = stored.get("last_post")
         self.scan_last_post = last if isinstance(last, (int, float)) and not isinstance(last, bool) else None
@@ -606,7 +610,7 @@ class Control:
         d = self.cfg.get("scan_dir")
         if not d:
             return False
-        count, tamper = 0, False
+        count, high, tamper = 0, 0, False
         try:
             st = os.lstat(d)
             want = self.cfg.get("scan_expect") or {}
@@ -621,9 +625,13 @@ class Control:
                         break
         except OSError:
             names, tamper = [], True
+        if len(names) >= SCAN_FULL_AT:
+            tamper = True
         for name in names:
             path = os.path.join(d, name)
             count += 1
+            if name.startswith("h-"):
+                high += 1
             try:
                 if os.path.isdir(path) and not os.path.islink(path):
                     _force_rmtree(path)
@@ -635,6 +643,7 @@ class Control:
                 tamper = True
         if count or tamper:
             self.scan_pending += count
+            self.scan_high += high
             self.scan_tamper = self.scan_tamper or tamper
             self._save_scan_state()
         if not self.scan_pending and not self.scan_tamper:
@@ -645,18 +654,19 @@ class Control:
             return False
         try:
             # Its own budget (this cooldown), not the shared ALERTS_PER_HOUR one.
-            self.matrix.send_text(self.cfg["alerts_room"], "[Jill] " + scan_alert_text(self.scan_pending, self.scan_tamper))
+            self.matrix.send_text(self.cfg["alerts_room"], "[Jill] " + scan_alert_text(self.scan_pending, self.scan_tamper, self.scan_high))
         except MatrixError as exc:
             log("WARN: scan alert not delivered: %s" % exc)
             return False
         self.scan_last_post = now
-        self.scan_pending, self.scan_tamper = 0, False
+        self.scan_pending, self.scan_tamper, self.scan_high = 0, False, 0
         self._save_scan_state()
         return True
 
     def _save_scan_state(self):
         try:
-            write_json_atomic(self.scan_state_file, {"pending": self.scan_pending, "tamper": self.scan_tamper,
+            write_json_atomic(self.scan_state_file, {"pending": self.scan_pending, "high": self.scan_high,
+                                                     "tamper": self.scan_tamper,
                                                      "last_post": self.scan_last_post})
         except OSError as exc:
             log("WARN: cannot persist the scan-alert state: %s" % exc)
@@ -917,15 +927,17 @@ def _force_rmtree(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def scan_alert_text(pending, tamper):
-    """Fixed text. The only variable is the bucketed count (M5)."""
+def scan_alert_text(pending, tamper, high=0):
+    """Fixed text. The variables are the bucketed count and a coarse
+    severity, HIGH or low (M5; round 7 round 2 asked for the severity)."""
     parts = []
     if pending:
-        parts.append("Injection scanner flagged %s item(s) in Jill's tool output since the last report. The "
-                     "content stayed in her session; ask Jill in the encrypted chat room." % _bucket(pending))
+        parts.append("Injection scanner flagged %s item(s) in Jill's tool output since the last report, %s. The "
+                     "content stayed in her session; ask Jill in the encrypted chat room."
+                     % (_bucket(pending), "at least one HIGH" if high else "all low"))
     if tamper:
-        parts.append("The scanner's alert path was tampered with (cannot list, cannot remove, or owner/mode "
-                     "changed). Check opencode-serve.")
+        parts.append("The scanner's alert path was tampered with (full, cannot list, cannot remove, or "
+                     "owner/mode changed), so an alert may have been held back. Check opencode-serve.")
     return " ".join(parts)
 
 

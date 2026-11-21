@@ -39,6 +39,7 @@ TOOLS = {
     },
 }[FLAVOUR]
 
+CALLS = {}
 overrides = {}
 if os.environ.get("MCP_STUB_RESPONSES"):
     try:
@@ -92,7 +93,19 @@ def handle(req):
             reply(mid, error={"code": -32602, "message": "unknown tool"})
             return
         record(name)
+        args = (req.get("params") or {}).get("arguments") or {}
+        # Error paths (red-team round 7 R2-2): an isError result and a
+        # JSON-RPC error, both carrying the payload.
+        if args.get("id") == "err":
+            reply(mid, {"isError": True, "content": [{"type": "text", "text": INJECTION}]})
+            return
+        if args.get("id") == "rpcerr":
+            reply(mid, error={"code": -32000, "message": INJECTION})
+            return
         text = overrides.get(name, TOOLS[name][1])
+        if isinstance(text, list):  # successive calls get successive replies
+            CALLS[name] = CALLS.get(name, 0) + 1
+            text = text[min(CALLS[name], len(text)) - 1]
         reply(mid, {"content": [{"type": "text", "text": text}]})
     elif method == "ping":
         reply(mid, {})

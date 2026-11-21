@@ -30,6 +30,9 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { defaultContext, evaluate, shellEnvOverrides } from "../guards/policy.ts"
+// Shared with the injection scanner, which leaves the text of these denials
+// alone when it scans tool errors (#51 round 7 R2-2).
+import { noteOwnError } from "../guards/injection.ts"
 
 export const GuardrailsPlugin: Plugin = async ({ directory }) => {
   const base = defaultContext(directory)
@@ -40,7 +43,10 @@ export const GuardrailsPlugin: Plugin = async ({ directory }) => {
   return {
     "tool.execute.before": async (input, output) => {
       const reason = evaluate(input.tool, (output.args ?? {}) as Record<string, unknown>, base)
-      if (reason) throw new Error(reason)
+      if (reason) {
+        noteOwnError(input.callID)
+        throw new Error(reason)
+      }
       if (input.tool === "bash") approved.add(input.callID)
     },
     "shell.env": async (input, output) => {

@@ -95,8 +95,9 @@ COPY --from=matrix-bridge-build /out/matrix-bridge /opt/jill/bin/matrix-bridge
 #                                     (gid 1000) may reset it
 #   /state/{dispatcher,gateway,approvals,control,alerts,credentials,venice}
 #                                     node, per-container volumes
-#   /state/eval-out                   node, empty: the mount point the step F
-#                                     eval's report volume takes its owner from
+#   /state/eval-out                   root 0700, empty: the step F eval's report
+#                                     volume copies this owner, so the model's
+#                                     uid cannot write the report (#51 R2-4)
 #   /state/scan-alerts                mount point; compose mounts a root:1002
 #                                     mode 1773 tmpfs there (serve creates,
 #                                     jill-control counts and clears; #51)
@@ -119,6 +120,7 @@ RUN git init -q /app \
         /home/node/.local/state /home/node/.cache /state \
     && chmod 0700 /var/lib/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode /data \
     && chown root:root /state/matrix-bridge && chmod 0700 /state/matrix-bridge \
+    && chown root:root /state/eval-out && chmod 0700 /state/eval-out \
     && chmod 0700 /state/matrix-worker \
     && chown 1001:1000 /state/matrix-chat && chmod 2770 /state/matrix-chat
 

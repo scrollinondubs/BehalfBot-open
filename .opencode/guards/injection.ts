@@ -210,14 +210,32 @@ function decodeEntities(s: string): string {
 }
 
 /**
+ * Remove HTML comments in one linear pass. A regex with a lazy body goes
+ * quadratic on many unclosed `<!--` (red-team round 7 R2-5). An unclosed
+ * comment loses only its opener, so it cannot hide what follows.
+ */
+export function stripComments(s: string): string {
+  let out = ""
+  let i = 0
+  for (;;) {
+    const open = s.indexOf("<!--", i)
+    if (open < 0) return out + s.slice(i)
+    const close = s.indexOf("-->", open + 4)
+    if (close < 0) return out + s.slice(i, open) + s.slice(open + 4)
+    out += s.slice(i, open)
+    i = close + 3
+  }
+}
+
+/**
  * The decoded view. Two variants: tags removed outright (a tag inside a word,
  * pre<b>vious) and tags replaced by a space (between words). Order matters:
  * JSON escapes first (email JSON may carry HTML), entities after tags.
  */
 function decoded(raw: string, tagAs: string): string {
   let s = decodeJsonEscapes(raw)
-  s = s.replace(/<!--[\s\S]*?-->/g, "")
-  s = s.replace(/<\/?[a-zA-Z][^<>]{0,500}>/g, tagAs)
+  s = stripComments(s)
+  s = s.replace(/<\/?[a-zA-Z][^<>]{0,2000}>/g, tagAs)
   s = decodeEntities(s)
   s = s.replace(/^[ \t]*\d{1,9}[:|][ \t]?/gm, "") // `read` line numbers (L3)
   s = s.replace(/(\*{1,3}|_{1,3}|~~|`+)(?=\S)|(?<=\S)(\*{1,3}|_{1,3}|~~|`+)/g, "") // markdown emphasis
@@ -404,7 +422,7 @@ export type Outcome =
 type Deps = { scan: (t: string) => ScanResult; nonce: () => string }
 const DEFAULT_DEPS: Deps = { scan: scanText, nonce: newNonce }
 
-function withhold(output: Record<string, unknown>): void {
+export function withhold(output: Record<string, unknown>): void {
   output.output = WITHHELD
   output.content = [{ type: "text", text: WITHHELD }]
   delete output.structuredContent
@@ -512,6 +530,102 @@ export function handleToolOutput(tool: string, args: unknown, output: unknown, d
 }
 
 // ---------------------------------------------------------------------------
+// Error text and chat documents (red-team round 7 R2-2, R2-12)
+// ---------------------------------------------------------------------------
+
+/**
+ * Tool calls whose error text is this install's own: a guard denial or the
+ * scanner's own withhold. The guard plugin records them before it throws
+ * (both plugins import this module, so they share the set); their text is
+ * left alone so a denial still reads as one. Bounded, oldest dropped.
+ */
+const OWN_ERRORS = new Set<string>()
+export function noteOwnError(callID: unknown): void {
+  if (typeof callID !== "string" || !callID) return
+  OWN_ERRORS.add(callID)
+  if (OWN_ERRORS.size > 5000) OWN_ERRORS.delete(OWN_ERRORS.values().next().value as string)
+}
+
+const PERMISSION_DENIAL = "The user has specified a rule which prevents you from using this specific tool call"
+const BUILTIN_TOOLS = new Set(["bash", "read", "write", "edit", "glob", "grep", "list", "task", "webfetch", "websearch",
+  "todowrite", "todoread", "apply_patch", "patch", "skill", "question", "invalid"])
+
+export type TransformState = { done: Map<string, string>; nonces: Map<string, string> }
+export const newTransformState = (): TransformState => ({ done: new Map(), nonces: new Map() })
+
+const DOC_BLOCK = /(===== BEGIN UNTRUSTED DOCUMENT: [^\n]* =====\n)([\s\S]*?)(\n===== END UNTRUSTED DOCUMENT: [^\n]* =====)/g
+
+/**
+ * `tool.execute.after` does not run when a tool fails, so MCP error text,
+ * an MCP `isError` result and `read`'s "did you mean" list would reach the
+ * model unscanned. OpenCode's `experimental.chat.messages.transform` hook
+ * sees every message before each model call (session/prompt.ts), and the
+ * model text is built from it afterwards. This scans, in place:
+ *   - the error text of every failed tool part, except our own denials;
+ *   - the document blocks the Matrix bridge puts in Sean's messages
+ *     (PDF and text uploads, bridge/matrix_worker.py wrap_document): the
+ *     bridge path runs no tool, so no other hook sees them.
+ * The messages are re-read every step, so each rewrite is remembered by key
+ * and an alert is raised once per key. Returns the severities to alert.
+ */
+export function scanMessages(messages: unknown, state: TransformState, deps: Deps = DEFAULT_DEPS): Array<Severity | "error"> {
+  const alerts: Array<Severity | "error"> = []
+  const process = (key: string, text: string, source: Source): string => {
+    if (state.done.get(key) === text) return text
+    let out: string
+    let sev: Severity | "error" | null = null
+    try {
+      const scan = deps.scan(text)
+      if (scan) {
+        let nonce = state.nonces.get(key)
+        if (!nonce) state.nonces.set(key, (nonce = deps.nonce()))
+        out = quarantine(text, scan, source, nonce)
+        sev = scan.severity
+      } else out = defuse(text)
+    } catch {
+      out = WITHHELD
+      sev = "error"
+    }
+    if (sev && !state.nonces.has("alerted:" + key)) {
+      state.nonces.set("alerted:" + key, "1")
+      alerts.push(sev)
+    }
+    state.done.set(key, out)
+    return out
+  }
+  if (!Array.isArray(messages)) return alerts
+  for (const m of messages) {
+    const msg = (m && typeof m === "object" ? m : {}) as Record<string, unknown>
+    const role = ((msg.info ?? {}) as Record<string, unknown>).role
+    if (!Array.isArray(msg.parts)) continue
+    for (const p of msg.parts) {
+      if (!p || typeof p !== "object") continue
+      const part = p as Record<string, unknown>
+      const id = String(part.id ?? part.callID ?? "")
+      if (part.type === "tool") {
+        const st = (part.state ?? {}) as Record<string, unknown>
+        if (st.status !== "error" || OWN_ERRORS.has(String(part.callID ?? ""))) continue
+        // OpenCode's own permission denial (opencode.json "permission") on a
+        // built-in tool. Only built-ins: an MCP error's text is the server's.
+        if (BUILTIN_TOOLS.has(String(part.tool)) && typeof st.error === "string" && st.error.startsWith(PERMISSION_DENIAL)) continue
+        const source = sourceOf(String(part.tool ?? ""), st.input)
+        if (typeof st.error === "string") st.error = process("e:" + id, st.error, source)
+        const meta = st.metadata as Record<string, unknown> | undefined
+        if (meta && typeof meta.output === "string") meta.output = process("m:" + id, meta.output, source)
+      } else if (role === "user" && part.type === "text" && typeof part.text === "string" && part.text.includes("===== BEGIN UNTRUSTED DOCUMENT:")) {
+        let n = 0
+        part.text = part.text.replace(DOC_BLOCK, (_all, head: string, body: string, tail: string) => {
+          const key = "d:" + id + ":" + n++
+          const done = state.done.get(key)
+          return head + (done !== undefined && done === body ? body : process(key, body, "document")) + tail
+        })
+      }
+    }
+  }
+  return alerts
+}
+
+// ---------------------------------------------------------------------------
 // Alerts
 // ---------------------------------------------------------------------------
 
@@ -520,12 +634,14 @@ export function handleToolOutput(tool: string, args: unknown, output: unknown, d
  * and group 1002 with mode 1773 (docker-compose.yml): serve's uid may create
  * files but cannot list, delete what it cannot name, or chmod the directory,
  * so a model cannot clear or hide a real alert (H3). jill-control only
- * COUNTS entries; nothing in a file, its name or its mode is read (M5).
+ * COUNTS entries and reads one bit from the name, h- (HIGH) or anything
+ * else (low): nothing in a file or its mode is read (M5).
  * Returns false when the write failed; the caller logs that.
  */
-export function writeAlert(dir: string): boolean {
+export function writeAlert(dir: string, severity: Severity | "error" = "low"): boolean {
   try {
-    const name = `${crypto.randomBytes(16).toString("hex")}.alert`
+    const prefix = severity === "high" ? "h" : "l"
+    const name = `${prefix}-${crypto.randomBytes(16).toString("hex")}.alert`
     const fd = fs.openSync(path.join(dir, name), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600)
     fs.closeSync(fd)
     return true

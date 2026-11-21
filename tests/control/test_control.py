@@ -370,7 +370,7 @@ class ScanAlerts(Base):
         body = self.hs.sent[0][1]
         self.assertNotIn(secret, body)
         self.assertNotIn("high", body.lower().replace("flagged", ""))
-        self.assertEqual(body, "[Jill] " + c.scan_alert_text(2, False), "the line is fixed apart from the bucket")
+        self.assertEqual(body, "[Jill] " + c.scan_alert_text(2, False, 0), "the line is fixed apart from the bucket")
 
     def test_counts_are_bucketed(self):
         for i in range(37):
@@ -442,6 +442,23 @@ class ScanAlerts(Base):
         self.ctl.drain_scan_alerts()
         self.assertTrue(os.path.isdir(target))
         self.assertEqual(os.listdir(self.scan), [])
+
+    def test_severity_is_one_coarse_bit_from_the_name(self):
+        self.drop("l-a.alert")
+        self.drop("h-b.alert")
+        self.ctl.drain_scan_alerts()
+        self.assertIn("at least one HIGH", self.hs.sent[0][1])
+        self.now[0] += 1000
+        self.drop("l-c.alert")
+        self.ctl.drain_scan_alerts()
+        self.assertIn("all low", self.hs.sent[1][1])
+
+    def test_a_nearly_full_dir_is_tampering(self):
+        # R2-3: a model fills the inodes so the scanner's write fails.
+        for i in range(c.SCAN_FULL_AT):
+            self.drop("x%d" % i)
+        self.ctl.drain_scan_alerts()
+        self.assertIn("tampered", self.hs.sent[0][1])
 
     def test_unset_dir_is_a_no_op(self):
         self.cfg["scan_dir"] = None
