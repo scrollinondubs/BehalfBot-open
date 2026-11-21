@@ -89,4 +89,15 @@ code=$(http -X POST -H 'content-type: application/json' -d '{"path":"/data/stora
 case "$code" in 2*) out siyuan-storage-read ;; esac
 if t curl -s http://brave-mcp:8080/mcp; then out brave-mcp-direct; fi
 
+# Control (#49): the kill switch, the alert spool and the credential probes
+# live in volumes serve never mounts, behind a sidecar serve cannot reach. If
+# serve could write a flag it could lift its own halt; if it could write the
+# spool, alerts would be an egress path to Sean's homeserver.
+for d in /state/control /state/alerts /state/credentials; do
+  if [ -e "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then out "control-volume-mounted:$d"; fi
+  if touch "$d/.selftest-write" 2>/dev/null; then rm -f "$d/.selftest-write"; out "control-dir-writable:$d"; fi
+done
+if t getent hosts jill-control; then out jill-control-resolvable; fi
+if env | cut -d= -f1 | grep -qE '^MATRIX_'; then out env-matrix; fi
+
 echo selftest-ok

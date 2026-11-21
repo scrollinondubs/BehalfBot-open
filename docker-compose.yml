@@ -47,6 +47,13 @@
 #   approval  sending email and fetching a web page need Sean's one-shot
 #             approval (gateway/approvals.py), written only by the bridge or
 #             dispatcher into a volume serve does not mount.
+#   control   jill-control (gateway/control.py) holds the Matrix token,
+#             listens for halt/resume from Sean, posts alerts and watches
+#             credential expiry. It is not on jill-internal and listens on
+#             no port. It shares only volumes, none of which serve mounts:
+#             control-state (it writes, dispatcher reads), alert-spool
+#             (dispatcher writes, it posts), credential-status (gateways
+#             write status-only probe results, it reads). docs/control.md.
 #
 #   Discord -> bridge -> api-proxy -> opencode-serve -> venice-proxy -> Venice
 #                                                    -> agentmail-proxy -> AgentMail
@@ -172,6 +179,9 @@ services:
       UPSTREAM_KEY: ${VENICE_API_KEY:?set VENICE_API_KEY in .env}
       # Venice "private" inference only; keep in step with opencode.json.
       VENICE_MODELS: zai-org-glm-5-2,z-ai-glm-5-3-flash,zai-org-glm-5-1,kimi-k2-7-code,deepseek-v4-pro
+      CREDENTIAL_STATUS_DIR: /state/credentials
+    volumes:
+      - credential-status:/state/credentials
     networks: [jill-internal, jill-egress]
     <<: *gateway
 
@@ -185,9 +195,11 @@ services:
       AGENTMAIL_INBOX: ${AGENTMAIL_INBOX:-jill-agent@agentmail.to}
       APPROVALS_DIR: /state/approvals
       GATEWAY_STATE_DIR: /state/gateway
+      CREDENTIAL_STATUS_DIR: /state/credentials
     volumes:
       - approvals:/state/approvals:ro
       - agentmail-state:/state/gateway
+      - credential-status:/state/credentials
     networks: [jill-internal, jill-egress]
     <<: *gateway
 
@@ -213,6 +225,9 @@ services:
       GATEWAY_ROUTE: siyuan
       UPSTREAM_URL: ${SIYUAN_URL:-}
       UPSTREAM_KEY: ${SIYUAN_TOKEN:-}
+      CREDENTIAL_STATUS_DIR: /state/credentials
+    volumes:
+      - credential-status:/state/credentials
     networks: [jill-internal, jill-egress]
     <<: *gateway
 
@@ -236,6 +251,40 @@ services:
       GATEWAY_ROUTE: mcp
       UPSTREAM_URL: http://brave-mcp:8080
     networks: [jill-internal, jill-brave]
+    <<: *gateway
+
+  # --- control: kill switch, alerts, credential expiry (#49) ---------------
+  # Holds the Matrix token; Jill holds nothing and cannot reach it. Not on
+  # jill-internal, no listening port. Its boot self-test (token valid, both
+  # rooms joined and NOT encrypted, control room readable) must pass before
+  # it reports healthy, and the dispatcher will not start until it does.
+  jill-control:
+    image: behalfbot-open:latest
+    container_name: behalfbot-jill-control
+    command: ["python3", "/app/gateway/control.py"]
+    environment:
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-http://host.docker.internal:8008}
+      MATRIX_CONTROL_TOKEN: ${MATRIX_CONTROL_TOKEN:-}
+      MATRIX_PRINCIPAL: ${MATRIX_PRINCIPAL:-}
+      MATRIX_CONTROL_ROOM: ${MATRIX_CONTROL_ROOM:-}
+      MATRIX_ALERTS_ROOM: ${MATRIX_ALERTS_ROOM:-}
+      CONTROL_DIR: /state/control
+      ALERT_SPOOL_DIR: /state/alerts
+      CREDENTIAL_STATUS_DIR: /state/credentials
+      CREDENTIAL_EXPECT: ${CREDENTIAL_EXPECT:-venice}
+      CREDENTIAL_EXPIRES: ${CREDENTIAL_EXPIRES:-}
+    volumes:
+      - control-state:/state/control
+      - alert-spool:/state/alerts
+      - credential-status:/state/credentials:ro
+    networks: [jill-callers]
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/control-ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
     <<: *gateway
 
   # --- trusted callers: hold the API password and write approvals ----------
@@ -288,7 +337,7 @@ services:
     command:
       - bash
       - -c
-      - 'while true; do bash scheduled-tasks/heartbeat-dispatcher.sh || true; sleep "$${DISPATCHER_INTERVAL_SECONDS:-900}"; done'
+      - 'bash scheduled-tasks/dispatcher-selftest.sh || exit 1; while true; do bash scheduled-tasks/heartbeat-dispatcher.sh || true; sleep "$${DISPATCHER_INTERVAL_SECONDS:-900}"; done'
     working_dir: /app
     environment:
       BEHALFBOT_HOME: /app
@@ -309,6 +358,14 @@ services:
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
       DISCORD_OPS_WEBHOOK_URL: ${DISCORD_OPS_WEBHOOK_URL:-}
       INSTANCE_NAME: ${INSTANCE_NAME:-}
+      # Control (#49, docs/control.md). The flags are read-only here.
+      CONTROL_DIR: /state/control
+      CONTROL_REQUIRE_ARMED: "1"
+      ALERT_SPOOL_DIR: /state/alerts
+      SELFTEST_LIVE: "1"
+      DISPATCHER_MAX_USD_PER_DAY: ${DISPATCHER_MAX_USD_PER_DAY:-5}
+      DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY: ${DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY:-24}
+      VENICE_PRICES: ${VENICE_PRICES:-}
     volumes:
       - ./HEARTBEATS.md:/app/HEARTBEATS.md:ro
       - ./scheduled-tasks:/app/scheduled-tasks:ro
@@ -317,8 +374,12 @@ services:
       - approvals:/state/approvals
       - agentmail-state:/state/agentmail-gw:ro
       - fetch-state:/state/fetch-gw:ro
+      - control-state:/state/control:ro
+      - alert-spool:/state/alerts
     depends_on:
       api-proxy:
+        condition: service_healthy
+      jill-control:
         condition: service_healthy
     networks: [jill-control, jill-callers]
     cap_drop: [ALL]
@@ -341,8 +402,8 @@ networks:
   # Ordinary outbound network for the gateways.
   jill-egress:
     driver: bridge
-  # Outbound for the bridge (Discord) and dispatcher (webhooks), kept apart
-  # from the gateways, which parse model-controlled input.
+  # Outbound for the bridge (Discord), dispatcher (webhooks) and jill-control
+  # (Matrix), kept apart from the gateways, which parse model-controlled input.
   jill-callers:
     driver: bridge
   # brave-proxy <-> brave-mcp only; opencode-serve is not on it.
@@ -358,3 +419,6 @@ volumes:
   approvals:        # Sean's one-shot approvals (bridge/dispatcher write, gateways read)
   agentmail-state:  # draft snapshots (what a send delivers), consumed approvals
   fetch-state:      # consumed URL approvals, URL requests
+  control-state:    # halt.json, conservation-mode.json, armed.json, cursors (jill-control writes)
+  alert-spool:      # content-free alerts from the dispatcher, drained by jill-control
+  credential-status: # status-only credential probe results from the key-holding gateways

@@ -45,7 +45,7 @@ COPY opencode.json AGENTS.md ./
 COPY .opencode/ ./.opencode/
 COPY config/ ./config/
 COPY selftest/ ./selftest/
-COPY gateway/gateway.py gateway/approvals.py ./gateway/
+COPY gateway/gateway.py gateway/approvals.py gateway/control.py gateway/control_flags.py ./gateway/
 COPY runtime/jill-shell /opt/jill/bin/bash
 COPY runtime/setup-netns.sh /opt/jill/bin/setup-netns.sh
 COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
@@ -66,7 +66,8 @@ COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
 #   /app, global config, /home/node   uid 65534 (nobody), read-only to all
 #   /var/lib/opencode, /data          node 0700 (OpenCode data, memory MCP)
 #   /workspace                        node (her files)
-#   /state/{bridge,dispatcher,gateway,approvals}  node, per-container volumes
+#   /state/{bridge,dispatcher,gateway,approvals,control,alerts,credentials}
+#                                     node, per-container volumes
 RUN git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
     && git -C /app config user.name "Jill" \
@@ -75,6 +76,7 @@ RUN git init -q /app \
     && mkdir -p /etc/opencode-xdg/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode \
         /data /workspace /home/node/.local/state /home/node/.cache \
         /state/bridge /state/dispatcher /state/gateway /state/approvals \
+        /state/control /state/alerts /state/credentials \
     && cp /app/.opencode/.gitignore /etc/opencode-xdg/opencode/.gitignore \
     && printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /etc/opencode-xdg/opencode/opencode.jsonc \
     && chown -R 65534:65534 /app /etc/opencode-xdg /home/node \
