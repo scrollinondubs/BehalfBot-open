@@ -16,7 +16,8 @@
 #   F1           unreadable, invalid or missing telemetry reads as cap reached
 #   F2           an invalid state file stops the tick; bad writes are dropped
 #   F4           an unarmed switch is checked before every run
-#   F6           strict flag schema, orphan and held locks, cents in alerts
+#   F6           strict flag schema, a held lock, cents in alerts
+#   no-flock     flock missing: refuses to start, exits non-zero, one alert
 #   unarmed      CONTROL_REQUIRE_ARMED=1 with no armed.json: nothing fires,
 #                one alert
 #   fire-cap     max_fires_per_day: 1 holds across two ticks, one alert
@@ -136,14 +137,16 @@ new_sandbox() {
 }
 
 # tick [VAR=value ...]: one real dispatcher run in the sandbox, clean env.
+TICK_RC=0
 tick() {
+    TICK_RC=0
     env -i PATH="$TICK_PATH" HOME="$SB" LANG=C.UTF-8 \
         BEHALFBOT_HOME="$SB/home" BEHALFBOT_STATE_HOME="$SB/state" \
         CONTROL_DIR="$SB/control" ALERT_SPOOL_DIR="$SB/spool" \
         OPENCODE_BIN="$ROOT/bin/opencode" DISPATCHER_RETRY_BASE_SECONDS=0 \
         DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY=0 DISPATCHER_MAX_USD_PER_DAY=1000 \
         FAKE_SB="$SB" FAKE_CANARY="$CANARY" "$@" \
-        bash "$DISPATCHER" >/dev/null 2>&1
+        bash "$DISPATCHER" >/dev/null 2>&1 || TICK_RC=$?
     return 0
 }
 
@@ -251,28 +254,20 @@ jq -e '.keep.v == "1"' "$SB/state/scheduled-tasks/heartbeat-state.json" >/dev/nu
     && ok "F2 an empty or non-object update never replaces the state file" \
     || bad "F2 an empty or non-object update replaced the state file"
 
-new_sandbox orphan-lock "hb-a|"
-mkdir -p "$SB/state/scheduled-tasks"
-echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
-mkdir "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
-touch -t 202001010000 "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
-tick DISPATCHER_STATE_LOCK=mkdir
-[[ "$(calls)" == 1 && "$(alerts state-lock)" == 1 ]] && logged "orphaned state lock" \
-    && ok "F6 orphaned lock (no pid): removed with an alert, then the tick ran" \
-    || bad "F6 orphaned lock: calls=$(calls) alerts=$(alerts state-lock)"
+new_sandbox no-flock "hb-a|"
+tick DISPATCHER_FLOCK_BIN=/nonexistent/flock
+rc1=$TICK_RC
+tick DISPATCHER_FLOCK_BIN=/nonexistent/flock
+[[ "$rc1" != 0 && "$TICK_RC" != 0 && "$(calls)" == 0 && "$(alerts no-flock)" == 1 ]] && logged "flock(1) not found" \
+    && ok "flock missing: the dispatcher refuses to start, exits non-zero, nothing fired, one alert over two ticks" \
+    || bad "flock missing: rc=$rc1/$TICK_RC calls=$(calls) alerts=$(alerts no-flock)"
+tick
+[[ "$TICK_RC" == 0 && "$(calls)" == 1 ]] && ok "flock back: the dispatcher runs again" \
+    || bad "flock back: rc=$TICK_RC calls=$(calls)"
 
-new_sandbox held-lock "hb-a|"
-mkdir -p "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
-echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
-echo $$ > "$SB/state/scheduled-tasks/heartbeat-state.json.lock/pid"
-tick DISPATCHER_STATE_LOCK=mkdir
-rm -f "$SB/state/scheduled-tasks/heartbeat-state.json.lock/pid"
-rmdir "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
-[[ "$(calls)" == 0 && "$(alerts state-lock)" == 1 ]] && logged "write refused" \
-    && ok "F6 mkdir lock held by a live process: writes refused, nothing fired, one alert" \
-    || bad "F6 held lock: calls=$(calls) alerts=$(alerts state-lock)"
-
-if command -v flock >/dev/null 2>&1; then
+if ! command -v flock >/dev/null 2>&1; then
+    bad "flock is not installed here; the dispatcher requires it, so these checks cannot pass"
+else
     new_sandbox held-flock "hb-a|"
     mkdir -p "$SB/state/scheduled-tasks"
     echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
@@ -392,16 +387,12 @@ fi
 # --- state lock -------------------------------------------------------------
 # 40 writers at once is far past what a tick does; give them time so the
 # test measures lost updates, not the (correct) refusal after the wait.
-# The stress runs on the lock this host actually uses: flock where it exists
-# (the image, Linux), else the mkdir fallback. The mkdir fallback lost 2 of
-# 40 writes under this contention on a GitHub-hosted runner, cause not yet
-# found, so it is not stress-tested where flock is in use (docs/control.md).
 logcount() { cat "$SB"/state/logs/scheduled/*-dispatcher.log 2>/dev/null | grep -c "$1"; }
-for kind in auto; do
+for kind in flock; do
     new_sandbox "state-lock-$kind" "hb-a|"
     (
         export BEHALFBOT_HOME="$SB/home" BEHALFBOT_STATE_HOME="$SB/state" DISPATCHER_TEST_SOURCE=1
-        export DISPATCHER_STATE_LOCK_WAIT_SECONDS=120 DISPATCHER_STATE_LOCK="$kind"
+        export DISPATCHER_STATE_LOCK_WAIT_SECONDS=120
         # shellcheck source=/dev/null
         source "$DISPATCHER"
         init_state
@@ -414,9 +405,9 @@ for kind in auto; do
     missing=$(jq -r '[range(1;21) as $i | select(.["race-\($i)"].v != "\($i)") | "race-\($i)"]
         + [range(1;21) as $i | select(.["count-\($i)"].fire_count != "1") | "count-\($i)"] | join(",")' \
         "$SB/state/scheduled-tasks/heartbeat-state.json" 2>/dev/null || echo unreadable)
-    label="state lock ($kind$([[ "$kind" == auto ]] && command -v flock >/dev/null 2>&1 && echo ": flock"))"
+    label="state lock ($kind)"
     [[ -z "$missing" ]] && ok "$label: 40 concurrent writes, none lost" \
-        || bad "$label: lost $missing (refused: $(logcount "write refused"), discarded: $(logcount "discarded"), orphan removals: $(logcount "orphaned"), dead-holder recoveries: $(logcount "dead holder"), writers finished: $(wc -l < "$SB/writers.log" | tr -d ' ')/40, stderr: $(tr '\n' ' ' < "$SB/writers.err" | cut -c1-300))"
+        || bad "$label: lost $missing (refused: $(logcount "write refused"), discarded: $(logcount "discarded"), writers finished: $(wc -l < "$SB/writers.log" | tr -d ' ')/40, stderr: $(tr '\n' ' ' < "$SB/writers.err" | cut -c1-300))"
 done
 
 # --- live mounts (compose only) ---------------------------------------------

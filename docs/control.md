@@ -111,7 +111,7 @@ To turn them on: `cp HEARTBEATS.md.template HEARTBEATS.md`, then
 - runs `scheduled-tasks/dispatcher-selftest.sh` first, and refuses to loop if it fails;
 - skips everything while halted or unarmed, checked at tick start, before every run, before every retry, and before the validator and notification;
 - refuses to run if `heartbeat-state.json` is not a JSON object (one alert), and never writes an empty or invalid state;
-- takes its state lock with `flock` where available (the image has it), falling back to a mkdir lock; refuses state writes, and stops the tick, if the lock is held for 10s (`DISPATCHER_STATE_LOCK_WAIT_SECONDS`); an orphaned mkdir lock (no pid, over 5s old) is removed with an alert. Known issue: the mkdir fallback lost 2 of 40 writes under heavy contention on a GitHub-hosted runner, cause not yet found;
+- requires `flock` for its state lock (the image has it): without it, the dispatcher refuses to start, sends one alert and exits non-zero. A lock held for 10s (`DISPATCHER_STATE_LOCK_WAIT_SECONDS`) refuses the write and stops the tick, with an alert;
 - enforces caps:
 
 | Setting | Default | Scope |
@@ -142,7 +142,7 @@ control room), as `[Jill] <text>`:
   - the boot announcement and auto-lifts;
   - the Venice meter: alert line, hard ceiling, responses without usage, unreadable meter;
   - credential stage changes.
-- **The dispatcher (heartbeats on only):** spool files (`spend-cap`, `spend-half`, `fire-cap`, `all-failed`, `recovered`, `unarmed`, `validator`, `spend-unmeasured`, `state-invalid`, `state-lock`).
+- **The dispatcher (heartbeats on only):** spool files (`spend-cap`, `spend-half`, `fire-cap`, `all-failed`, `recovered`, `unarmed`, `validator`, `spend-unmeasured`, `state-invalid`, `state-lock`, `no-flock`).
 
 At most `ALERTS_PER_HOUR` (20) are posted. Undelivered alerts are retried.
 Malformed spool files go to `rejected/`. Dollar figures are rounded to cents.

@@ -242,17 +242,17 @@ get_state() {
 # a22251c). A unique temp path alone only stops two writers' staging files
 # colliding; it does nothing about two writers both reading the state file,
 # computing from the same stale snapshot, and the second mv discarding the
-# first writer's change. mkdir is atomic everywhere this runs and needs no
-# flock. The lock is a directory holding one pid file, removed with
-# rm -f + rmdir: never a recursive delete of a computed path.
+# first writer's change.
 #
-# A dead holder's lock is recovered. A lock dir with NO pid file that is
-# itself more than 5s old was orphaned by a writer killed between mkdir and
-# the pid write: it is removed and alerted on. Age is read from the lock
-# dir, not counted by the waiter: a counter spans successive holders, each
-# briefly seen without a pid, and once removed a live lock (CI caught it). A live holder for 10s makes this write REFUSED, never
-# done unlocked: STATE_LOCK_FAILED stops the tick firing anything more (red
-# team F6), because a lost fire count is a cap bypass.
+# flock(1) is REQUIRED (main refuses to start without it). It is
+# kernel-enforced and released when its holder dies, so there are no
+# orphaned locks. The chassis's mkdir lock is not used: on a GitHub-hosted
+# runner it lost 2 of 40 concurrent updates with no recovery path taken.
+# A lock held for DISPATCHER_STATE_LOCK_WAIT_SECONDS (default 10) makes the
+# write REFUSED, never done unlocked: STATE_LOCK_FAILED stops the tick
+# firing anything more (red team F6), because a lost fire count is a cap
+# bypass. fd 9 keeps this runnable by older bash.
+FLOCK_BIN="${DISPATCHER_FLOCK_BIN:-$(command -v flock 2>/dev/null || true)}"
 STATE_LOCK_FAILED=0
 STATE_LOCK_ALERTED=0
 
@@ -264,69 +264,20 @@ _state_lock_alert() {
     fi
 }
 
-_mtime() {
-    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo ""
-}
-
-# flock(1), where present (the image, Linux hosts), is kernel-enforced and
-# released when the holder dies, so it has no orphans. The mkdir lock below
-# is the fallback for hosts without it (stock macOS), or when
-# DISPATCHER_STATE_LOCK=mkdir. fd 9 is used so bash 3.2 can run this too.
-# Known issue: under 40 concurrent writers on a GitHub-hosted runner the
-# mkdir fallback lost 2 updates with no recovery path taken; cause not yet
-# found. The dispatcher itself runs in the image, which has flock.
-STATE_LOCK_KIND=""
-
 _state_lock_acquire() {
-    if [[ "${DISPATCHER_STATE_LOCK:-auto}" != "mkdir" ]] && command -v flock >/dev/null 2>&1; then
-        exec 9>>"${STATE_FILE}.flock"
-        if flock -w "${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10}" 9; then
-            STATE_LOCK_KIND=flock
-            return 0
-        fi
-        exec 9>&-
-        STATE_LOCK_FAILED=1
-        _state_lock_alert "ERROR state lock held >${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10}s - write refused; this tick fires nothing more" \
-            "The dispatcher could not take its state lock in time, so it refused the write and stopped firing for this tick. Another dispatcher may be running."
-        return 1
+    exec 9>>"${STATE_FILE}.flock"
+    if "$FLOCK_BIN" -w "${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10}" 9; then
+        return 0
     fi
-    STATE_LOCK_KIND=mkdir
-    local lock_dir="${STATE_FILE}.lock" waited=0 holder="" made
-    while ! mkdir "$lock_dir" 2>/dev/null; do
-        holder=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
-        if [[ -z "$holder" ]]; then
-            made=$(_mtime "$lock_dir")
-            if [[ "$made" =~ ^[0-9]+$ ]] && (( $(date +%s) - made > 5 )) && [[ ! -e "$lock_dir/pid" ]]; then
-                _state_lock_alert "WARNING orphaned state lock (no pid file, >5s old) - removed" \
-                    "The dispatcher found an orphaned state lock (a writer died mid-write) and removed it. If this repeats, check the dispatcher container."
-                rmdir "$lock_dir" 2>/dev/null || true
-                continue
-            fi
-        elif ! kill -0 "$holder" 2>/dev/null; then
-            log "WARNING state lock held by dead holder pid $holder - recovered"
-            rm -f "$lock_dir/pid" 2>/dev/null || true
-            rmdir "$lock_dir" 2>/dev/null || true
-            continue
-        fi
-        sleep 0.1
-        waited=$((waited + 1))
-        if [[ $waited -ge $(( ${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10} * 10 )) ]]; then
-            STATE_LOCK_FAILED=1
-            _state_lock_alert "ERROR state lock held >${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10}s by pid ${holder:-unknown} - write refused; this tick fires nothing more" \
-                "The dispatcher could not take its state lock in time, so it refused the write and stopped firing for this tick. Another dispatcher may be running."
-            return 1
-        fi
-    done
-    echo $$ > "$lock_dir/pid"
+    exec 9>&-
+    STATE_LOCK_FAILED=1
+    _state_lock_alert "ERROR state lock held >${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10}s - write refused; this tick fires nothing more" \
+        "The dispatcher could not take its state lock in time, so it refused the write and stopped firing for this tick. Another dispatcher may be running."
+    return 1
 }
 
 _state_lock_release() {
-    if [[ "$STATE_LOCK_KIND" == flock ]]; then
-        exec 9>&-
-        return 0
-    fi
-    rm -f "${STATE_FILE}.lock/pid" 2>/dev/null || true
-    rmdir "${STATE_FILE}.lock" 2>/dev/null || true
+    exec 9>&-
 }
 
 # _state_update <jq filter> [jq args...] - one locked read-modify-write.
@@ -1189,6 +1140,19 @@ fi
 # --- Main Dispatch Loop ---
 
 main() {
+    # flock is required for the state lock. Without it: refuse to start,
+    # alert once (until flock is back), exit non-zero.
+    local no_flock_marker="$STATE_DIR/.no-flock-alerted"
+    if [[ -z "$FLOCK_BIN" || ! -x "$FLOCK_BIN" ]]; then
+        log "FATAL flock(1) not found - the dispatcher will not run without its state lock"
+        if [[ ! -e "$no_flock_marker" ]]; then
+            : > "$no_flock_marker"
+            alert_ops no-flock "The heartbeat dispatcher refused to start: flock is not installed where it runs, and it will not run without its state lock."
+        fi
+        exit 78
+    fi
+    rm -f "$no_flock_marker"
+
     acquire_lock
     init_state
     log "=== Dispatcher run started ==="
