@@ -736,7 +736,10 @@ invoke_opencode() {
 # A heartbeat whose output starts with `notify: true` raises an alert
 # through the Matrix alerts path (alert_ops). That room is not end-to-end
 # encrypted, so the alert carries the heartbeat and output file names only,
-# never the model-written summary: read the output on Jill's side.
+# never the model-written summary: read the output on Jill's side. The bit
+# itself is model-controlled, so it is rate-limited per heartbeat
+# (NOTIFY_MIN_INTERVAL_SECONDS, default 6h): Jill cannot signal through the
+# timing of alerts more often than that (red-team round 6 L2).
 
 check_and_notify() {
     local name="$1" output_file="$2"
@@ -745,6 +748,14 @@ check_and_notify() {
         return
     fi
 
+    local now last
+    now=$(date +%s)
+    last=$(get_state "$name" "last_notify_at")
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < ${NOTIFY_MIN_INTERVAL_SECONDS:-21600} )); then
+        log "NOTIFY $name suppressed (rate limit)"
+        return
+    fi
+    set_state "$name" "last_notify_at" "$now"
     log "NOTIFY $name"
     alert_ops "notify" "Heartbeat $name finished and asked for your attention (output $(basename "$output_file"))."
 }

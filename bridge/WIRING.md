@@ -61,12 +61,18 @@ supplied that.
 If Sean's master key ever differs from the pin, the bridge locks:
 
 - it refuses all chat and all commands;
+- it discards the room's outbound key;
 - it posts a content-free alert through jill-control's alerts room;
 - it persists the lock in the state volume.
 
-Only `matrix-bridge setup` re-pins and clears it. Reset your own Matrix
-identity, and you must re-run setup. If you did not, treat the alert as an
-attack.
+The alert travels through the homeserver admin's room and can be dropped,
+so check on the host too: `docker compose exec matrix-bridge
+/opt/jill/bin/matrix-bridge status` prints the pin and any lock and exits
+non-zero when locked. `docker/cutover.sh` runs it.
+
+Only `matrix-bridge setup` re-pins and clears the lock. If you reset your
+own Matrix identity, you must re-run setup. If you did not, treat the alert
+as an attack.
 
 ### Outbound
 
@@ -78,57 +84,129 @@ refuses to send, and alerts, if any of these is true:
 - Sean's master key no longer matches the pin;
 - Sean has no device signed through the pin.
 
-Room keys go only to the principal and Jill. Jill's user-signing key signed
-the pinned master key at setup, and `SendKeysMinTrust` is
-`cross-signed-verified`, so mautrix shares keys only with Sean's devices
-signed through that key. Key requests from other devices are refused.
-Replies are plain text, with no `formatted_body`.
+**Room keys go only to the principal and Jill.**
+
+- Jill's user-signing key signed the pinned master key at setup, and
+  `SendKeysMinTrust` is `cross-signed-verified`, so mautrix shares keys only
+  with Sean's devices signed through that key.
+- Key requests from other devices are refused.
+- Replies are plain text, with no `formatted_body`.
+
+**The outbound Megolm session is the bridge's own (red-team round 6 H1).**
+mautrix reuses a session once it is shared. The bridge therefore never
+keeps one longer than it can account for:
+
+- it discards the session at the end of every setup (success or failure),
+  at every start, and on an identity lock;
+- it rotates it whenever the room's members, Sean's pinned-trusted devices
+  or the pin change;
+- it rotates after 50 messages or 24 hours, whatever the room's encryption
+  settings say.
+
+Setup refuses to run unless the room holds exactly Jill and Sean, and its
+verification messages are encrypted to those two only.
 
 ## Commands in the encrypted room
 
-These are whole messages, handled before any model call, and they work while
-halted:
+These are whole messages, handled before any model call, one at a time in
+the order received. They work while halted:
 
 | Command | Effect |
 |---|---|
-| `halt [2h] [reason]` (`mute`, `silence`) | `venice-proxy` refuses every model call |
-| `resume` (`unmute`, `unhalt`) | clears halt and conservation. **Only here**, not in the unencrypted control room |
-| `reset meter` | today's Venice request count |
-| `reset meter spend` | and today's dollar spend. **Only here** |
+| `halt [2h] [reason]` (`mute`, `silence`) | `venice-proxy` refuses every model call. Only tightens an existing halt. Cancels anything waiting for `confirm` |
+| `conserve [2h]` | heartbeats: `critical` only |
 | `status` | both flags |
 | `new` (`/new`, `/reset`, `!reset`) | a fresh opencode session |
-| `show draft <id>` | the approval screen for that draft |
-| `approve draft <id> <sha256>` | approves exactly what that screen showed |
+| `show draft <id>` | the approval screen, with a one-time code |
+| `resume` (`unmute`, `unhalt`), `unconserve`, `reset meter`, `reset meter spend` | answered with `send confirm <code> within 5 minutes` |
+| `approve draft <id> <sha256> <code>` | `<code>` from that draft's screen; answered with a confirm code |
+| `confirm <code>` | runs the command it was issued for |
 
 While halted, every other message gets a refusal and never reaches the
-model. `conserve` and `unconserve` stay in the control room.
+model. A message that starts with `show draft`, `approve` or `confirm` but
+does not match exactly is answered as an error and never reaches the
+model either.
+
+**Confirm codes (round 6 H3).** The homeserver writes event timestamps and
+can hold a message back, so a message's age proves nothing.
+
+- Anything that lifts a stop, hands back budget or approves a send runs only
+  after `confirm <code>`.
+- The code is random, single-use, and valid for 5 minutes by the bridge's
+  own clock.
+- A code works only once the bridge has delivered the message carrying it,
+  and a later `halt` cancels it.
+- A held-back command can only ever produce a fresh code.
+
+**Reply fallbacks** (quoted `> ` lines) are not stripped. Whether a message
+is a reply comes from the unencrypted wrapper, which the server controls
+(round 6 L3); Element X sends no fallback. An edit marker, from either the
+wrapper or the payload, makes the bridge drop the message. That fails
+closed: the server can make the bridge ignore a message, never act on one.
 
 ### The approval screen
 
 `show draft <id>` reads agentmail-proxy's stored snapshot of the draft once,
 read-only from the `agentmail-state` volume. The snapshot is exactly what a
-send delivers. The bridge has no network path to the gateway, so it does not
-use the `GET /_jill/drafts/<id>/digest` endpoint. The endpoint returns the same snapshot.
+send delivers. The bridge has no network path to the gateway, so it does
+not use the `GET /_jill/drafts/<id>/digest` endpoint. The endpoint returns
+the same snapshot.
 
 - **Fields.** The screen shows every field in `approvals.SENDABLE`: to, cc,
-  bcc, reply_to, subject, in_reply_to, labels, attachments, text and html. It
-  also shows the headers a send adds (`In-Reply-To` and `References`, both
-  from in_reply_to). An absent field reads `(not set)`; an empty one shows `""`.
-- **Escaping.** C0 and C1 control characters show as `\xNN`. Bidi, zero-width
-  and other invisible characters show as `\u{NNNN}`. A backslash shows as
-  `\\`. Body lines start with `| `, so body text cannot pose as a field line
-  or as the hash line.
+  bcc, reply_to, subject, in_reply_to, labels, attachments, text and html.
+  It also shows the headers a send adds (`In-Reply-To` and `References`,
+  both from in_reply_to). An absent field reads `(not set)`; an empty one
+  shows `""`.
+- **Escaping in fields.** In addresses, subject, labels and headers every
+  non-ASCII character shows as `\u{NNNN}`, look-alike letters included
+  (round 6 M3).
+- **Escaping in bodies.** C0 and C1 control characters show as `\xNN`.
+  Bidi, zero-width, non-standard spaces and blank-rendering characters show
+  as `\u{NNNN}`. Runs of spaces show as `\s{N}`, so padding cannot push text
+  onto what looks like a new field. A backslash shows as `\\`. Body lines
+  start with `| `.
+- **Size.** Each body shows its first 2000 characters and its total length.
+  The whole screen fits in one Matrix message, so no part can be withheld.
+  A draft with a longer body, or whose screen would not fit, cannot be
+  approved here.
 - **Attachments.** They show as name, type, size and the sha256 of their
   bytes. A draft with attachments cannot be approved.
-- **The hash.** The last line is `sha256 <hex>`. It is
+- **The code and the hash.** An approvable screen ends with
+  `approve draft <id> <sha256> <code>` and then `sha256 <hex>`, which is
   `approvals.draft_digest` of that one read, the same digest the gateway
   checks at send.
 
-`approve draft <id> <sha256>` never re-reads the draft. It accepts only an
-`(id, sha256)` pair that this bridge showed you in the last hour, without
-attachments, and writes the approval bound to the hash you typed (TTL 15
-minutes, `DRAFT_APPROVAL_TTL`). If Jill changes the draft after you looked,
+`approve draft <id> <sha256> <code>` accepts only a code that this bridge
+printed on a screen for exactly that `(id, sha256)`, under these conditions:
+
+- the bridge delivered that screen;
+- less than 15 minutes have passed;
+- the code has not been used, and an attempt uses it up.
+
+The model never sees bridge screens, so a screen Jill imitates in chat
+carries no valid code (round 6 H2). After `confirm`, the approval is
+written bound to the typed sha256 (TTL 15 minutes, `DRAFT_APPROVAL_TTL`),
+without re-reading the draft. If Jill changes the draft after you looked,
 the gateway's send check fails and the approval is used up.
+
+### Worker isolation
+
+The bridge runs as root with every capability dropped except
+`SETUID`/`SETGID`, with no new privileges and a read-only root (round 6 M4).
+It starts each Python worker as `node` (1000). The kernel switches the
+child's uid before exec, and a non-root process has no capabilities, so the
+worker cannot switch back.
+
+- The bridge state (access token, pickle key, crypto store) is root `0700`.
+  The worker cannot list or read it.
+- The worker keeps its codes and sessions in the separate
+  `matrix-worker-state` volume.
+- Alerts are written through the worker, which owns the spool.
+- The service has `mem_limit` 512m and `pids_limit` 128.
+- PDF parsing happens only in the worker.
+
+`matrix-bridge isolation-check` proves the isolation, and CI runs it in the
+built image.
 
 ## Chat
 

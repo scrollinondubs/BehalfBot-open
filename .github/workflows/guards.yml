@@ -23,8 +23,8 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
       - name: Guard policy unit tests
@@ -37,7 +37,7 @@ jobs:
         run: python3 -m unittest discover -s tests/control -v
       - name: Matrix bridge worker (commands, halt gate, approval screen, approve binding)
         run: python3 -m unittest discover -s tests/bridge -v
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: matrix-bridge/go.mod
           cache-dependency-path: matrix-bridge/go.sum
@@ -59,25 +59,42 @@ jobs:
   matrix-bridge-e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: matrix-bridge/go.mod
           cache-dependency-path: matrix-bridge/go.sum
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
-      - name: Worker dependencies
-        run: pip install "aiohttp>=3.9,<4" "pypdf>=5,<7"
+          python-version: "3.11"
+      - name: Worker dependencies (hash-pinned, as in the image)
+        run: "pip install --require-hashes --no-deps --only-binary=:all: -r bridge/requirements.lock"
       - name: End-to-end against a throwaway homeserver
         run: bash selftest/matrix-bridge-e2e.sh
 
   selftest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build image
         run: docker build -t behalfbot-open:ci .
+      - name: Matrix bridge worker isolation (round 6 M4)
+        # As compose runs it: root with only SETUID/SETGID, no new privileges,
+        # read-only root. The worker uid must not be able to list or read the
+        # bridge state; the bridge must refuse to run the worker as itself.
+        run: |
+          docker run --rm --network none --read-only --user 0:0 --cap-drop ALL \
+            --cap-add SETUID --cap-add SETGID --security-opt no-new-privileges \
+            --tmpfs /tmp -v /state/matrix-bridge \
+            -e BRIDGE_WORKER_UID=1000 -e BRIDGE_WORKER_GID=1000 \
+            -e MATRIX_PRINCIPAL=@s:test.local -e 'MATRIX_JILL_ROOM=!r:test.local' \
+            behalfbot-open:ci /opt/jill/bin/matrix-bridge isolation-check
+          if docker run --rm --network none --read-only --cap-drop ALL --tmpfs /tmp -v /state/matrix-bridge \
+            -e BRIDGE_WORKER_UID=1000 -e BRIDGE_WORKER_GID=1000 \
+            -e MATRIX_PRINCIPAL=@s:test.local -e 'MATRIX_JILL_ROOM=!r:test.local' \
+            behalfbot-open:ci /opt/jill/bin/matrix-bridge isolation-check; then
+            echo "the bridge ran its worker as its own uid"; exit 1
+          fi
       - name: Boot self-test (serve's uid and caps, read-only rootfs, no network)
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \

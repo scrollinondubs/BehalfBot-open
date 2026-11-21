@@ -142,8 +142,9 @@ is administered by someone else, so the bridge trusts it for nothing:
   also fresh, not an edit, and not a replay. Replies are encrypted only to
   those devices.
 - `bridge/matrix_worker.py` - chat policy:
-  commands (`halt`, `resume`, `reset meter [spend]`, `status`, `new`), the
-  halt gate, the draft approval screen (`show draft`, `approve draft`),
+  commands (`halt`, `conserve`, `status`, `new`; `resume`, `unconserve`,
+  `reset meter [spend]` and `approve draft` each need `confirm <code>`), the
+  halt gate, the draft approval screen with one-time codes,
   opencode sessions, and PDF and text extraction from decrypted attachments.
 - Keys, token and pin live in the `matrix-bridge-state` volume, mounted into
   no other service. No server-side key backup.

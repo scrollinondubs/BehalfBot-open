@@ -17,9 +17,9 @@ None of it gives Jill a new secret or a new way out of her container.
 
 ```
 Sean (Matrix control room, NOT encrypted)      Sean (Jill's chat room, E2EE)
-   |  halt / conserve / unconserve /              |  halt / resume / status /
-   |  status / reset meter                        |  reset meter [spend]
-   v                                              v
+   |  halt (no duration), nothing else            |  halt, conserve, status; resume,
+   |                                              |  unconserve, reset meter [spend]
+   v                                              v  each answered by `confirm <code>`
 jill-control  (gateway/control.py)            matrix-bridge (#50, bridge/WIRING.md)
 holds MATRIX_CONTROL_TOKEN                    writes the same flags in control-state
    | writes                ^ reads                 ^ reads          ^ drains
@@ -47,31 +47,47 @@ Send one of these as a whole message. "Where" says which room accepts it:
 
 | Word | Where | Effect |
 |---|---|---|
-| `halt [2h] [reason]` (also `mute`, `silence`) | both | `venice-proxy` refuses every model call, chat included. Heartbeats (if on) are skipped, `critical` too |
-| `resume` (also `unmute`, `unhalt`) | **chat room only** | Clears halt and conservation |
-| `conserve [2h] [reason]` (also `throttle`, `conservation on`) | control room | Heartbeats: only `critical` ones run. Chat is unaffected |
-| `unconserve` (also `conservation off`) | control room | Clears conservation |
-| `status` | both | Reports both flags |
-| `reset meter` | both | Zeroes today's Venice request count and rate window (spend is kept). The request is recorded in control-state; `venice-proxy` applies it once, on its next call |
-| `reset meter spend` | **chat room only** | The same, and also zeroes today's dollar spend |
+| `halt [reason]` (also `mute`, `silence`) | both | `venice-proxy` refuses every model call, chat included. Heartbeats (if on) are skipped, `critical` too. In the control room no duration is accepted |
+| `halt 2h [reason]` | chat room | The same, with an auto-lift |
+| `conserve [2h] [reason]` (also `throttle`, `conservation on`) | chat room | Heartbeats: only `critical` ones run. Chat is unaffected |
+| `status` | chat room | Reports both flags |
+| `resume` (also `unmute`, `unhalt`) | chat room, **then `confirm <code>`** | Clears halt and conservation |
+| `unconserve` (also `conservation off`) | chat room, **then `confirm <code>`** | Clears conservation |
+| `reset meter` | chat room, **then `confirm <code>`** | Zeroes today's Venice request count and rate window (spend is kept). The request is recorded in control-state; `venice-proxy` applies it once, on its next call |
+| `reset meter spend` | chat room, **then `confirm <code>`** | The same, and also zeroes today's dollar spend |
 
-**Why two rooms (#50).** The control room is unencrypted on a homeserver Jill
-does not control, so its admin can forge any message there.
+**The control room only halts (red-team round 6 H4).** It is unencrypted on
+a homeserver Jill does not control, so its admin can forge any message
+there. A forged `halt` only stops Jill, so `halt` with no duration works.
+Everything else, including `status` and a halt with a duration (a forged
+`halt 1m` would otherwise set an auto-lift), is refused with an ack.
 
-- **Stops stay in the control room.** A forged `halt` only stops Jill, so
-  `halt` works there.
-- **Lifts move to the chat room.** The words that lift a stop or hand back
-  budget (`resume`, `reset meter spend`) are refused in the control room,
-  with an ack. They work only in Jill's end-to-end encrypted chat room.
-- **What the chat room requires.** The bridge accepts a message only when it
-  decrypts and comes from a device cross-signed by Sean's pinned key
-  (`bridge/WIRING.md`). In that room every command must be under 10 minutes
-  old; an older one is dropped.
+**A halt only ever tightens**, from either room: it never shortens or lifts
+an existing halt. No auto-lift beats any auto-lift, and a later lift beats an
+earlier one. The same holds for `conserve`.
+
+**Lifting needs a challenge (round 6 H3).** The homeserver writes the
+timestamp on every event and can hold one back, so the age of a message
+proves nothing.
+
+- The bridge answers `resume`, `unconserve`, `reset meter [spend]` and
+  `approve draft` with a random code: send `confirm <code>`.
+- The command runs only if the confirm arrives within 5 minutes by the
+  bridge's own clock.
+- A code is single-use, and works only once the bridge has delivered the
+  message carrying it.
+- Any `halt` cancels every command still waiting for its confirm.
+- A held-back `resume`, delivered days later, gets a fresh code and does
+  nothing.
+
+The chat bridge handles commands one at a time, in the order received
+(round 6 M1). It also drops messages more than 10 minutes old, though that
+check rests on the server's timestamp.
 
 - **Duration.** A duration (`30m`, `2h`, `3d`, at least `1m`) sets an auto-lift. `halt 0m` is refused with an ack, because it would lift immediately. With no duration the flag stays until `resume`.
 - **Who.** Only `MATRIX_PRINCIPAL` (your full Matrix user id) is obeyed. Display names are never compared.
-- **Ignored entirely:** edits, a control word inside a sentence, and encrypted events.
-- **Age rule (control room).** `halt` and `conserve` are honoured at any age, in the order sent: a late stop is still a stop. `unconserve` and `reset meter` older than 10 minutes are NOT applied, and the room gets an ack saying so; send them again if you still mean them. A stale `status`, `resume` or `reset meter spend` is ignored silently.
+- **Ignored entirely:** edits, a control word inside a sentence, and encrypted events in the control room.
+- **Age rule (control room).** A `halt` is honoured at any age: a late stop is still a stop. Refusals of other words older than 10 minutes are silent.
 
 **Break-glass resume (host only).** There is no Matrix path to `resume`
 other than the encrypted chat room (Sean, 2026-11-21). If the bridge is
@@ -90,7 +106,8 @@ purpose: a message starting with `halt`, `mute` or `silence` halts Jill
 **What halt does not stop:** a tool call already executing finishes. Both
 rooms keep listening, so `resume` (in the chat room) still works. While
 halted, the chat bridge answers every non-command message with a refusal
-and sends nothing to the model.
+and sends nothing to the model. A model reply that finishes after a halt is
+discarded, not delivered.
 
 **Fail-closed rules**
 
@@ -158,7 +175,7 @@ All of Jill's spend goes through `venice-proxy`, so the ceiling lives there:
 
 - `reset meter` clears today's request count and the rate window. Spend is kept.
 - `reset meter spend` also clears today's dollar spend.
-- Both are keyed on the Matrix event's own time, so a replayed message changes nothing.
+- Both run only after `confirm <code>`, and are keyed on the bridge's clock at confirmation. A code is single-use, so a replayed confirm changes nothing.
 
 **Allowed models.** Prices are list prices seen 2026-11-21, partly from third-party pages; confirm them against venice.ai/pricing. `zai-org-glm-5-1`, `kimi-k2-7-code` and `deepseek-v4-pro` were removed from the allowlist (here and in `opencode.json`), because no price could be sourced with confidence.
 
@@ -170,13 +187,14 @@ Things only a real Venice call can show, to check on the first live calls:
 - [ ] Venice accepts a request carrying both `max_tokens` and `max_completion_tokens`.
 - [ ] Billed prompt tokens stay below request bytes + 4096 (the hold's bound). The tripwire alert fires if not.
 - [ ] Prices in `VENICE_PRICES` match venice.ai/pricing for GLM 5.2 and GLM 5.3 Flash.
-- [ ] `status`, `halt` and `reset meter` round-trip in the control room, and `resume` there is refused with an ack.
+- [ ] `halt` works in the control room; `halt 1m`, `resume`, `status` and `reset meter` there are refused with an ack.
 
 The encrypted chat bridge (#50, `bridge/WIRING.md`):
 
 - [ ] The emoji verification in `matrix-bridge setup` completes with Element X: same seven emoji on both screens, confirmed on both sides, and setup prints `Pinned`. If it cannot complete, use `setup --no-sas` and compare the printed master-key fingerprint with the one Sean's own client shows.
 - [ ] Element X shows Jill as cross-signed (verified, no warning shield) in the room.
-- [ ] A real encrypted round trip: Sean sends a message, the log shows `accept event=...`, Jill replies, and Element X decrypts the reply. Then `halt`, a chat message (refused, no model call in the venice-proxy log), `resume` (lifts it), and `show draft` / `approve draft` on a test draft.
+- [ ] A real encrypted round trip: Sean sends a message, the log shows `accept event=...`, Jill replies, and Element X decrypts the reply. Then `halt`, a chat message (refused, no model call in the venice-proxy log), `resume` then `confirm <code>` (lifts it), and `show draft` / `approve draft <id> <sha> <code>` / `confirm <code>` on a test draft.
+- [ ] `docker compose exec matrix-bridge /opt/jill/bin/matrix-bridge isolation-check` passes on the real host.
 - [ ] A replayed event does nothing. Restart the bridge (`docker compose restart matrix-bridge`): no message is answered twice, and the log shows no new `accept` for old event ids.
 - [ ] A message from a second, non-principal device is dropped. Log in to Sean's account on a new session, do NOT verify it, send a message: the log shows `drop event=... reason=device-not-cross-signed` and Jill does not answer. Then log out that session.
 
@@ -254,7 +272,7 @@ their keys are set.
 2. Create an **unencrypted** room. Invite the bot and yourself, and have the bot join.
 3. In `.env`, set `MATRIX_CONTROL_TOKEN`, `MATRIX_PRINCIPAL` and `MATRIX_CONTROL_ROOM`. Optionally set the `VENICE_*` limits, `CREDENTIAL_EXPECT` and `CREDENTIAL_EXPIRES`.
 4. `docker compose up -d`, then `docker logs behalfbot-jill-control`. It logs `ARMED`, or exactly what is wrong. Until it is armed, `venice-proxy` refuses model calls.
-5. Say `status` in the room.
+5. Say `halt` in the control room to test it, then lift it with `resume` and `confirm <code>` in the chat room.
 
 ## Tests
 
