@@ -736,7 +736,11 @@ async def handle_chat(req, client=None):
         return {"handled": True, "replies": [HALTED_REPLY]}
     if PROVIDER_ID != "venice" or not MODEL_ID:
         return {"handled": True, "replies": ["DEFAULT_MODEL must be a venice/ model (BehalfBot-open#46)."]}
-    import aiohttp
+    try:
+        import aiohttp
+        transport_errors = (aiohttp.ClientError, RuntimeError, OSError)
+    except ImportError:  # only the unit tests run without it
+        transport_errors = (RuntimeError, OSError)
     text = normalise(req)
     blocks, notes, fatal = gather_documents(req.get("attachments") or [])
     if fatal:
@@ -756,7 +760,7 @@ async def handle_chat(req, client=None):
         reply = await client.prompt(sid, (SECURITY_PREAMBLE + body) if is_new else body)
     except asyncio.TimeoutError:
         return {"handled": True, "replies": ["The model timed out ({}s). Try again or say `new`.".format(int(HTTP_TIMEOUT))]}
-    except (aiohttp.ClientError, RuntimeError, OSError) as exc:
+    except transport_errors as exc:
         log.warning("opencode error: %s", type(exc).__name__)
         if not await client.health():
             return {"handled": True, "replies": ["opencode server is unreachable - is the stack running?"]}
