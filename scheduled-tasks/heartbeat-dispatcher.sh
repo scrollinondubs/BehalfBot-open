@@ -281,6 +281,7 @@ _state_lock_acquire() {
                 continue
             fi
         elif ! kill -0 "$holder" 2>/dev/null; then
+            log "WARNING state lock held by dead holder pid $holder - recovered"
             rm -f "$lock_dir/pid" 2>/dev/null || true
             rmdir "$lock_dir" 2>/dev/null || true
             continue
@@ -317,7 +318,7 @@ _state_update() {
         mv "$tmp" "$STATE_FILE"
     else
         rm -f "$tmp"
-        log "WARNING a state update produced no valid JSON object - discarded"
+        log "WARNING a state update produced no valid JSON object - discarded (jq exit or empty output)"
     fi
     _state_lock_release
 }
