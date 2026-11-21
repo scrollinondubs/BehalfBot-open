@@ -346,6 +346,7 @@ func (b *Bridge) onDecrypted(ctx context.Context, evt *event.Event) {
 			return VerifyPrincipalDevice(raw, b.cfg.Principal, b.pin.MasterKey, dev.DeviceID, dev.SigningKey, dev.IdentityKey)
 		},
 		IndexKnown: refOK && dev != nil,
+		IsHalt:     haltReq != nil,
 		Late:       func() bool { return b.index.Late(key, ref.index) },
 		Claim:      func() (bool, error) { return b.handled.Claim(evt.ID) },
 	}

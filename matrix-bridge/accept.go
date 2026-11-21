@@ -69,6 +69,9 @@ type Inbound struct {
 	// already accepted from the same session (round 6b N2).
 	IndexKnown bool
 	Late       func() bool
+	// IsHalt: a halt is honoured even when it arrives late, because a late
+	// stop is still a stop (round 6b R4-1).
+	IsHalt bool
 	// Claim records the event id as handled and reports whether it was new.
 	// Persisted, so a replay across restarts is refused.
 	Claim func() (bool, error)
@@ -138,7 +141,7 @@ func Accept(in Inbound) string {
 	if !in.IndexKnown {
 		return ReasonNoIndex
 	}
-	if in.Late != nil && in.Late() {
+	if !in.IsHalt && in.Late != nil && in.Late() {
 		return ReasonLate
 	}
 	if in.Claim == nil {

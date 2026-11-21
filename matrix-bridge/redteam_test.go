@@ -653,6 +653,7 @@ func n2(t *testing.T, tag string, restart bool) {
 
 	// The server holds both back; Sean sent the first one first.
 	hold.Store(true)
+	lateHalt := e.say(t, ctx, e.sean, e.jillID.String()+": halt")
 	older := e.say(t, ctx, e.sean, "yes, go ahead and do it")
 	newer := e.say(t, ctx, e.sean, "what is on my calendar today")
 	time.Sleep(3 * time.Second) // the room key reaches the bridge by to-device
@@ -699,4 +700,13 @@ func n2(t *testing.T, tag string, restart bool) {
 	if e.sean.find("stub-reply: yes, go ahead") != "" {
 		t.Fatal("the late message reached the model")
 	}
+	// R4-1: a late halt, even mention-prefixed, is still honoured.
+	deliver(target, lateHalt)
+	if !e.waitLog(t, 30*time.Second, "accept event="+lateHalt.String()) {
+		t.Fatal("FIX REGRESSED (round 6b R4-1): a late halt was dropped")
+	}
+	waitUntil(t, 30*time.Second, "the halt flag", func() bool {
+		data, _ := os.ReadFile(filepath.Join(e.work, "control", "halt.json"))
+		return strings.Contains(string(data), `"enabled": true`)
+	})
 }

@@ -46,7 +46,7 @@ with the event id and the reason, never the content:
 | under 10 minutes old, and not more than 1 minute in the future, checked after decryption | `stale`, `future-timestamp` |
 | the principal's master key equals the pin (a fresh `/keys/query`) | `identity-changed` |
 | the device is signed by a self-signing key that the pinned master key signed, and the device's own keys match the keys that encrypted the event | `device-not-cross-signed` |
-| no newer message from the same Megolm session was accepted before it (persisted per session; round 6b N2) | `late-delivery`, and a `[bridge]` notice quoting its first 40 characters |
+| no newer message from the same Megolm session was accepted before it (persisted per session; round 6b N2). A `halt` is exempt: a late stop is still a stop (R4-1) | `late-delivery`, and a `[bridge]` notice quoting its first 40 characters |
 | the event id was never handled before (persisted, so it survives restarts) | `replay` |
 
 Megolm's own message-index check, also persisted in the crypto store, refuses

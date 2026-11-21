@@ -59,6 +59,10 @@ func TestAcceptRules(t *testing.T) {
 		{"replay", func(in *Inbound) { in.Claim = func() (bool, error) { return false, nil } }, ReasonReplay},
 		{"late delivery (older Megolm index)", func(in *Inbound) { in.Late = func() bool { return true } }, ReasonLate},
 		{"Megolm index not recorded", func(in *Inbound) { in.IndexKnown = false }, ReasonNoIndex},
+		{"late halt is still honoured (R4-1)", func(in *Inbound) {
+			in.IsHalt = true
+			in.Late = func() bool { return true }
+		}, ReasonAccepted},
 		{"replay store error", func(in *Inbound) { in.Claim = func() (bool, error) { return false, errors.New("disk") } }, ReasonCheckError},
 	}
 	for _, c := range cases {
@@ -241,6 +245,12 @@ func TestIndexStoreLateDeliveryAcrossRestart(t *testing.T) {
 	}
 	if !s.Late(k, 4) {
 		t.Fatal("index 4 after 5 must be late")
+	}
+	if err := s.Accept(k, 2); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Late(k, 4) {
+		t.Fatal("accepting a late halt's lower index must not move the high-water mark back (R4-1)")
 	}
 	if s.Late(k, 5) || s.Late(k, 6) {
 		t.Fatal("equal (replay, caught by the event id) or newer must not count as late")
