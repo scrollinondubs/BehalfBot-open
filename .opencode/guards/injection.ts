@@ -210,8 +210,13 @@ export function scanText(raw: string): ScanResult {
 // Which tool output is ingest, and where it came from
 // ---------------------------------------------------------------------------
 
-/** Tools whose output the harness writes itself, not outside content. */
-export const UNSCANNED_TOOLS = new Set(["write", "edit", "apply_patch", "patch", "todowrite", "todoread", "invalid"])
+/**
+ * Tools whose output the harness writes itself, not outside content. `skill`
+ * returns a SKILL.md from the image's read-only .opencode/skills (external
+ * skills are disabled), so wrapping it would tell Jill not to follow her own
+ * skills.
+ */
+export const UNSCANNED_TOOLS = new Set(["write", "edit", "apply_patch", "patch", "todowrite", "todoread", "invalid", "skill"])
 
 export const SOURCES = ["web", "email", "siyuan", "search", "document", "memory", "shell", "subagent", "other"] as const
 export type Source = (typeof SOURCES)[number]

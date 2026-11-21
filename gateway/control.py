@@ -599,12 +599,17 @@ class Control:
         d = self.cfg.get("scan_dir")
         if not d:
             return False
+        names = []
         try:
-            names = os.listdir(d)
+            with os.scandir(d) as it:
+                for entry in it:
+                    names.append(entry.name)
+                    if len(names) >= MAX_SCAN_ENTRIES:
+                        break
         except OSError as exc:
             log("WARN: cannot list the scan-alert dir: %s" % exc)
             return False
-        for name in names[:MAX_SCAN_ENTRIES]:
+        for name in names:
             path = os.path.join(d, name)
             rec, ok = flags.read(path)
             if ok and rec.get("kind") == "injection-scan" and set(rec) == {"kind", "severity", "source"} \

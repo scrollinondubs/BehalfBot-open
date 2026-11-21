@@ -62,7 +62,8 @@
 #             alert files to scan-alerts, the ONE volume serve shares with
 #             jill-control. The model can write it too (same uid), so
 #             jill-control posts nothing from it: fixed enums only, bucketed
-#             counts, a cooldown. A 1 MB tmpfs, so it cannot fill a disk.
+#             counts, a cooldown. A 1 MB, 256-inode tmpfs, so it cannot
+#             fill a disk or grow a listing without bound.
 #
 #   Matrix (E2EE) -> matrix-bridge -> api-proxy -> opencode-serve -> venice-proxy -> Venice
 #                                                    -> agentmail-proxy -> AgentMail
@@ -545,7 +546,7 @@ volumes:
     driver_opts:
       type: tmpfs
       device: tmpfs
-      o: "size=1m,uid=1000,gid=1000,mode=0700"
+      o: "size=1m,nr_inodes=256,uid=1000,gid=1000,mode=0700"
   cred-venice:      # status-only credential probe result, venice-proxy writes
   cred-agentmail:   # ... agentmail-proxy writes
   cred-siyuan:      # ... siyuan-proxy writes

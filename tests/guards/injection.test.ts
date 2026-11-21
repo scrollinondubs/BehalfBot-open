@@ -122,6 +122,16 @@ for (const [label, text] of BENIGN) {
   })
 }
 
+test("Jill's own instruction surfaces scan clean (a LOW hit would quarantine them)", () => {
+  const walk = (p: string): string[] =>
+    fs.statSync(p).isDirectory() ? fs.readdirSync(p).flatMap((n) => walk(path.join(p, n))) : [p]
+  const files = [".opencode/skills", ".opencode/agents", ".opencode/instructions", "AGENTS.md"]
+    .flatMap((r) => walk(path.join(REPO, r)))
+    .filter((f) => f.endsWith(".md"))
+  assert.ok(files.length > 5)
+  for (const f of files) assert.equal(scanText(fs.readFileSync(f, "utf8")), null, `${path.relative(REPO, f)} trips the scanner`)
+})
+
 test("this repo's own security writing is never HIGH", () => {
   for (const f of ["AGENTS.md", "docs/control.md", "SECURITY.md", "README.md", "bridge/WIRING.md"]) {
     const p = path.join(REPO, f)
@@ -256,6 +266,7 @@ test("fail closed: a non-image attachment is withheld, an image is kept", () => 
 test("harness-written tools are not scanned; undefined output is clean", () => {
   const out = { title: "", output: PAYLOAD, metadata: {} }
   assert.equal(handleToolOutput("write", { filePath: "/workspace/a" }, out).status, "skipped")
+  assert.equal(handleToolOutput("skill", { name: "brand-voice" }, out).status, "skipped")
   assert.equal(out.output, PAYLOAD)
   assert.equal(handleToolOutput("task", {}, undefined).status, "clean")
 })
