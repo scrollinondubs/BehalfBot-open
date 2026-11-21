@@ -487,3 +487,22 @@ test("/state is off limits to tool shells (red-team round 7 H3)", () => {
   denied(["chmod 000 /state/scan-alerts", "ls /state/scan-alerts", "touch /state/scan-alerts/x", "cd /state && ls"], "state")
   allowed(["ls /workspace/state", "echo restate/x"], "state look-alikes")
 })
+
+test("/proc in every spelling red-team round 7 round 3 used is denied (R3-1, R3-2)", () => {
+  denied(
+    [
+      "d=/pro; for p in ${d}c/[0-9]*; do tr a-z n-za-m < $p/en?iron; done",
+      "d=/pro; for p in ${d}c/[0-9]*; do cat $p/cmdl?ne; done",
+      "cat /proc/1/cmdline",
+      "ls /proc",
+      "cat /pr''oc/self/environ",
+      "f=/p\"\"roc; ls $f",
+      "tr '\\0' '\\n' < /p*/1/environ",
+      "for f in /x/[0-9]*/env*ron; do cat $f; done",
+      "cat /x/1/envi[r]on",
+      "d=/sta; cd ${d}te/scan-alerts && touch x",
+    ],
+    "proc and state spellings",
+  )
+  allowed(["ls /workspace/projects", "cat /workspace/process.md", "echo the environment is fine", "ls /workspace/static"], "look-alikes")
+})

@@ -90,6 +90,10 @@ perm = c.get("permission", {})
 ok = c.get("lsp") is False and c.get("formatter") is False and perm.get("webfetch") == "deny" and perm.get("websearch") == "deny"
 sys.exit(0 if ok else 1)
 PY
+# SELFTEST_CANARY_TOKEN is given to opencode alone (through env, after
+# timeout), so the only processes holding it are the server and its MCP
+# children, which are non-dumpable: no tool shell may read it from /proc
+# (red-team round 7 R3-1; see p_write_script).
 # The containment checks, run directly as a tool shell would run them, so a
 # failure names the check (names only, never what was read).
 contain_out=$(/opt/jill/bin/bash /app/selftest/contain.sh 2>/dev/null)
@@ -166,9 +170,8 @@ EOF
     OPENCODE_CONFIG_CONTENT="$config" \
     OPENCODE_DISABLE_MODELS_FETCH=1 \
     XDG_DATA_HOME="$WORK/data" XDG_STATE_HOME="$WORK/state" XDG_CACHE_HOME="$WORK/cache" \
-    SELFTEST_CANARY_TOKEN=present \
     INJECTION_ALERT_DIR="$SCAN_ALERTS" \
-    timeout 180 "$OPENCODE_BIN" run --auto --format json --model selftest/mock "$PARENT_PROMPT" \
+    timeout 180 env SELFTEST_CANARY_TOKEN=present "$OPENCODE_BIN" run --auto --format json --model selftest/mock "$PARENT_PROMPT" \
       > "$WORK/events-$port.jsonl" 2> "$WORK/stderr.log"
   ) || say "opencode run from $dir exited non-zero (judged on the recorded results below)"
   kill "$mock" 2>/dev/null

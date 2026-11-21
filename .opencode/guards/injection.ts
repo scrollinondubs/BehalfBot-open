@@ -614,11 +614,11 @@ export function scanMessages(messages: unknown, state: TransformState, deps: Dep
         if (meta && typeof meta.output === "string") meta.output = process("m:" + id, meta.output, source)
       } else if (role === "user" && part.type === "text" && typeof part.text === "string" && part.text.includes("===== BEGIN UNTRUSTED DOCUMENT:")) {
         let n = 0
-        part.text = part.text.replace(DOC_BLOCK, (_all, head: string, body: string, tail: string) => {
-          const key = "d:" + id + ":" + n++
-          const done = state.done.get(key)
-          return head + (done !== undefined && done === body ? body : process(key, body, "document")) + tail
-        })
+        // The whole block, header and footer included: an uploaded file's
+        // NAME can carry a payload too (red-team round 7 R3-3).
+        if (state.done.get("t:" + id) === part.text) continue
+        part.text = part.text.replace(DOC_BLOCK, (all: string) => process("d:" + id + ":" + n++, all, "document"))
+        state.done.set("t:" + id, part.text as string)
       }
     }
   }

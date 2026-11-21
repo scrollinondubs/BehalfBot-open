@@ -415,9 +415,29 @@ export function isSecretVarName(name: string): boolean {
   return SECRET_VAR.test(name)
 }
 
+/**
+ * /proc, and the spellings that assemble it (red-team round 7 R3-1, R3-2):
+ * `d=/pro; ${d}c/...`, `/pr''oc`, `en?iron`, `cmdl?ne`, `envi[r]on`. A text
+ * rule cannot see through every expansion, so the server is also made
+ * non-dumpable (guards/nodump.ts), which is what actually keeps its
+ * environment unreadable; this rule gives the model an early, clear no.
+ */
+const PROC_PATH = /\/pro(?:c\b|[^a-z0-9_]|$)|\/pr(?:o)?['"\\$*?[{]|\/p['"\\$*?[{]/i
+const WILD_NAME = /[e?*][n?*][v?*][i?*][r?*][o?*][n?*]|[c?*][m?*][d?*][l?*][i?*][n?*][e?*]/gi
+
+export function procDenied(cmd: string): boolean {
+  if (PROC_PATH.test(cmd)) return true
+  const flat = cmd.replace(/\[(\w)\]/g, "$1")
+  for (const m of flat.matchAll(WILD_NAME)) {
+    if (/[?*]/.test(m[0])) return true
+    if (!cmd.toLowerCase().includes(m[0].toLowerCase())) return true // spelled with [x] classes
+  }
+  return false
+}
+
 function secretBashDenied(cmd: string): string | null {
-  if (/\/proc\b/.test(cmd) && /envi|cmdl|\/proc\/[^\s]*[*?[]/.test(cmd))
-    return deny("secret-print-guard: reading another process's environment or command line prints its secrets. Name the one variable you need instead.")
+  if (procDenied(cmd))
+    return deny("secret-print-guard: /proc is off limits to tools (another process's environment or command line prints its secrets). Name the one variable you need instead.")
   for (const seg of segments(cmd, true)) {
     const s = seg
     const pipes = pipeline(s)
@@ -874,7 +894,7 @@ export function bashDenied(cmd: string, ctx: GuardContext, depth = 0): string | 
     const cw = commandWord(tokens(seg))
     if (cw && MAIL_CLIS.has(cw.word)) return deny("Blocked: sending email via a CLI mailer is not allowed.")
   }
-  if (/(^|[\s'"=:<>(])\/state(\/|\b)/.test(cmd))
+  if (/(^|[\s'"=:<>(])\/state(\/|\b)/.test(cmd) || /\/sta(?:[^a-z0-9_]|$)|\/st['"\\$*?[{]/i.test(cmd))
     return deny("Blocked: /state holds the scanner's alert path and other control state. No tool touches it.")
   if (SQL_DESTRUCTIVE.test(cmd) && !PREVIEW_DB.test(cmd))
     return deny("Blocked: destructive SQL operation detected. Schema changes require Sean's approval.")

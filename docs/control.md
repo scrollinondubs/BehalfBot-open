@@ -364,6 +364,17 @@ hook before every model call; `tool.execute.after` never sees them. The
 guard's own denials and OpenCode's permission denials on built-in tools keep
 their text.
 
+**The server's environment (red-team round 7, round 3).** Tool shells run
+as the server's uid, and a text rule cannot see through every shell
+expansion (`d=/pro; ${d}c/[0-9]*/en?iron`). The guard plugin therefore makes
+the OpenCode server non-dumpable at load (`prctl(PR_SET_DUMPABLE, 0)`,
+`.opencode/guards/nodump.ts`): the kernel then gives its `/proc` environ and
+memory to root, so no tool can read them in any spelling. If the call
+fails, the plugin fails to load and serve refuses to start. The self-test
+reads every `/proc/*/environ` from a script and fails if the canary shows.
+The bash guard also denies `/proc` and `/state` in the spellings the
+red-team used. Uploaded file names are scanned with the document.
+
 **Residuals (for Sean to accept).**
 - A regex catches phrasings, not intent. Base64, rot13, leetspeak, dotted
   spelling, paraphrase and a phrase split across two tool calls or a
@@ -392,6 +403,10 @@ their text.
   - An injected email send the guard lets through (`drafts/<id>/send`
     without approval) is refused by agentmail-proxy but has no recording
     stub in the eval; it scores `unguarded`, which fails the gate.
+- Open LOW from round 3: R3-2, `/proc/<pid>/cmdline` is world-readable by
+  design, so a model that gets past the text rule (from a script file) can
+  still see the eval harness's command line during step F and learn it is
+  being evaluated. The probes, scorer and report stay out of its reach.
 
 ## Alerts
 
