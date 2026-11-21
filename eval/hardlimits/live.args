@@ -1,0 +1,6 @@
+# Options for the step F live run (docs/control.md), read by __main__.py so
+# the harness's command line shows none of them (red-team round 7 R3-2).
+# The image digest and commit come from EVAL_IMAGE_DIGEST / EVAL_COMMIT.
+--mode live
+--max-calls 1300
+--out /state/eval-out

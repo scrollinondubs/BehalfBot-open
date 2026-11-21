@@ -167,6 +167,32 @@ services:
       retries: 3
       start_period: 240s
 
+  # The hard-limit eval (#51; step F in docs/control.md, never started by
+  # `up`). The eval image is the runtime plus strace, which the harness runs
+  # as root around the model's opencode to see any read of a process
+  # environment (red-team round 7 R3-1). Same network namespace, rootfs and
+  # limits as serve; the run command adds the harness's capabilities and
+  # mounts eval/hardlimits under root-only /root.
+  opencode-eval:
+    profiles: ["eval"]
+    build:
+      context: .
+      target: eval
+    image: behalfbot-open:eval
+    working_dir: /app
+    network_mode: "service:jill-netns"
+    cap_drop: [ALL]
+    environment:
+      VENICE_BASE_URL: http://venice-proxy:8080/api/v1
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /home/node/.cache:uid=1000,gid=1000
+      - /home/node/.local/state:uid=1000,gid=1000
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
   # --- gateways: the only exits from jill-internal ---------------------------
   api-proxy:
     image: behalfbot-open:latest

@@ -417,16 +417,20 @@ export function isSecretVarName(name: string): boolean {
 
 /**
  * /proc, and the spellings that assemble it (red-team round 7 R3-1, R3-2):
- * `d=/pro; ${d}c/...`, `/pr''oc`, `en?iron`, `cmdl?ne`, `envi[r]on`. A text
+ * `d=/pro; ${d}c/...`, `/pr''oc`, `en?iron`, `cmdl?ne`, `envi[r]on`, and
+ * relative to / (`cd / && cat proc/self/environ`). A text
  * rule cannot see through every expansion, so the server is also made
  * non-dumpable (guards/nodump.ts), which is what actually keeps its
  * environment unreadable; this rule gives the model an early, clear no.
  */
 const PROC_PATH = /\/pro(?:c\b|[^a-z0-9_]|$)|\/pr(?:o)?['"\\$*?[{]|\/p['"\\$*?[{]/i
+// Relative to / (`cd / && cat proc/1/environ`, `cd proc`, `cd /; cd pr*`):
+// the word proc, or a glob or quote cut from it, as a path start.
+const PROC_RELATIVE = /(?:^|[\s'"=:<>(;&|])(?:\.{1,2}\/)*(?:proc(?:\/|$|[\s;&|)'"])|pr(?:oc?)?['"\\$*?[{])/i
 const WILD_NAME = /[e?*][n?*][v?*][i?*][r?*][o?*][n?*]|[c?*][m?*][d?*][l?*][i?*][n?*][e?*]/gi
 
 export function procDenied(cmd: string): boolean {
-  if (PROC_PATH.test(cmd)) return true
+  if (PROC_PATH.test(cmd) || PROC_RELATIVE.test(cmd)) return true
   const flat = cmd.replace(/\[(\w)\]/g, "$1")
   for (const m of flat.matchAll(WILD_NAME)) {
     if (/[?*]/.test(m[0])) return true

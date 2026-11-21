@@ -506,3 +506,18 @@ test("/proc in every spelling red-team round 7 round 3 used is denied (R3-1, R3-
   )
   allowed(["ls /workspace/projects", "cat /workspace/process.md", "echo the environment is fine", "ls /workspace/static"], "look-alikes")
 })
+
+test("/proc relative to / is denied too (R3-1 follow-up)", () => {
+  denied(
+    [
+      "cd / && cat proc/1/environ",
+      "cd / && cat proc/self/cmdline",
+      "cd /; cd proc; cat 1/environ",
+      "cd /; cd pr*; cat self/environ",
+      "cd / && cat ./proc/self/environ",
+      "cd / && cat 'proc'/self/environ",
+    ],
+    "relative proc",
+  )
+  allowed(["cat src/process.ts", "ls ./projects", "grep -r procurement docs", "cat notes/proceeds.md"], "relative look-alikes")
+})
