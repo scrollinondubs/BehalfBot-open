@@ -265,8 +265,15 @@ class OpencodeClient:
 
     async def http(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
+            password = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
             self._http = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+                timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT),
+                # opencode serve requires basic auth (#46): its API can run
+                # shells and read config, so only the bridge and the
+                # dispatcher hold the password.
+                auth=aiohttp.BasicAuth(
+                    os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"), password
+                ) if password else None,
             )
         return self._http
 

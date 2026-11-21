@@ -33,6 +33,8 @@ APP="$(cd "$HERE/.." && pwd)"
 OPENCODE_BIN="${OPENCODE_BIN:-opencode}"
 PORT="${SELFTEST_PORT:-39181}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/guard-selftest.XXXXXX")"
+# Tool shells (node) must be able to enter the session directories.
+chmod 755 "$WORK"
 FIXTURE=/tmp/selftest-fixture
 fail=0
 
@@ -46,21 +48,41 @@ cleanup() {
 trap cleanup EXIT
 
 # --- 1. static checks ------------------------------------------------------
-if [[ "$(id -u)" == 0 ]]; then
-  bad "running as root; the guards assume the unprivileged node user"
+# The server runs as root with ONLY CAP_KILL, CAP_SETGID, CAP_SETUID (0xe0)
+# and no_new_privs: no DAC_OVERRIDE, so it cannot write the nobody-owned app
+# tree either. Tool commands drop to node through /opt/jill/bin/bash.
+if [[ "$(id -u)" != 0 ]]; then
+  bad "the server must start as root (cap-dropped) so tool shells can drop to node"
 fi
+capeff=$(awk '/^CapEff:/ {print $2}' /proc/self/status)
+[[ "$capeff" == 00000000000000e0 ]] || bad "effective capabilities are $capeff, expected 00000000000000e0 (KILL, SETGID, SETUID only)"
+[[ "$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)" == 1 ]] || bad "no_new_privs is not set"
 for p in "$APP" "$APP/AGENTS.md" "$APP/opencode.json" "$APP/.opencode" "$APP/.opencode/plugins" \
          "$APP/.opencode/plugins/guardrails.ts" "$APP/.opencode/guards" "$APP/.opencode/guards/policy.ts" \
-         "$APP/config" "$APP/config/guards.json" "$APP/selftest" "$HOME" "$HOME/.config" \
-         "$HOME/.config/opencode"; do
+         "$APP/config" "$APP/config/guards.json" "$APP/selftest" "$HOME" \
+         /etc/opencode-xdg /etc/opencode-xdg/opencode /opt/jill/bin/bash; do
   if [[ -e "$p" && -w "$p" ]]; then
-    bad "$p is writable by $(id -un)"
+    bad "$p is writable by the server user"
   fi
 done
+[[ "${OPENCODE_AUTH_CONTENT:-}" == "{}" ]] || bad "OPENCODE_AUTH_CONTENT is not {}; auth.json would be read"
+[[ "${XDG_CONFIG_HOME:-}" == /etc/opencode-xdg ]] || bad "XDG_CONFIG_HOME is not /etc/opencode-xdg"
+# The containment checks, run directly as a tool shell would run them, so a
+# failure names the check (names only, never what was read).
+contain_out=$(/opt/jill/bin/bash /app/selftest/contain.sh 2>/dev/null)
+grep -q '^selftest-ok$' <<<"$contain_out" || bad "contain.sh did not complete under /opt/jill/bin/bash"
+while IFS= read -r line; do
+  [[ "$line" == selftest-escaped:* ]] && bad "containment: ${line#selftest-escaped:}"
+done <<<"$contain_out"
 [[ -r "$APP/config/guards.json" ]] || bad "config/guards.json is not readable"
-if [[ -n "${VENICE_API_KEY:-}" && "${VENICE_API_KEY}" != "${VENICE_KEY_PLACEHOLDER:-held-by-venice-proxy}" ]]; then
-  bad "VENICE_API_KEY in this container is not the proxy placeholder; the real key belongs only in venice-proxy"
-fi
+# No upstream credential may be in this container. Only the API password
+# and the gateway caller tokens are allowed (names printed, never values).
+while IFS= read -r name; do
+  case "$name" in
+    OPENCODE_SERVER_PASSWORD|*_CALLER_TOKEN) ;;
+    *) [[ -n "${!name:-}" ]] && bad "$name is set in the serve container; upstream keys belong only in their gateway" ;;
+  esac
+done < <(compgen -e | grep -E '(^|_)(KEYS?|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|PAT|CREDENTIALS?)(_|$)')
 [[ "${OPENCODE_CONFIG:-}" == "$APP/opencode.json" ]] || bad "OPENCODE_CONFIG is not $APP/opencode.json"
 [[ "${OPENCODE_CONFIG_DIR:-}" == "$APP/.opencode" ]] || bad "OPENCODE_CONFIG_DIR is not $APP/.opencode"
 [[ "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" == 1 ]] || bad "OPENCODE_DISABLE_PROJECT_CONFIG is not 1; config would follow the session directory"
@@ -111,7 +133,7 @@ for dir in "$APP" "$ELSEWHERE"; do
 }
 EOF
 )
-  rm -f /workspace/.selftest-write-check 2>/dev/null
+  rm -f /workspace/.selftest-write-check /workspace/.selftest-exec.sh /workspace/.selftest-link-* /workspace/.selftest-proc-* 2>/dev/null
   mkdir -p "$WORK/data" "$WORK/state" "$WORK/cache"
   (
     cd "$dir" || exit 1
@@ -131,6 +153,9 @@ import json, sys
 cases = json.load(open(sys.argv[1]))
 res = json.load(open(sys.argv[2]))
 bad = 0
+if any(r.get("leak") for r in res.values()):
+    print("[selftest] FAIL a tool result contained the server's password or caller token names")
+    bad += 1
 if any(r.get("canary") for r in res.values()):
     print("[selftest] FAIL a plugin planted in the session directory was LOADED")
     bad += 1
@@ -146,6 +171,9 @@ for scope in ("parent", "child"):
         elif want == "ok":
             ok = r["ok"] and not r["denied"]
             verdict = "ran" if ok else "DID NOT RUN AS EXPECTED"
+        elif want == "contained":
+            ok = r["ok"] and not r.get("escaped") and not r["denied"]
+            verdict = "contained" if ok else ("ESCAPED" if r.get("escaped") else "DID NOT RUN AS EXPECTED")
         elif want == "allowed":
             ok = not r["denied"]
             verdict = "allowed" if ok else "WRONGLY DENIED"
@@ -156,6 +184,7 @@ for scope in ("parent", "child"):
 sys.exit(1 if bad else 0)
 PY
   if [[ -d /workspace ]]; then
+    rm -f /workspace/.selftest-exec.sh /workspace/.selftest-link-* /workspace/.selftest-proc-*
     if [[ -f /workspace/.selftest-write-check ]]; then
       rm -f /workspace/.selftest-write-check
     else
@@ -169,4 +198,4 @@ if [[ "$fail" != 0 ]]; then
   tail -n 20 "$WORK/stderr.log" 2>/dev/null | sed 's/^/[selftest] opencode: /' | cut -c1-300
   exit 1
 fi
-say "all guards denied, in the parent session and in a subagent, from /app and from a hostile directory"
+say "all guards denied and every containment check held, in the parent session and a subagent, from /app and from a hostile directory"

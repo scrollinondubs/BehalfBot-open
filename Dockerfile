@@ -44,34 +44,56 @@ COPY opencode.json AGENTS.md ./
 COPY .opencode/ ./.opencode/
 COPY config/ ./config/
 COPY selftest/ ./selftest/
+COPY gateway/gateway.py ./gateway/gateway.py
+COPY runtime/jill-shell /opt/jill/bin/bash
 COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
 
-# Guard files are ROOT-owned and read-only to the runtime user (#33). The
-# model runs as `node` with bash and file tools; if it could write
-# .opencode/, opencode.json, AGENTS.md or config/ it could rewrite its own
-# guard. So /app and $HOME stay root's, and `node` can write only:
-#   /workspace                          her working files (volume)
-#   /data                               memory + bridge state (volume)
-#   ~/.local/share/opencode             sessions and history (volume)
-#   ~/.local/state, ~/.cache, /tmp      scratch (tmpfs under compose)
-# OpenCode's global config dir (~/.config/opencode) is root's as well: a
-# config or plugin dropped there would load on the next start. The two files
-# OpenCode writes at startup when absent are created here instead.
-RUN git init -q /app \
+# Two identities in opencode-serve (#46 red-team C1/C2/H1/H2/H6):
+#
+#   root, cap-dropped to SETUID/SETGID/KILL, no DAC_OVERRIDE: the OpenCode
+#     server itself. It holds the API password and the Venice caller token,
+#     owns its data dir, and is the only user that can run `opencode`.
+#   node (1000): every bash tool command. /opt/jill/bin/bash (the shell
+#     OpenCode is configured to use) drops to node with an empty environment
+#     before running anything. node cannot read root's /proc/<pid>/environ,
+#     cannot execute or read the opencode binary, and cannot write OpenCode's
+#     data dir (no auth.json poisoning) or any guard file.
+#
+# Ownership, and why:
+#   /app, global config,    uid 65534 (nobody), read-only to everyone: not
+#   /home/node
+#                           even root-without-DAC_OVERRIDE can change them
+#   opencode binaries       root:ocrun 0750; the dispatcher gets group ocrun
+#   /var/lib/opencode       root 0700 (data volume, auth.json, sessions)
+#   /data                   root 0700 (memory MCP, runs as root in serve)
+#   /state/{bridge,dispatcher}  node, for the containers that run as node
+#   /workspace              node:jillwork 2775, root in jillwork, umask 002,
+#                           so files made by the write tool (root) and by
+#                           shell commands (node) are editable by both
+RUN groupadd -g 1500 jillwork && groupadd -g 1600 ocrun \
+    && usermod -aG jillwork node && usermod -aG jillwork root \
+    && git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
     && git -C /app config user.name "Jill" \
     && printf '%s\n' node_modules package.json package-lock.json bun.lock .gitignore > /app/.opencode/.gitignore \
     && git -C /app add -A && git -C /app commit -qm "image snapshot" \
-    && mkdir -p /data /workspace /home/node/.config/opencode \
-        /home/node/.local/share/opencode /home/node/.local/state /home/node/.cache \
-    && cp /app/.opencode/.gitignore /home/node/.config/opencode/.gitignore \
-    && printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /home/node/.config/opencode/opencode.jsonc \
-    && chown -R root:root /app /home/node \
-    && chmod -R u=rwX,go=rX /app /home/node \
-    && chown -R node:node /data /workspace /home/node/.local/share/opencode \
-        /home/node/.local/state /home/node/.cache
+    && mkdir -p /etc/opencode-xdg/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode \
+        /data /workspace /home/node/.local/state /home/node/.cache /state/bridge /state/dispatcher \
+    && cp /app/.opencode/.gitignore /etc/opencode-xdg/opencode/.gitignore \
+    && printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /etc/opencode-xdg/opencode/opencode.jsonc \
+    && chown -R 65534:65534 /app /etc/opencode-xdg \
+    && chmod -R u=rwX,go=rX /app /etc/opencode-xdg /opt/jill \
+    && chmod 0755 /opt/jill/bin/bash \
+    && chown -R 65534:65534 /home/node && chown -R root:root /opt/jill && chmod -R u=rwX,go=rX /home/node \
+    && chmod 0700 /var/lib/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode /data \
+    && chown node:jillwork /workspace && chmod 2775 /workspace \
+    && chown node:node /home/node/.local/state /home/node/.cache /state/bridge /state/dispatcher \
+    && chown -R root:ocrun /usr/local/lib/node_modules/opencode-ai \
+    && chmod -R o-rwx /usr/local/lib/node_modules/opencode-ai
 
-# Non-root from here on. uid/gid 1000, no sudo in the image.
+# Default user for the bridge and dispatcher. opencode-serve runs as root
+# with a reduced capability set (docker-compose.yml) and drops tool commands
+# to node through /opt/jill/bin/bash.
 USER node
 ENV HOME=/home/node \
     npm_config_cache=/tmp/.npm \
@@ -79,7 +101,9 @@ ENV HOME=/home/node \
     OPENCODE_CONFIG_DIR=/app/.opencode \
     OPENCODE_DISABLE_PROJECT_CONFIG=1 \
     OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
-    OPENCODE_DISABLE_CLAUDE_CODE=1
+    OPENCODE_DISABLE_CLAUDE_CODE=1 \
+    OPENCODE_DISABLE_MODELS_FETCH=1 \
+    OPENCODE_AUTH_CONTENT={}
 
 # Config is PINNED to the image, whatever directory a session runs in. By
 # default OpenCode walks up from the session directory loading every
@@ -89,9 +113,10 @@ ENV HOME=/home/node \
 # variables above load only /app's config and plugin dir, and turn off
 # project-level config, .claude/.agents skills and CLAUDE.md discovery.
 # AGENTS.md is listed in opencode.json "instructions" by absolute path.
+# OPENCODE_AUTH_CONTENT={} makes OpenCode ignore auth.json entirely, so no
+# "wellknown" entry can make it fetch remote config or plugins (red-team H1).
 
 EXPOSE 4747
 
-# No default CMD: docker-compose.yml picks the entrypoint per service
-# (opencode serve vs the bridge). Running the bare image does nothing.
-CMD ["node", "-e", "console.error('Use docker compose: opencode-serve / discord-bridge services'); process.exit(64)"]
+# No default CMD: docker-compose.yml picks the entrypoint per service.
+CMD ["node", "-e", "console.error('Use docker compose: see docker-compose.yml services'); process.exit(64)"]

@@ -51,6 +51,10 @@ def record(messages):
                 "denied": "[guardrails]" in body,
                 "ok": "selftest-ok" in body,
                 "canary": "[canary-loaded]" in body,
+                "escaped": "selftest-escaped" in body,
+                # Names only: a server-run file tool that followed a planted
+                # symlink into the server's environment would return these.
+                "leak": "OPENCODE_SERVER_PASSWORD" in body or "CALLER_TOKEN" in body,
             }
     with LOCK:
         tmp = RESULTS_PATH + ".tmp"

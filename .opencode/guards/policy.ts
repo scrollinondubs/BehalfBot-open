@@ -363,6 +363,8 @@ function gitDenied(cmd: string): string | null {
         return deny("Blocked: force-push is prohibited. Use 'git revert' to undo commits safely.")
       if (after.some((t) => /^(main|master)$/.test(t) || /:(refs\/heads\/)?(main|master)$/.test(t)))
         return deny("Blocked: pushing directly to main/master is prohibited. Create a PR instead.")
+      if (after.some((t) => /:\/\//.test(t) || /^[^\s/]+@[^\s/]+:/.test(t) || /^(\.{0,2}\/|\/)/.test(t)))
+        return deny("Blocked: git push to a URL or path remote. Push only to a configured named remote.")
     }
     if (sub === "reset" && rest.includes("--hard"))
       return deny("Blocked: git reset --hard can destroy work. Use 'git stash' or 'git revert' instead.")
@@ -414,7 +416,7 @@ export function isSecretVarName(name: string): boolean {
 }
 
 function secretBashDenied(cmd: string): string | null {
-  if (/\/proc\b/.test(cmd) && /\b(environ|cmdline)\b/.test(cmd))
+  if (/\/proc\b/.test(cmd) && /envi|cmdl|\/proc\/[^\s]*[*?[]/.test(cmd))
     return deny("secret-print-guard: reading another process's environment or command line prints its secrets. Name the one variable you need instead.")
   for (const seg of segments(cmd, true)) {
     const s = seg
@@ -593,7 +595,7 @@ function httpCalls(cmd: string): HttpCall[] {
   return calls
 }
 
-const AGENTMAIL_HOST = /(^|\.)agentmail\.to$/i
+const AGENTMAIL_HOST = /(^|\.)agentmail\.to$|^agentmail-proxy$/i
 const EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g
 
 /** Recipients of an AgentMail send payload, or null when they cannot be read. */
@@ -633,7 +635,18 @@ export function mailRecipients(payloads: string[]): string[] | null {
 }
 
 function agentmailSendDenied(pathname: string, payloads: string[], allowed: string[]): string | null {
-  const p = pathname.toLowerCase()
+  let p = pathname
+  for (let i = 0; i < 5; i++) {
+    let next = p
+    try {
+      next = decodeURIComponent(p)
+    } catch {
+      return deny("Blocked: AgentMail path with malformed percent-encoding.")
+    }
+    if (next === p) break
+    p = next
+  }
+  p = p.toLowerCase()
   if (/\/(reply|reply-all|reply_all|forward)(\/|$)/.test(p) || /\/drafts\/[^/]+\/send(\/|$)/.test(p))
     return deny(
       "Blocked: AgentMail reply, forward and draft-send take their recipients from stored mail, so they cannot be checked. Jill may send only to Sean; anything else stays a draft for him.",
@@ -898,19 +911,25 @@ export function evaluate(tool: string, args: Record<string, unknown>, ctx: Guard
     return null
   }
 
-  if (tool === "read") {
-    const p = str(args.filePath ?? args.file_path)
-    if (isSecretPath(p) || isSecretPath(path.resolve(ctx.directory, p)))
-      return deny(`secret-print-guard: reading ${p} would put secret values in the transcript.`)
-    return null
-  }
-  if (tool === "grep") {
-    const p = str(args.path)
+  // read/grep/glob run inside the SERVER process (root, cap-dropped), not in
+  // the uid-dropped shell, so a symlink a tool shell plants in /workspace
+  // (-> /proc/self/environ, the data dir) would be followed with the
+  // server's rights. Resolve the real target and allow only the app tree
+  // and the writable roots.
+  if (tool === "read" || tool === "grep" || tool === "glob") {
+    const p = str(args.filePath ?? args.file_path ?? args.path)
     const inc = str(args.include)
-    if ((p && isSecretPath(p)) || (inc && /\.env|auth\.json|\.pem|\.key|credentials|environ/.test(inc)))
+    if (tool === "grep" && inc && /\.env|auth\.json|\.pem|\.key|credentials|environ/.test(inc))
       return deny("secret-print-guard: grepping secret-bearing files prints their values.")
-    if (p && /^\/proc(\/|$)/.test(path.resolve(ctx.directory, p)))
-      return deny("secret-print-guard: grepping /proc reads process environments.")
+    if (!p) return null
+    const abs = path.resolve(ctx.directory, p)
+    const real = realish(abs)
+    if (isSecretPath(p) || isSecretPath(abs) || isSecretPath(real))
+      return deny(`secret-print-guard: reading ${p} would put secret values in the transcript.`)
+    const roots = [ctx.appRoot, ...(ctx.config?.writeRoots ?? [])]
+    const under = (x: string) => roots.some((r) => x === r || x.startsWith(r.replace(/\/+$/, "") + "/") || x === realish(r) || x.startsWith(realish(r) + "/"))
+    if (!under(abs) || !under(real))
+      return deny(`Blocked: ${p} resolves to ${real}, outside the readable directories (${roots.join(", ")}).`)
     return null
   }
 
@@ -942,6 +961,6 @@ export function evaluate(tool: string, args: Record<string, unknown>, ctx: Guard
 /** Environment variables blanked in every tool shell (shell.env hook). */
 export function shellEnvOverrides(env: Record<string, string | undefined>): Record<string, string> {
   const out: Record<string, string> = {}
-  for (const k of Object.keys(env)) if (isSecretVarName(k)) out[k] = ""
+  for (const k of Object.keys(env)) if (isSecretVarName(k) || /(^|_)proxy$|^CURL_HOME$|^CURLOPT/i.test(k)) out[k] = ""
   return out
 }

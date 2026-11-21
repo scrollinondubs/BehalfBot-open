@@ -87,7 +87,8 @@ mcp/package.json + lockfile        # MCP servers, exact versions, installed at i
   guards/policy.ts                 # the deny rules: secrets, egress, AgentMail, writes, rm, git
 config/guards.json                 # egress hosts, write roots, AgentMail recipients (read-only in the image)
 selftest/                          # boot self-test: real opencode run against a scripted model
-docker/venice-proxy.conf.template  # sidecar that holds the Venice key
+gateway/gateway.py                 # key-holding egress gateways (Venice, AgentMail, SiYuan, Brave MCP)
+runtime/jill-shell                 # the bash tool's shell: drops every command to uid node, empty env
 tests/                             # unit tests (node --test) and shell tests
   instructions/response-style.md   # loaded via the instructions array
 config/security-allowlist.json     # authorized security-scan targets

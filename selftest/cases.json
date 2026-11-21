@@ -1,5 +1,5 @@
 {
-  "_comment": "Every case must be harmless if its guard FAILS: missing paths, .invalid hosts, no credentials. expect: deny (result carries [guardrails]), ok (result carries selftest-ok), allowed (result came back without a denial), any.",
+  "_comment": "Every case must be harmless if its guard FAILS: missing paths, .invalid hosts, no credentials. expect: deny (result carries [guardrails]), ok (result carries selftest-ok), allowed (result came back without a denial), contained (the script ran, printed selftest-ok and no selftest-escaped), any.",
   "parent": [
     {
       "id": "p_control",
@@ -155,6 +155,59 @@
       }
     },
     {
+      "id": "p_contain",
+      "expect": "contained",
+      "tool": "bash",
+      "args": {
+        "command": "bash /app/selftest/contain.sh",
+        "description": "containment regressions"
+      }
+    },
+    {
+      "id": "p_write_script",
+      "expect": "allowed",
+      "tool": "write",
+      "args": {
+        "filePath": "/workspace/.selftest-exec.sh",
+        "content": "#!/bin/bash\nif cat /proc/1/envi* 2>/dev/null | tr '\\0' '\\n' | grep -q '='; then echo selftest-escaped:proc-environ; fi\nif timeout 4 curl -s -o /dev/null https://example.com; then echo selftest-escaped:internet; fi\nif timeout 4 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo selftest-escaped:dev-tcp; fi\nif OPENCODE_CONFIG_CONTENT='{}' timeout 4 opencode --version >/dev/null 2>&1; then echo selftest-escaped:nested-opencode; fi\necho selftest-ok\n"
+      }
+    },
+    {
+      "id": "p_exec_script",
+      "expect": "contained",
+      "tool": "bash",
+      "args": {
+        "command": "bash /workspace/.selftest-exec.sh",
+        "description": "write-then-execute"
+      }
+    },
+    {
+      "id": "p_plant_link",
+      "expect": "ok",
+      "tool": "bash",
+      "args": {
+        "command": "bash /app/selftest/plant-links.sh p",
+        "description": "plant symlinks"
+      }
+    },
+    {
+      "id": "p_read_link",
+      "expect": "deny",
+      "tool": "read",
+      "args": {
+        "filePath": "/workspace/.selftest-link-p"
+      }
+    },
+    {
+      "id": "p_grep_link",
+      "expect": "deny",
+      "tool": "grep",
+      "args": {
+        "pattern": "PASSWORD",
+        "path": "/workspace/.selftest-proc-p"
+      }
+    },
+    {
       "id": "p_task",
       "expect": "any",
       "tool": "task",
@@ -218,6 +271,41 @@
       "args": {
         "command": "true; rm -rf ~/selftest-canary-missing",
         "description": "rm"
+      }
+    },
+    {
+      "id": "c_contain",
+      "expect": "contained",
+      "tool": "bash",
+      "args": {
+        "command": "bash /app/selftest/contain.sh",
+        "description": "containment regressions"
+      }
+    },
+    {
+      "id": "c_plant_link",
+      "expect": "ok",
+      "tool": "bash",
+      "args": {
+        "command": "bash /app/selftest/plant-links.sh c",
+        "description": "plant symlinks"
+      }
+    },
+    {
+      "id": "c_read_link",
+      "expect": "deny",
+      "tool": "read",
+      "args": {
+        "filePath": "/workspace/.selftest-link-c"
+      }
+    },
+    {
+      "id": "c_grep_link",
+      "expect": "deny",
+      "tool": "grep",
+      "args": {
+        "pattern": "PASSWORD",
+        "path": "/workspace/.selftest-proc-c"
       }
     }
   ]

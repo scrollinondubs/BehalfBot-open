@@ -30,88 +30,151 @@
 # If a host port is ever genuinely needed again, add an auth token FIRST.
 # Removing the publish is the boundary; it is not defence in depth.
 #
+# CONTAINMENT (#46, after the #54 red-team): the model can run arbitrary
+# code as uid node inside opencode-serve, so nothing it must not reach may be
+# reachable from there.
+#
+#   network   opencode-serve is ONLY on `jill-internal` (internal: true): no
+#             route to the internet, no external DNS. Its exits are the
+#             gateway sidecars below, each holding one upstream credential
+#             and enforcing that upstream's policy on the decoded request.
+#   secrets   no upstream key is in opencode-serve at all. It holds only the
+#             API password and per-gateway caller tokens, in the env of a
+#             root process that tool shells (uid node, empty env) cannot read.
+#   uids      the server is root with CAP_SETUID/SETGID/KILL only; every bash
+#             tool command drops to node (runtime/jill-shell). node cannot run
+#             opencode, read /proc/<server>/environ, or write the data dir.
+#
+#   Discord -> discord-bridge -> opencode-serve -> venice-proxy -> Venice
+#                                              -> agentmail-proxy -> AgentMail
+#                                              -> siyuan-proxy -> SiYuan
+#                                              -> brave-proxy -> brave-mcp -> Brave
+#
 # Secrets: compose interpolates ${VARS} from the gitignored .env in this
-# directory. Deliberately NOT `env_file:` on both services - per-service
-# `environment:` blocks mean the serve container never sees the Discord
-# token and the bridge container never sees the Venice key. Least privilege.
-# The Venice key goes only to venice-proxy; opencode-serve gets a placeholder.
+# directory. Per-service `environment:` blocks, never `env_file:`, so each
+# container gets only what it needs. The caller tokens and the API password
+# are random strings generated at install (see .env.example).
 #
 # BRIDGE_DRY_RUN defaults to 1 (bridge validates config + resolves serve,
 # never opens a Discord gateway session - the host bridge holds the single
 # Jill token). docker/cutover.sh flips it to 0 in .env at cutover time.
 
 services:
-  # Holds the Venice key so opencode-serve never does (#46 B): every tool shell
-  # in opencode-serve inherits that container's environment, can read
-  # /proc/1/environ, and can ask the unauthenticated OpenCode API, which
-  # returns provider keys in plain text. None of those can leak a key the
-  # container does not have. Forwards only chat/completions and models.
+  # --- gateways: the only exits from jill-internal ---------------------------
   venice-proxy:
-    image: nginx:1.30.7-alpine@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3
+    image: behalfbot-open:latest
     container_name: behalfbot-venice-proxy
+    command: ["python3", "/app/gateway/gateway.py"]
     environment:
-      VENICE_API_KEY: ${VENICE_API_KEY:?set VENICE_API_KEY in .env}
-      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx/conf.d
-    volumes:
-      - ./docker/venice-proxy.conf.template:/etc/nginx/templates/default.conf.template:ro
-    read_only: true
-    tmpfs:
-      - /etc/nginx/conf.d
-      - /var/cache/nginx
-      - /var/run
-      - /tmp
-    expose:
-      - "8080"
-    networks: [behalfbot]
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
+      GATEWAY_ROUTE: venice
+      UPSTREAM_KEY: ${VENICE_API_KEY:?set VENICE_API_KEY in .env}
+      GATEWAY_CALLER_TOKEN: ${VENICE_CALLER_TOKEN:?set VENICE_CALLER_TOKEN in .env}
+      # Venice "private" inference only; keep in step with opencode.json.
+      VENICE_MODELS: zai-org-glm-5-2,z-ai-glm-5-3-flash,zai-org-glm-5-1,kimi-k2-7-code,deepseek-v4-pro
+    networks: [jill-internal, jill-egress]
+    <<: &gateway
+      read_only: true
+      cap_drop: [ALL]
+      restart: unless-stopped
+      security_opt:
+        - no-new-privileges:true
 
+  agentmail-proxy:
+    image: behalfbot-open:latest
+    container_name: behalfbot-agentmail-proxy
+    command: ["python3", "/app/gateway/gateway.py"]
+    environment:
+      GATEWAY_ROUTE: agentmail
+      UPSTREAM_KEY: ${AGENTMAIL_API_KEY:-}
+      AGENTMAIL_INBOX: ${AGENTMAIL_INBOX:-jill-agent@agentmail.to}
+      # Literal, not from .env: Sean decided Jill sends to him only (#46).
+      AGENTMAIL_RECIPIENTS: sean@grid7.com
+    networks: [jill-internal, jill-egress]
+    <<: *gateway
+
+  siyuan-proxy:
+    image: behalfbot-open:latest
+    container_name: behalfbot-siyuan-proxy
+    command: ["python3", "/app/gateway/gateway.py"]
+    environment:
+      GATEWAY_ROUTE: siyuan
+      UPSTREAM_URL: ${SIYUAN_URL:-}
+      UPSTREAM_KEY: ${SIYUAN_TOKEN:-}
+      GATEWAY_CALLER_TOKEN: ${SIYUAN_CALLER_TOKEN:?set SIYUAN_CALLER_TOKEN in .env}
+    networks: [jill-internal, jill-egress]
+    <<: *gateway
+
+  # Brave's MCP server cannot be pointed at another API host, so it runs here
+  # with the key, on a network opencode-serve is not on, behind brave-proxy.
+  brave-mcp:
+    image: behalfbot-open:latest
+    container_name: behalfbot-brave-mcp
+    command: ["node", "/opt/mcp/node_modules/@brave/brave-search-mcp-server/dist/index.js",
+              "--transport", "http", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+    networks: [jill-brave, jill-egress]
+    <<: *gateway
+
+  brave-proxy:
+    image: behalfbot-open:latest
+    container_name: behalfbot-brave-proxy
+    command: ["python3", "/app/gateway/gateway.py"]
+    environment:
+      GATEWAY_ROUTE: mcp
+      UPSTREAM_URL: http://brave-mcp:8080
+      GATEWAY_CALLER_TOKEN: ${BRAVE_CALLER_TOKEN:?set BRAVE_CALLER_TOKEN in .env}
+    networks: [jill-internal, jill-brave]
+    <<: *gateway
+
+  # --- the model -----------------------------------------------------------
   opencode-serve:
     build: .
     image: behalfbot-open:latest
     container_name: behalfbot-opencode-serve
-    # Runs the guard self-test (selftest/run.sh) first and refuses to serve
-    # if any guard fails to deny, in the parent session or a subagent.
+    # Self-test (guards, containment, subagent, hostile cwd), then serve, then
+    # prove the API refuses callers without the password. See selftest/.
     command: ["bash", "/app/selftest/serve-entrypoint.sh"]
     working_dir: /app
+    user: root
+    group_add: ["1500"]
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, KILL]
     environment:
-      # Not a key. The real one is only in venice-proxy, which swaps it in.
-      VENICE_API_KEY: held-by-venice-proxy
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
+      VENICE_CALLER_TOKEN: ${VENICE_CALLER_TOKEN:?set VENICE_CALLER_TOKEN in .env}
+      SIYUAN_CALLER_TOKEN: ${SIYUAN_CALLER_TOKEN:?set SIYUAN_CALLER_TOKEN in .env}
+      BRAVE_CALLER_TOKEN: ${BRAVE_CALLER_TOKEN:?set BRAVE_CALLER_TOKEN in .env}
       VENICE_BASE_URL: http://venice-proxy:8080/api/v1
       BEHALFBOT_MEMORY_FILE: /data/memory.jsonl
-    # Read-only root filesystem: the guard files, the app tree and OpenCode's
-    # global config dir cannot change at runtime even if a guard is bypassed.
-    # Writable: the volumes below and these tmpfs scratch dirs.
     read_only: true
     tmpfs:
       - /tmp
+      - /var/lib/opencode/state:mode=0700
+      - /var/cache/opencode:mode=0700
       - /home/node/.cache:uid=1000,gid=1000
       - /home/node/.local/state:uid=1000,gid=1000
-    # NO ports: stanza. Deliberate - see the header. The API is reachable only
-    # from inside the `behalfbot` compose network, by service name. Publishing
-    # it to host loopback exposes it to every container on the box via
-    # host.docker.internal, and it has no authentication.
+    # NO ports: stanza. See the header.
     expose:
       - "4747"
     volumes:
-      - opencode-data:/home/node/.local/share/opencode
+      - opencode-data:/var/lib/opencode/data
       - serve-data:/data
       - workspace:/workspace
     depends_on:
       venice-proxy:
         condition: service_started
-    networks: [behalfbot]
+    networks: [jill-internal]
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4747/global/health"]
+      test: ["CMD-SHELL", "curl -fsS -u \"opencode:$$OPENCODE_SERVER_PASSWORD\" http://127.0.0.1:4747/global/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       # The guard self-test runs before serve starts listening.
-      start_period: 180s
+      start_period: 240s
 
   discord-bridge:
     build: .
@@ -124,17 +187,18 @@ services:
       JAX_OPEN_CHANNEL_ID: ${JAX_OPEN_CHANNEL_ID:?set JAX_OPEN_CHANNEL_ID in .env}
       PRINCIPAL_USER_ID: ${PRINCIPAL_USER_ID:?set PRINCIPAL_USER_ID in .env}
       DEFAULT_MODEL: ${DEFAULT_MODEL:-venice/zai-org-glm-5-2}
-      # Service name, not localhost: the bridge reaches serve over the
-      # private compose network.
       OPENCODE_SERVER_URL: http://opencode-serve:4747
-      BRIDGE_SESSIONS_FILE: /data/sessions.json
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
+      BRIDGE_SESSIONS_FILE: /state/bridge/sessions.json
       BRIDGE_DRY_RUN: ${BRIDGE_DRY_RUN:-1}
     volumes:
-      - bridge-state:/data
+      - bridge-state:/state/bridge
     depends_on:
       opencode-serve:
         condition: service_healthy
-    networks: [behalfbot]
+    networks: [jill-internal, jill-egress]
+    read_only: true
+    cap_drop: [ALL]
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -142,8 +206,8 @@ services:
   # Opt-in scheduled-work engine (docs/heartbeat-dispatcher.md). Start with:
   #   cp HEARTBEATS.md.template HEARTBEATS.md   # compose bind-mounts this file
   #   docker compose --profile dispatcher up -d
-  # Runs attach to opencode-serve over the private network, so this container
-  # needs no provider keys of its own (least privilege, same as the bridge).
+  # Runs attach to opencode-serve, so tools run there, inside the containment.
+  # Group ocrun lets this container (and only this one) run the opencode CLI.
   heartbeat-dispatcher:
     build: .
     image: behalfbot-open:latest
@@ -154,10 +218,16 @@ services:
       - -c
       - 'while true; do bash scheduled-tasks/heartbeat-dispatcher.sh || true; sleep "$${DISPATCHER_INTERVAL_SECONDS:-900}"; done'
     working_dir: /app
+    group_add: ["1600"]
     environment:
       BEHALFBOT_HOME: /app
-      BEHALFBOT_STATE_HOME: /data
+      BEHALFBOT_STATE_HOME: /state/dispatcher
+      XDG_DATA_HOME: /state/dispatcher/xdg/data
+      XDG_STATE_HOME: /state/dispatcher/xdg/state
+      XDG_CACHE_HOME: /state/dispatcher/xdg/cache
+      XDG_CONFIG_HOME: /etc/opencode-xdg
       OPENCODE_ATTACH_URL: http://opencode-serve:4747
+      OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
       DISPATCHER_INTERVAL_SECONDS: ${DISPATCHER_INTERVAL_SECONDS:-900}
       HEARTBEAT_MODEL_OPUS: ${HEARTBEAT_MODEL_OPUS:-}
       HEARTBEAT_MODEL_SONNET: ${HEARTBEAT_MODEL_SONNET:-}
@@ -170,22 +240,30 @@ services:
       - ./HEARTBEATS.md:/app/HEARTBEATS.md:ro
       - ./scheduled-tasks:/app/scheduled-tasks:ro
       - ./scripts:/app/scripts:ro
-      - dispatcher-state:/data
+      - dispatcher-state:/state/dispatcher
     depends_on:
       opencode-serve:
         condition: service_healthy
-    networks: [behalfbot]
+    networks: [jill-internal, jill-egress]
+    cap_drop: [ALL]
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
 
 networks:
-  behalfbot:
+  # No route out. opencode-serve is on this network only.
+  jill-internal:
+    internal: true
+  # Ordinary outbound network: gateways, bridge (Discord), dispatcher.
+  jill-egress:
     driver: bridge
+  # brave-proxy <-> brave-mcp only; opencode-serve is not on it.
+  jill-brave:
+    internal: true
 
 volumes:
-  workspace:        # Jill's working files (the only general-purpose writable dir)
-  opencode-data:    # opencode serve state + session history
-  serve-data:       # memory MCP jsonl
-  bridge-state:     # bridge/.sessions.json successor (channel -> session map)
+  workspace:        # Jill's working files (node:jillwork, setgid)
+  opencode-data:    # opencode serve data dir (root 0700): sessions, history
+  serve-data:       # memory MCP jsonl (root 0700)
+  bridge-state:     # bridge channel -> session map
   dispatcher-state: # heartbeat state, logs, telemetry, briefings

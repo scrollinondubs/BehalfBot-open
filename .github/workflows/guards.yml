@@ -30,6 +30,8 @@ jobs:
         run: node --experimental-strip-types --test tests/guards/*.test.ts
       - name: Venice-only model resolution
         run: bash tests/test-resolve-model.sh
+      - name: Gateway policies (decoded paths, model allowlist, recipients, caller auth)
+        run: python3 -m unittest discover -s tests/gateway -v
 
   selftest:
     runs-on: ubuntu-latest
@@ -37,12 +39,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build image
         run: docker build -t behalfbot-open:ci .
-      - name: Boot self-test (read-only rootfs, no network)
+      - name: Boot self-test (serve's uid and caps, read-only rootfs, no network)
         run: |
-          docker run --rm --network none --read-only \
-            --tmpfs /tmp \
+          docker run --rm --network none --read-only --user root --group-add 1500 \
+            --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add KILL \
+            --security-opt no-new-privileges \
+            --tmpfs /tmp --tmpfs /var/lib/opencode/state --tmpfs /var/cache/opencode \
             --tmpfs /home/node/.cache:uid=1000,gid=1000 \
             --tmpfs /home/node/.local/state:uid=1000,gid=1000 \
-            -v /home/node/.local/share/opencode -v /data -v /workspace \
-            -e VENICE_API_KEY=held-by-venice-proxy \
+            -v /var/lib/opencode/data -v /data -v /workspace \
+            -e VENICE_CALLER_TOKEN=ci-caller-token \
+            -e XDG_DATA_HOME=/var/lib/opencode/data -e XDG_STATE_HOME=/var/lib/opencode/state \
+            -e XDG_CACHE_HOME=/var/cache/opencode -e XDG_CONFIG_HOME=/etc/opencode-xdg \
             -w /app behalfbot-open:ci bash /app/selftest/run.sh
