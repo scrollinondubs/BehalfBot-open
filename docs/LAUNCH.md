@@ -1,9 +1,19 @@
 # Launching Jill (step F, #52)
 
 This is the hands-on launch session, in order. Sean runs every step himself,
-signed in as Jill's macOS user, `jillvibe`. Jax has no access to that
-account and never holds Jill's credentials. Every secret goes from 1Password
-straight into a hidden prompt.
+signed in as Jill's macOS user, `jillvibe`. Jax never runs these steps and
+never handles Jill's credentials. Every secret goes from 1Password straight
+into a hidden prompt.
+
+**What the isolation from Jax is, and is not (Sean's decision, 2026-11-21,
+"Path A").** Jill's separation from Jax on this Mac is enforced by rules and
+safety hooks, not by the OS. The kit keeps `.env`, the Colima VM and Jill's
+state readable only by `jillvibe`, and Jax's hooks forbid reaching for them.
+That stops accidents, not a determined admin: on this host Jax owns the
+Homebrew tools `jillvibe` runs, and the Matrix homeserver runs in Jax's
+Docker. Any admin user on this Mac could obtain Jill's credentials. Real OS
+isolation would mean a separate machine and a homeserver Jax does not run
+(red-team round 4, H63-1).
 
 Each step ends with a check. If one fails, stop there. Everything up to the
 eval can be redone, and nothing reaches Jill until step 8 starts the stack.
@@ -30,6 +40,11 @@ eval can be redone, and nothing reaches Jill until step 8 starts the stack.
   in to a second user (fast user switching) is lighter, but pick a time when
   a restart of the other user's agents would not hurt, and do not create or
   delete users during the session.
+- Remove Jax's stale passwordless sudo, as an admin user (it is a
+  leftover named `jax-temp` from Feb 2026; Jax's own scripts only use sudo
+  on BigPoppa over ssh):
+  `sudo rm /etc/sudoers.d/jax-temp`, then check `sudo -l -U jax` shows no
+  `NOPASSWD` entry.
 - Code: Both launch PRs are merged to `main`: the round-3 eval fixes
   (#51) and this runbook (#52).
 - Homebrew tools, system-wide, installed once by an admin user:
@@ -236,6 +251,11 @@ to report healthy. If they do not, it stops the bridge.
 - `docker compose logs matrix-bridge` shows `first sync done`.
 
 Do not talk to Jill yet. Her first real job is the eval.
+
+From here on the stack is live and bridged to Matrix with real keys while the
+eval runs. Jill stays inert (venice-proxy refuses calls until `jill-control`
+is ARMED, heartbeats are off), but a flaw the eval finds is found with Jill
+already wired in. If the eval fails, go to "Halt and rollback".
 
 ## 9. The live eval: the launch gate
 

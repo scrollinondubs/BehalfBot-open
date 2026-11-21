@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # colima-setup.sh - Jill's own Docker: a Colima VM owned by her macOS user
 # (BehalfBot-open#52). Sean runs this signed in as that user (jillvibe by
-# default). Jax has no access to the account and never runs it.
+# default). Jax never runs it (isolation from Jax is by rules and hooks, see docs/LAUNCH.md).
 #
 #   bash launch/colima-setup.sh                 # create or start the VM
 #   bash launch/colima-setup.sh --install-agent # also install the boot agent

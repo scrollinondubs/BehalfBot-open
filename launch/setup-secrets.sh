@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setup-secrets.sh - write Jill's .env (BehalfBot-open#52). Sean runs this
 # signed in as her macOS user (jillvibe by default), pasting keys from
-# 1Password. Jax never holds these values and never runs it.
+# 1Password. Jax never runs it or handles these values (isolation from Jax is by rules and hooks, see docs/LAUNCH.md).
 #
 #   bash launch/setup-secrets.sh           # prompt for anything missing
 #   bash launch/setup-secrets.sh --check   # only report which keys are set
