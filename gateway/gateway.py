@@ -616,6 +616,7 @@ def load_config(env=os.environ):
         "approvals_dir": env.get("APPROVALS_DIR", "/state/approvals"),
         "consumed_dir": os.path.join(env.get("GATEWAY_STATE_DIR", "/state/gateway"), "consumed"),
         "state_dir": env.get("GATEWAY_STATE_DIR", "/state/gateway"),
+        "credential_dir": env.get("CREDENTIAL_STATUS_DIR") or None,
     }
     if name == "venice" and not cfg["models"]:
         raise SystemExit("VENICE_MODELS is required")
@@ -821,11 +822,93 @@ def make_handler(cfg):
     return Handler
 
 
+# --- credential probe (Jill v2 C, #49) -------------------------------------
+#
+# The keys live only in the gateways, so only a gateway can tell whether its
+# key still works. With CREDENTIAL_STATUS_DIR set, a key-holding gateway makes
+# one cheap authenticated call upstream every CREDENTIAL_PROBE_SECONDS and
+# writes a status-only record to <dir>/<route>.json: result, HTTP status and
+# timestamps, never the key or any response body. jill-control reads those
+# records (read-only) and alerts. Nothing Jill sends can trigger a probe.
+
+PROBES = {
+    "venice": ("GET", "/api/v1/api_keys/rate_limits", None),
+    "agentmail": ("GET", "/v0/inboxes/{inbox}", None),
+    "siyuan": ("POST", "/api/notebook/lsNotebooks", {}),
+}
+
+
+def probe_once(cfg, call):
+    """call(method, path, body) -> HTTP status, raising Deny when unreachable."""
+    method, path, body = PROBES[cfg["name"]]
+    try:
+        status = call(method, path.format(inbox=cfg["inbox"]), body)
+    except Deny:
+        return "error", 0
+    if 200 <= status < 300:
+        return "ok", status
+    if status in (401, 403):
+        return "rejected", status
+    return "error", status
+
+
+def write_probe(cfg, result, status, now=None):
+    now = int(now if now is not None else time.time())
+    path = os.path.join(cfg["credential_dir"], cfg["name"] + ".json")
+    try:
+        with open(path) as f:
+            prev = json.load(f)
+        last_ok = prev.get("last_ok_at") if isinstance(prev, dict) else None
+    except (OSError, ValueError):
+        last_ok = None
+    rec = {"route": cfg["name"], "result": result, "http_status": status, "checked_at": now,
+           "last_ok_at": now if result == "ok" else last_ok}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)
+    return rec
+
+
+def probe_loop(cfg, call, interval):
+    while True:
+        result, status = probe_once(cfg, call)
+        try:
+            write_probe(cfg, result, status)
+        except OSError as e:
+            sys.stderr.write(f"[gateway:{cfg['name']}] credential probe could not write its status: {e}\n")
+        sys.stderr.write(f"[gateway:{cfg['name']}] credential probe: {result} {status}\n")
+        time.sleep(interval)
+
+
 def main():
     cfg = load_config()
     host, _, port = os.environ.get("GATEWAY_LISTEN", "0.0.0.0:8080").rpartition(":")
     server = ThreadingHTTPServer((host or "0.0.0.0", int(port)), make_handler(cfg))
     server.daemon_threads = True
+    if cfg["credential_dir"] and cfg["name"] in PROBES:
+        up = cfg["upstream"]
+
+        def call(method, path, body):
+            conn = connect(up, timeout=30)
+            try:
+                payload = json.dumps(body).encode() if body is not None else None
+                headers = {"host": up.netloc, "authorization": cfg["auth"], "accept": "application/json"}
+                if payload is not None:
+                    headers["content-type"] = "application/json"
+                    headers["content-length"] = str(len(payload))
+                conn.request(method, (up.path.rstrip("/") + quote(path, safe="/@:")) or "/", body=payload,
+                             headers=headers)
+                resp = conn.getresponse()
+                resp.read(MAX_BODY)
+                return resp.status
+            except OSError:
+                raise Deny(502, "upstream unreachable")
+            finally:
+                conn.close()
+
+        interval = max(60, int(os.environ.get("CREDENTIAL_PROBE_SECONDS", "3600")))
+        threading.Thread(target=probe_loop, args=(cfg, call, interval), daemon=True).start()
     sys.stderr.write(f"[gateway:{cfg['name']}] listening on {host}:{port}, upstream {cfg['upstream'].netloc}\n")
     server.serve_forever()
 
