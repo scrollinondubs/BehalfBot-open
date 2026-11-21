@@ -287,10 +287,10 @@ _state_lock_acquire() {
         fi
         sleep 0.1
         waited=$((waited + 1))
-        if [[ $waited -ge 100 ]]; then
+        if [[ $waited -ge $(( ${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10} * 10 )) ]]; then
             STATE_LOCK_FAILED=1
-            _state_lock_alert "ERROR state lock held >10s by pid ${holder:-unknown} - write refused; this tick fires nothing more" \
-                "The dispatcher could not take its state lock for 10s, so it refused the write and stopped firing for this tick. Another dispatcher may be running."
+            _state_lock_alert "ERROR state lock held >${DISPATCHER_STATE_LOCK_WAIT_SECONDS:-10}s by pid ${holder:-unknown} - write refused; this tick fires nothing more" \
+                "The dispatcher could not take its state lock in time, so it refused the write and stopped firing for this tick. Another dispatcher may be running."
             return 1
         fi
     done

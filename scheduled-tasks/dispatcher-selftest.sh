@@ -375,9 +375,12 @@ else
 fi
 
 # --- state lock -------------------------------------------------------------
+# 40 writers at once is far past what a tick does; give them time so the
+# test measures lost updates, not the (correct) refusal after the wait.
 new_sandbox state-lock "hb-a|"
 (
     export BEHALFBOT_HOME="$SB/home" BEHALFBOT_STATE_HOME="$SB/state" DISPATCHER_TEST_SOURCE=1
+    export DISPATCHER_STATE_LOCK_WAIT_SECONDS=120
     # shellcheck source=/dev/null
     source "$DISPATCHER"
     init_state
@@ -389,7 +392,9 @@ new_sandbox state-lock "hb-a|"
 )
 lost=$(jq '[range(1;21) as $i | select(.["race-\($i)"].v != "\($i)" or .["count-\($i)"].fire_count != "1")] | length' \
     "$SB/state/scheduled-tasks/heartbeat-state.json" 2>/dev/null || echo 40)
-[[ "$lost" == 0 ]] && ok "state lock: 40 concurrent writes, none lost" || bad "state lock: $lost write(s) lost"
+refused=$(grep -c "write refused" "$SB"/state/logs/scheduled/*-dispatcher.log 2>/dev/null | awk -F: '{s += $NF} END {print s + 0}')
+[[ "$lost" == 0 ]] && ok "state lock: 40 concurrent writes, none lost" \
+    || bad "state lock: $lost write(s) missing ($refused refused after the lock wait, the rest lost)"
 
 # --- live mounts (compose only) ---------------------------------------------
 if [[ "${SELFTEST_LIVE:-0}" == 1 ]]; then
