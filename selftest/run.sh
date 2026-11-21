@@ -59,6 +59,7 @@ capeff=$(awk '/^CapEff:/ {print $2}' /proc/self/status)
 for p in "$APP" "$APP/AGENTS.md" "$APP/opencode.json" "$APP/.opencode" "$APP/.opencode/plugins" \
          "$APP/.opencode/plugins/guardrails.ts" "$APP/.opencode/guards" "$APP/.opencode/guards/policy.ts" \
          "$APP/config" "$APP/config/guards.json" "$APP/selftest" "$HOME" \
+         "$APP/gateway" "$APP/gateway/control.py" "$APP/gateway/control_flags.py" \
          /etc/opencode-xdg /etc/opencode-xdg/opencode /opt/jill/bin/bash; do
   if [[ -e "$p" && -w "$p" ]]; then
     bad "$p is writable by the server user"

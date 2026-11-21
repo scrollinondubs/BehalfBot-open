@@ -30,8 +30,12 @@ jobs:
         run: node --experimental-strip-types --test tests/guards/*.test.ts
       - name: Venice-only model resolution
         run: bash tests/test-resolve-model.sh
-      - name: Gateway policies (decoded paths, model allowlist, recipients, caller auth)
+      - name: Gateway policies (decoded paths, model allowlist, recipients, caller auth, credential probe)
         run: python3 -m unittest discover -s tests/gateway -v
+      - name: Kill switch, alert spool, credential expiry (jill-control vs a fake homeserver)
+        run: python3 -m unittest discover -s tests/control -v
+      - name: Dispatcher controls (halt, caps, spend cap, all-failed alarm, state lock)
+        run: bash scheduled-tasks/dispatcher-selftest.sh
 
   selftest:
     runs-on: ubuntu-latest
@@ -52,3 +56,9 @@ jobs:
             -e XDG_DATA_HOME=/var/lib/opencode/data -e XDG_STATE_HOME=/var/lib/opencode/state \
             -e XDG_CACHE_HOME=/var/cache/opencode -e XDG_CONFIG_HOME=/etc/opencode-xdg \
             -w /app behalfbot-open:ci bash /app/selftest/run.sh
+      - name: Dispatcher self-test inside the image (its bash, jq and coreutils)
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --tmpfs /tmp:exec \
+            -v "$PWD/scheduled-tasks:/app/scheduled-tasks:ro" \
+            -w /app behalfbot-open:ci bash /app/scheduled-tasks/dispatcher-selftest.sh
