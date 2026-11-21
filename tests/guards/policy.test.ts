@@ -482,3 +482,8 @@ test("missing config fails closed for egress and mail", () => {
   const c = { ...ctx, config: null }
   assert.ok(bash("curl -X POST https://api.agentmail.to/v0/inboxes/x/drafts -d '{}'", c))
 })
+
+test("/state is off limits to tool shells (red-team round 7 H3)", () => {
+  denied(["chmod 000 /state/scan-alerts", "ls /state/scan-alerts", "touch /state/scan-alerts/x", "cd /state && ls"], "state")
+  allowed(["ls /workspace/state", "echo restate/x"], "state look-alikes")
+})

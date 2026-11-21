@@ -61,7 +61,9 @@ COPY opencode.json AGENTS.md ./
 COPY .opencode/ ./.opencode/
 COPY config/ ./config/
 COPY selftest/ ./selftest/
-COPY eval/ ./eval/
+# eval/ (the hard-limit eval, #51) is deliberately NOT copied: Jill must not
+# be able to read the probes or the scorer. It is mounted into an eval run
+# only (docs/control.md step F, .github/workflows/guards.yml).
 COPY gateway/gateway.py gateway/approvals.py gateway/control.py gateway/control_flags.py ./gateway/
 COPY runtime/jill-shell /opt/jill/bin/bash
 COPY runtime/setup-netns.sh /opt/jill/bin/setup-netns.sh
@@ -93,9 +95,11 @@ COPY --from=matrix-bridge-build /out/matrix-bridge /opt/jill/bin/matrix-bridge
 #                                     (gid 1000) may reset it
 #   /state/{dispatcher,gateway,approvals,control,alerts,credentials,venice}
 #                                     node, per-container volumes
-#   /state/scan-alerts                node: the injection scanner's content-free
-#                                     alert files (serve writes, jill-control
-#                                     drains; #51)
+#   /state/eval-out                   node, empty: the mount point the step F
+#                                     eval's report volume takes its owner from
+#   /state/scan-alerts                mount point; compose mounts a root:1002
+#                                     mode 1773 tmpfs there (serve creates,
+#                                     jill-control counts and clears; #51)
 RUN git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
     && git -C /app config user.name "Jill" \
@@ -104,7 +108,7 @@ RUN git init -q /app \
     && mkdir -p /etc/opencode-xdg/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode \
         /data /workspace /home/node/.local/state /home/node/.cache \
         /state/matrix-bridge /state/matrix-worker /state/matrix-chat /state/dispatcher /state/gateway /state/approvals \
-        /state/control /state/alerts /state/scan-alerts /state/credentials /state/venice \
+        /state/control /state/alerts /state/scan-alerts /state/eval-out /state/credentials /state/venice \
         /state/credentials/venice /state/credentials/agentmail /state/credentials/siyuan \
     && cp /app/.opencode/.gitignore /etc/opencode-xdg/opencode/.gitignore \
     && printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /etc/opencode-xdg/opencode/opencode.jsonc \

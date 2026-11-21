@@ -93,8 +93,8 @@ if t curl -s http://brave-mcp:8080/mcp; then out brave-mcp-direct; fi
 # live in volumes serve never mounts, behind a sidecar serve cannot reach. If
 # serve could write a flag it could lift its own halt; if it could write the
 # spool, alerts would be an egress path to Sean's homeserver. /state/scan-alerts
-# (#51) is deliberately NOT in this list: serve writes it, and jill-control
-# reads it as fixed enums only, so it carries no text (gateway/control.py).
+# (#51) is deliberately NOT in this list: serve may CREATE files there and
+# nothing else (checked below); jill-control only counts them.
 for d in /state/control /state/alerts /state/credentials /state/credentials/venice \
          /state/credentials/agentmail /state/credentials/siyuan /state/venice; do
   if [ -e "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null | grep -vxE 'venice|agentmail|siyuan')" ]; then
@@ -102,6 +102,13 @@ for d in /state/control /state/alerts /state/credentials /state/credentials/veni
   fi
   if touch "$d/.selftest-write" 2>/dev/null; then rm -f "$d/.selftest-write"; out "control-dir-writable:$d"; fi
 done
+# In the compose stack the scanner's alert dir must be create-only for us
+# (root:1002 1773): no listing, no chmod (red-team round 7 H3).
+if [ -f /tmp/jill-expect-firewall ]; then
+  if [ "$(stat -c %u:%a /state/scan-alerts 2>/dev/null)" != "0:1773" ]; then out scan-alerts-owner-or-mode; fi
+  if ls /state/scan-alerts >/dev/null 2>&1; then out scan-alerts-listable; fi
+  if chmod 700 /state/scan-alerts 2>/dev/null; then out scan-alerts-chmod; fi
+fi
 if t getent hosts jill-control; then out jill-control-resolvable; fi
 if env | cut -d= -f1 | grep -qE '^MATRIX_'; then out env-matrix; fi
 

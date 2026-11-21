@@ -335,8 +335,10 @@ class Alerts(Base):
 
 
 class ScanAlerts(Base):
-    """#51: the scan-alert dir is writable by opencode-serve, so by the model.
-    Nothing from it may reach the room except fixed categories and buckets."""
+    """#51 and red-team round 7 (H3, M5, L5, L6): the scan-alert dir is
+    written by opencode-serve, so by the model. Only a bucketed COUNT may
+    reach the room, silencing must itself alert, and the line has its own
+    budget and survives a restart."""
 
     def setUp(self):
         super().setUp()
@@ -344,73 +346,102 @@ class ScanAlerts(Base):
         os.makedirs(self.scan)
         self.cfg["scan_dir"] = self.scan
         self.cfg["scan_cooldown"] = 900
+        self.cfg["scan_expect"] = {}
         self.now = [1000.0]
         self.ctl.clock = lambda: self.now[0]
 
-    def drop(self, name, obj):
+    def drop(self, name, body=""):
         with open(os.path.join(self.scan, name), "w") as f:
-            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+            f.write(body)
 
-    def test_valid_files_post_one_templated_alert_and_are_deleted(self):
-        self.drop("a.json", {"kind": "injection-scan", "severity": "high", "source": "email"})
-        self.drop("b.json", {"kind": "injection-scan", "severity": "low", "source": "web"})
-        self.drop("c.json", {"kind": "injection-scan", "severity": "low", "source": "web"})
+    def test_entries_are_counted_deleted_and_posted_as_one_fixed_line(self):
+        for i in range(3):
+            self.drop("%d.alert" % i)
         self.assertTrue(self.ctl.drain_scan_alerts())
         self.assertEqual(len(self.hs.sent), 1)
-        body = self.hs.sent[0][1]
-        self.assertIn("HIGH 1", body)
-        self.assertIn("LOW 2-9", body)
-        self.assertIn("sources: web, email", body)
+        self.assertIn("flagged 2-9 item(s)", self.hs.sent[0][1])
         self.assertEqual(os.listdir(self.scan), [])
 
-    def test_no_content_from_a_forged_file_reaches_the_room(self):
+    def test_nothing_model_written_reaches_the_room(self):
         secret = "SEAN-TAX-ID-123456789"
-        self.drop(secret + ".json", {"kind": "injection-scan", "severity": "high", "source": secret})
-        self.drop("x.json", {"kind": "injection-scan", "severity": "high", "source": "web", "text": secret})
-        self.drop("y.json", {"kind": "spend-cap", "text": secret})
-        self.drop("z.json", "not json " + secret)
-        os.makedirs(os.path.join(self.scan, secret))
+        self.drop(secret + ".alert", json.dumps({"kind": "injection-scan", "severity": "high", "source": secret}))
+        self.drop("x", secret)
         self.assertTrue(self.ctl.drain_scan_alerts())
         body = self.hs.sent[0][1]
         self.assertNotIn(secret, body)
-        self.assertIn("malformed alert files 2-9", body)
-        self.assertEqual(os.listdir(self.scan), [])
+        self.assertNotIn("high", body.lower().replace("flagged", ""))
+        self.assertEqual(body, "[Jill] " + c.scan_alert_text(2, False), "the line is fixed apart from the bucket")
 
     def test_counts_are_bucketed(self):
         for i in range(37):
-            self.drop("%d.json" % i, {"kind": "injection-scan", "severity": "low", "source": "shell"})
+            self.drop("%d.alert" % i)
         self.ctl.drain_scan_alerts()
-        self.assertIn("LOW 10+", self.hs.sent[0][1])
+        self.assertIn("flagged 10+ item(s)", self.hs.sent[0][1])
         self.assertNotIn("37", self.hs.sent[0][1])
 
-    def test_cooldown_coalesces_then_posts(self):
-        self.drop("1.json", {"kind": "injection-scan", "severity": "low", "source": "web"})
+    def test_cooldown_coalesces_and_has_a_floor(self):
+        self.drop("1.alert")
         self.assertTrue(self.ctl.drain_scan_alerts())
-        self.now[0] += 60
-        self.drop("2.json", {"kind": "injection-scan", "severity": "error", "source": "siyuan"})
-        self.assertFalse(self.ctl.drain_scan_alerts(), "inside the cooldown nothing is posted")
+        self.cfg["scan_cooldown"] = 60  # below the floor
+        self.now[0] += 120
+        self.drop("2.alert")
+        self.assertFalse(self.ctl.drain_scan_alerts(), "inside the 900 s floor nothing is posted")
         self.assertEqual(os.listdir(self.scan), [], "but the file is still consumed")
         self.now[0] += 900
         self.assertTrue(self.ctl.drain_scan_alerts())
         self.assertEqual(len(self.hs.sent), 2)
-        self.assertIn("scanner errors (output withheld) 1", self.hs.sent[1][1])
-        self.assertIn("sources: siyuan", self.hs.sent[1][1])
 
-    def test_undelivered_alert_is_kept_pending(self):
-        self.hs.token = "rotated"
-        self.drop("1.json", {"kind": "injection-scan", "severity": "high", "source": "web"})
-        self.assertFalse(self.ctl.drain_scan_alerts())
-        self.hs.token = TOKEN
+    def test_own_budget_not_the_shared_hourly_one(self):
+        self.cfg["alerts_per_hour"] = 1
+        self.ctl.sent = [self.now[0]] * 5  # the shared budget is exhausted
+        self.drop("1.alert")
         self.assertTrue(self.ctl.drain_scan_alerts())
+        self.assertEqual(len(self.ctl.sent), 5, "a scan alert does not spend the shared budget")
+
+    def test_pending_count_survives_a_restart(self):
+        self.hs.token = "rotated"
+        for i in range(4):
+            self.drop("%d.alert" % i)
+        self.assertFalse(self.ctl.drain_scan_alerts())
+        again = c.Control(self.cfg, c.Matrix(self.hs.url, TOKEN), clock=lambda: self.now[0])
+        self.hs.token = TOKEN
+        self.assertTrue(again.drain_scan_alerts())
+        self.assertIn("flagged 2-9 item(s)", self.hs.sent[0][1])
+
+    def test_unlistable_dir_is_a_tamper_alert(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        os.chmod(self.scan, 0o300)
+        try:
+            self.assertTrue(self.ctl.drain_scan_alerts())
+            self.assertIn("tampered", self.hs.sent[0][1])
+        finally:
+            os.chmod(self.scan, 0o700)
+
+    def test_wrong_owner_or_mode_is_a_tamper_alert(self):
+        self.cfg["scan_expect"] = {"mode": 0o1773}
+        os.chmod(self.scan, 0o700)
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.assertIn("tampered", self.hs.sent[0][1])
+
+    def test_a_planted_locked_tree_is_removed(self):
+        d = os.path.join(self.scan, "trap")
+        os.makedirs(os.path.join(d, "inner"))
+        with open(os.path.join(d, "inner", "f"), "w") as f:
+            f.write("x")
+        os.chmod(os.path.join(d, "inner"), 0)
+        os.chmod(d, 0)
+        self.ctl.drain_scan_alerts()
+        self.assertEqual(os.listdir(self.scan), [])
+        self.assertNotIn("tampered", self.hs.sent[0][1])
 
     def test_a_symlink_is_removed_not_followed(self):
-        target = os.path.join(self.tmp.name, "keep.json")
-        with open(target, "w") as f:
-            json.dump({"kind": "injection-scan", "severity": "low", "source": "web"}, f)
-        os.symlink(target, os.path.join(self.scan, "l.json"))
+        target = os.path.join(self.tmp.name, "keep")
+        os.makedirs(target)
+        os.symlink(target, os.path.join(self.scan, "l"))
         self.ctl.drain_scan_alerts()
-        self.assertTrue(os.path.exists(target))
-        self.assertIn("malformed alert files 1", self.hs.sent[0][1])
+        self.assertTrue(os.path.isdir(target))
+        self.assertEqual(os.listdir(self.scan), [])
 
     def test_unset_dir_is_a_no_op(self):
         self.cfg["scan_dir"] = None
@@ -421,7 +452,8 @@ class ScanAlerts(Base):
                "SCAN_ALERT_DIR": "/state/scan-alerts", "SCAN_ALERT_COOLDOWN_SECONDS": "5"}
         cfg, _ = c.load_config(env)
         self.assertEqual(cfg["scan_dir"], "/state/scan-alerts")
-        self.assertEqual(cfg["scan_cooldown"], 60, "the cooldown has a floor")
+        self.assertEqual(cfg["scan_cooldown"], 900, "the cooldown has a 900 s floor")
+        self.assertEqual(cfg["scan_expect"], {"uid": 0, "mode": 0o1773})
 
 
 class Credentials(Base):

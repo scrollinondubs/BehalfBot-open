@@ -64,7 +64,6 @@ capeff=$(awk '/^CapEff:/ {print $2}' /proc/self/status)
 for p in "$APP" "$APP/AGENTS.md" "$APP/opencode.json" "$APP/.opencode" "$APP/.opencode/plugins" \
          "$APP/.opencode/plugins/guardrails.ts" "$APP/.opencode/guards" "$APP/.opencode/guards/policy.ts" \
          "$APP/.opencode/plugins/injection-scan.ts" "$APP/.opencode/guards/injection.ts" \
-         "$APP/eval" "$APP/eval/hardlimits" \
          "$APP/config" "$APP/config/guards.json" "$APP/selftest" "$HOME" \
          "$APP/gateway" "$APP/gateway/control.py" "$APP/gateway/control_flags.py" \
          /etc/opencode-xdg /etc/opencode-xdg/opencode /opt/jill/bin/bash; do
@@ -222,24 +221,21 @@ PY
   fi
 done
 
-# The scanner's alert files: written for the hits above, and carrying a fixed
-# kind, a severity and a source category, nothing else (the alerts room is
-# not encrypted).
+# The scanner's alert files: one per hit, EMPTY, randomly named. jill-control
+# only counts them, so nothing the model could influence reaches the
+# unencrypted alerts room (red-team round 7 M5).
 python3 - "$SCAN_ALERTS" <<'PY' || fail=1
-import json, os, sys
+import os, re, sys
 d = sys.argv[1]
-names = [n for n in os.listdir(d) if n.endswith(".json")]
+names = os.listdir(d)
 if not names:
     print("[selftest] FAIL the injection scanner wrote no alert for its hits")
     sys.exit(1)
-sources = {"web", "email", "siyuan", "search", "document", "memory", "shell", "subagent", "other"}
 for n in names:
-    rec = json.load(open(os.path.join(d, n)))
-    if set(rec) != {"kind", "severity", "source"} or rec["kind"] != "injection-scan" \
-            or rec["severity"] not in ("high", "low", "error") or rec["source"] not in sources:
-        print("[selftest] FAIL an injection alert file carries more than kind/severity/source")
+    if not re.fullmatch(r"[0-9a-f]{32}\.alert", n) or os.path.getsize(os.path.join(d, n)) != 0:
+        print("[selftest] FAIL an injection alert file is not an empty, randomly named file")
         sys.exit(1)
-print(f"[selftest] ok   injection alerts: {len(names)} content-free file(s)")
+print(f"[selftest] ok   injection alerts: {len(names)} empty file(s)")
 PY
 
 if [[ "$fail" != 0 ]]; then

@@ -17,11 +17,12 @@
  *
  * Fail closed: handleToolOutput withholds on any scanner error. If even that
  * cannot run, this throws, which fails the tool call; OpenCode then reports
- * an error to the model, never the output. The boot self-test proves the
- * plugin is loaded (selftest/cases.json, "flagged" cases).
+ * an error to the model, never the output (proven in the image for built-in
+ * and MCP tools). The boot self-test proves the plugin is loaded.
  *
- * Alerts go to INJECTION_ALERT_DIR (compose: the scan-alerts volume, which
- * jill-control drains). They carry no content (see writeAlert).
+ * Alerts: one empty file per flagged or withheld output in
+ * INJECTION_ALERT_DIR (compose: the scan-alerts volume, create-only for this
+ * uid). No severity, category or text: jill-control only counts them.
  */
 
 import type { Plugin } from "@opencode-ai/plugin"
@@ -30,8 +31,8 @@ import { handleToolOutput, TAG, WITHHELD, writeAlert } from "../guards/injection
 export const InjectionScanPlugin: Plugin = async () => {
   const alertDir = process.env.INJECTION_ALERT_DIR || "/state/scan-alerts"
   let warned = false
-  const alert = (severity: "high" | "low" | "error", source: Parameters<typeof writeAlert>[2]) => {
-    if (!writeAlert(alertDir, severity, source) && !warned) {
+  const alert = () => {
+    if (!writeAlert(alertDir) && !warned) {
       warned = true
       console.error(`${TAG} could not write an alert to ${alertDir}; hits are still quarantined`)
     }
@@ -42,11 +43,10 @@ export const InjectionScanPlugin: Plugin = async () => {
       try {
         outcome = handleToolOutput(input.tool, input.args, output)
       } catch {
-        alert("error", "other")
+        alert()
         throw new Error(WITHHELD)
       }
-      if (outcome.status === "flagged") alert(outcome.severity, outcome.source)
-      else if (outcome.status === "withheld") alert("error", outcome.source)
+      if (outcome.status === "flagged" || outcome.status === "withheld") alert()
     },
   }
 }

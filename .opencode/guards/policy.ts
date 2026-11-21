@@ -874,6 +874,8 @@ export function bashDenied(cmd: string, ctx: GuardContext, depth = 0): string | 
     const cw = commandWord(tokens(seg))
     if (cw && MAIL_CLIS.has(cw.word)) return deny("Blocked: sending email via a CLI mailer is not allowed.")
   }
+  if (/(^|[\s'"=:<>(])\/state(\/|\b)/.test(cmd))
+    return deny("Blocked: /state holds the scanner's alert path and other control state. No tool touches it.")
   if (SQL_DESTRUCTIVE.test(cmd) && !PREVIEW_DB.test(cmd))
     return deny("Blocked: destructive SQL operation detected. Schema changes require Sean's approval.")
   if (/(^|[;&|`( ])wacli\b/.test(cmd) || /whatsapp/i.test(cmd))

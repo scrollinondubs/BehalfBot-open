@@ -28,8 +28,8 @@ TOOLS = {
     "siyuan": {
         "get_block_kramdown": ("Read one block's kramdown.", INJECTION),
         "sql_query": ("Run a read-only SQL query.", "selftest-ok rows: 0"),
-        "create_doc": ("Create a document (a write; the guard must deny it).", "created"),
-        "update_block": ("Update a block (a write; the guard must deny it).", "updated"),
+        "create_doc": ("Create a document.", "created"),
+        "update_block": ("Update a block.", "updated"),
     },
     "brave": {
         "brave_web_search": (
@@ -79,7 +79,7 @@ def handle(req):
         reply(mid, {
             "protocolVersion": version,
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "stub-" + FLAVOUR, "version": "0.0.1"},
+            "serverInfo": {"name": FLAVOUR + "-mcp", "version": "1.0.4"},
         })
     elif method == "tools/list":
         reply(mid, {"tools": [
