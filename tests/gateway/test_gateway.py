@@ -37,6 +37,8 @@ def cfg(route, tmp=None, **env):
         e["UPSTREAM_URL"] = "http://127.0.0.1:1"
     if route == "api":
         e["GATEWAY_BASIC_PASSWORD"] = "api-pw"
+    if route == "venice" and not tmp:
+        e["GATEWAY_STATE_DIR"] = tempfile.mkdtemp(prefix="gw-meter-")
     if tmp:
         e["APPROVALS_DIR"] = os.path.join(tmp, "approvals")
         e["GATEWAY_STATE_DIR"] = os.path.join(tmp, "state")
@@ -361,7 +363,9 @@ class Live(unittest.TestCase):
         seen = Upstream.seen[-1]
         self.assertEqual(seen["auth"], "Bearer real-key-not-for-callers")
         self.assertEqual(seen["path"], "/api/v1/chat/completions")
-        self.assertEqual(json.loads(seen["body"]), {"model": "zai-org-glm-5-2", "messages": [], "stream": True})
+        self.assertEqual(json.loads(seen["body"]), {"model": "zai-org-glm-5-2", "messages": [], "stream": True,
+                                                  "stream_options": {"include_usage": True},
+                                                  "max_completion_tokens": 8192, "max_tokens": 8192})
         self.assertNotEqual(seen["body"], raw.encode())
         self.assertNotIn("set-cookie", hdrs)
 

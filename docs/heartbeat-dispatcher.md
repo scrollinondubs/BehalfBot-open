@@ -33,7 +33,8 @@ All state lives under `BEHALFBOT_STATE_HOME` (defaults to the repo root; point i
 | Path | What |
 |---|---|
 | `scheduled-tasks/heartbeat-state.json` | Per-heartbeat last_checked / last_fired / last_result / fire_count / circuit-breaker state |
-| `scheduled-tasks/conservation-mode.json` | `{"enabled": true, "reason": "...", "auto_lift_after": "ISO"}` - only `criticality: critical` heartbeats run while enabled |
+| `scheduled-tasks/conservation-mode.json` | `{"enabled": true, "reason": "...", "auto_lift_after": "ISO"}` - only `criticality: critical` heartbeats run while enabled. In compose this and `halt.json` live in `CONTROL_DIR` (the jill-control volume, read-only here) |
+| `scheduled-tasks/halt.json` | Remote kill switch: every heartbeat skipped, `critical` included. Written only by jill-control from the Matrix control room (docs/control.md) |
 | `logs/scheduled/YYYY-MM-DD-dispatcher.log` | Tick-by-tick decision log |
 | `logs/telemetry/YYYY-MM-DD-usage.jsonl` | One JSON line per invocation: cost_usd, input/output/cache tokens, wall_seconds, exit_code |
 | `briefings/YYYY-MM-DD-<name>.md` | Heartbeat output artifacts |
@@ -63,6 +64,7 @@ Same JSONL contract as the chassis, so downstream tooling ports unchanged:
 - **Retry policy** - 3 attempts per FIRE with 20s / 60s backoff.
 - **Circuit breaker** - after 2 consecutive failed FIREs (configurable via `OPENCODE_FAIL_CIRCUIT_THRESHOLD`), the heartbeat is skipped for an exponentially growing cooldown (capped at 32 ticks) so one broken heartbeat cannot serialize the whole dispatcher.
 - **Conservation mode** - flip `scheduled-tasks/conservation-mode.json` to `{"enabled": true}` to pause everything except `criticality: critical` heartbeats. Optional `auto_lift_after` timestamp self-disables it.
+- **Halt, daily caps, all-failed alarm, alerts** - the kill switch, `max_fires_per_day` / `max_usd_per_day`, the daily Venice spend cap, the cross-heartbeat failure alarm and the Matrix alert spool are documented in [control.md](control.md). `scheduled-tasks/dispatcher-selftest.sh` proves each of them with real ticks before the compose dispatcher loop starts.
 - **Output validator** - heartbeats with `output_validator: true` get a small-model Five Failure Modes check; failing artifacts are quarantined (`.quarantined` suffix) and the ops webhook (`DISCORD_OPS_WEBHOOK_URL`) is alerted.
 - **Fail-open ask_model** - if Ollama is unreachable, `condition: ask_model` fires rather than silently starving the heartbeat.
 - **Recovery hooks** - drop `*.sh` files defining `behalfbot_recovery_*` functions into `scheduled-tasks/recovery-hooks.d/`; they run once per tick before the dispatch loop.
@@ -84,7 +86,7 @@ Docker (canonical): the compose stack ships an opt-in `heartbeat-dispatcher` ser
 
 ```bash
 cp HEARTBEATS.md.template HEARTBEATS.md   # compose bind-mounts this file
-docker compose --profile dispatcher up -d
+docker compose --profile heartbeats up -d
 ```
 
 ## Triggers (deterministic keyword dispatch)
