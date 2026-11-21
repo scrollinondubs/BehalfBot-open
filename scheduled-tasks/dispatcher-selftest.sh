@@ -255,6 +255,7 @@ new_sandbox orphan-lock "hb-a|"
 mkdir -p "$SB/state/scheduled-tasks"
 echo '{}' > "$SB/state/scheduled-tasks/heartbeat-state.json"
 mkdir "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
+touch -t 202001010000 "$SB/state/scheduled-tasks/heartbeat-state.json.lock"
 tick
 [[ "$(calls)" == 1 && "$(alerts state-lock)" == 1 ]] && logged "orphaned state lock" \
     && ok "F6 orphaned lock (no pid): removed with an alert, then the tick ran" \

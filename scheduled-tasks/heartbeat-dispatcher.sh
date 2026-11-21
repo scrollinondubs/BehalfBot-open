@@ -246,9 +246,11 @@ get_state() {
 # flock. The lock is a directory holding one pid file, removed with
 # rm -f + rmdir: never a recursive delete of a computed path.
 #
-# A dead holder's lock is recovered. A lock dir with NO pid file for 2s was
-# orphaned by a writer killed between mkdir and the pid write: it is removed
-# and alerted on. A live holder for 10s makes this write REFUSED, never
+# A dead holder's lock is recovered. A lock dir with NO pid file that is
+# itself more than 5s old was orphaned by a writer killed between mkdir and
+# the pid write: it is removed and alerted on. Age is read from the lock
+# dir, not counted by the waiter: a counter spans successive holders, each
+# briefly seen without a pid, and once removed a live lock (CI caught it). A live holder for 10s makes this write REFUSED, never
 # done unlocked: STATE_LOCK_FAILED stops the tick firing anything more (red
 # team F6), because a lost fire count is a cap bypass.
 STATE_LOCK_FAILED=0
@@ -262,25 +264,26 @@ _state_lock_alert() {
     fi
 }
 
+_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo ""
+}
+
 _state_lock_acquire() {
-    local lock_dir="${STATE_FILE}.lock" waited=0 holder="" nopid=0
+    local lock_dir="${STATE_FILE}.lock" waited=0 holder="" made
     while ! mkdir "$lock_dir" 2>/dev/null; do
         holder=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
         if [[ -z "$holder" ]]; then
-            nopid=$((nopid + 1))
-            if [[ $nopid -ge 20 ]]; then
-                _state_lock_alert "WARNING orphaned state lock (no pid file) - removed" \
+            made=$(_mtime "$lock_dir")
+            if [[ "$made" =~ ^[0-9]+$ ]] && (( $(date +%s) - made > 5 )) && [[ ! -e "$lock_dir/pid" ]]; then
+                _state_lock_alert "WARNING orphaned state lock (no pid file, >5s old) - removed" \
                     "The dispatcher found an orphaned state lock (a writer died mid-write) and removed it. If this repeats, check the dispatcher container."
                 rmdir "$lock_dir" 2>/dev/null || true
-                nopid=0
                 continue
             fi
         elif ! kill -0 "$holder" 2>/dev/null; then
             rm -f "$lock_dir/pid" 2>/dev/null || true
             rmdir "$lock_dir" 2>/dev/null || true
             continue
-        else
-            nopid=0
         fi
         sleep 0.1
         waited=$((waited + 1))
