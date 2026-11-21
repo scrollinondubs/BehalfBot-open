@@ -250,6 +250,13 @@ class KillSwitch(Base):
         self.assertEqual(flags.state(self.cons), "off")
         self.assertEqual(flags.state(self.halt), "on")
 
+    def test_50_host_cli_break_glass_resume(self):
+        flags.write(self.halt, True, "t", None, None)
+        flags.write(self.cons, True, "t", None, None)
+        self.assertIn("RESUMED", c.break_glass_resume(self.cfg["control_dir"]))
+        self.assertEqual(flags.state(self.halt), "off")
+        self.assertEqual(flags.state(self.cons), "off")
+
     def test_50_resume_aliases_and_spend_reset_are_refused_in_the_control_room(self):
         flags.write(self.halt, True, "t", None, None)
         self.ctl.poll_room()

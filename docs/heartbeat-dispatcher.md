@@ -65,7 +65,7 @@ Same JSONL contract as the chassis, so downstream tooling ports unchanged:
 - **Circuit breaker** - after 2 consecutive failed FIREs (configurable via `OPENCODE_FAIL_CIRCUIT_THRESHOLD`), the heartbeat is skipped for an exponentially growing cooldown (capped at 32 ticks) so one broken heartbeat cannot serialize the whole dispatcher.
 - **Conservation mode** - flip `scheduled-tasks/conservation-mode.json` to `{"enabled": true}` to pause everything except `criticality: critical` heartbeats. Optional `auto_lift_after` timestamp self-disables it.
 - **Halt, daily caps, all-failed alarm, alerts** - the kill switch, `max_fires_per_day` / `max_usd_per_day`, the daily Venice spend cap, the cross-heartbeat failure alarm and the Matrix alert spool are documented in [control.md](control.md). `scheduled-tasks/dispatcher-selftest.sh` proves each of them with real ticks before the compose dispatcher loop starts.
-- **Output validator** - heartbeats with `output_validator: true` get a small-model Five Failure Modes check; failing artifacts are quarantined (`.quarantined` suffix) and the ops webhook (`DISCORD_OPS_WEBHOOK_URL`) is alerted.
+- **Output validator** - heartbeats with `output_validator: true` get a small-model Five Failure Modes check; failing artifacts are quarantined (`.quarantined` suffix) and a content-free Matrix alert is raised through the alert spool.
 - **Fail-open ask_model** - if Ollama is unreachable, `condition: ask_model` fires rather than silently starving the heartbeat.
 - **Recovery hooks** - drop `*.sh` files defining `behalfbot_recovery_*` functions into `scheduled-tasks/recovery-hooks.d/`; they run once per tick before the dispatch loop.
 
@@ -91,7 +91,7 @@ docker compose --profile heartbeats up -d
 
 ## Triggers (deterministic keyword dispatch)
 
-`scripts/dispatch-trigger.sh` is the companion inbound-message dispatcher: known-shape messages (keyword-prefixed commands) are matched against the `triggers.yaml` registry (copy `triggers.yaml.template`) and routed to shell handlers in milliseconds, without burning model tokens. Parsers live in `scripts/parsers/` (`passthrough`, `url-extract`); `scripts/discord-react.py` acks the source message with an emoji when `DISCORD_BOT_TOKEN` is set. Wire it into the Discord bridge (or any message source) by calling:
+`scripts/dispatch-trigger.sh` is the companion inbound-message dispatcher: known-shape messages (keyword-prefixed commands) are matched against the `triggers.yaml` registry (copy `triggers.yaml.template`) and routed to shell handlers in milliseconds, without burning model tokens. Parsers live in `scripts/parsers/` (`passthrough`, `url-extract`). The result reports the trigger's `react_emoji` with `react_status: emit_only`; the caller reacts on its own message source. Call it as:
 
 ```bash
 bash scripts/dispatch-trigger.sh <channel-id> <message-id> "<message body>"

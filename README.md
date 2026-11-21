@@ -33,7 +33,7 @@ What this repo proves today:
 
 ## Model provider: Venice only
 
-Jill runs on Venice AI only (BehalfBot-open#46). `opencode.json` sets `enabled_providers: ["venice"]` and whitelists Venice models whose `privacy` is `private` (default `venice/zai-org-glm-5-2`, small model `venice/z-ai-glm-5-3-flash`). There is no Anthropic or OpenRouter block, and the heartbeat dispatcher and Discord bridge both refuse any model that is not `venice/<id>`.
+Jill runs on Venice AI only (BehalfBot-open#46). `opencode.json` sets `enabled_providers: ["venice"]` and whitelists Venice models whose `privacy` is `private` (default `venice/zai-org-glm-5-2`, small model `venice/z-ai-glm-5-3-flash`). There is no Anthropic or OpenRouter block, and the heartbeat dispatcher and Matrix bridge both refuse any model that is not `venice/<id>`.
 
 ```bash
 bash scripts/run.sh --model venice/z-ai-glm-5-3-flash "your prompt"
@@ -117,7 +117,7 @@ mvp-run-output.json                # captured proof-of-loop JSON output
 
 ## Heartbeat dispatcher (Phase 3)
 
-The chassis's gather-first scheduled-work engine, ported to OpenCode (issue #4). Declarative heartbeats in `HEARTBEATS.md` fire `opencode run` only when a cheap gather script says there is work - ~96 ticks/day translate to ~4 model invocations. Supports schedule matching (interval/daily/weekly + jitter), threshold and Ollama-judged conditions, per-run telemetry (cost + tokens parsed from the JSON event stream), retry + circuit-breaker resilience, conservation mode, an opt-in Five Failure Modes output validator, and Discord webhook notifications.
+The chassis's gather-first scheduled-work engine, ported to OpenCode (issue #4). Declarative heartbeats in `HEARTBEATS.md` fire `opencode run` only when a cheap gather script says there is work - ~96 ticks/day translate to ~4 model invocations. Supports schedule matching (interval/daily/weekly + jitter), threshold and Ollama-judged conditions, per-run telemetry (cost + tokens parsed from the JSON event stream), retry + circuit-breaker resilience, conservation mode, an opt-in Five Failure Modes output validator, and content-free Matrix alerts for notifications.
 
 ```bash
 cp HEARTBEATS.md.template HEARTBEATS.md      # register heartbeats here
@@ -141,7 +141,7 @@ is administered by someone else, so the bridge trusts it for nothing:
   comes from a device cross-signed by the master key pinned at setup. It is
   also fresh, not an edit, and not a replay. Replies are encrypted only to
   those devices.
-- `bridge/matrix_worker.py` - the policy the Discord bridge had, plus:
+- `bridge/matrix_worker.py` - chat policy:
   commands (`halt`, `resume`, `reset meter [spend]`, `status`, `new`), the
   halt gate, the draft approval screen (`show draft`, `approve draft`),
   opencode sessions, and PDF and text extraction from decrypted attachments.

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # dispatch-trigger.sh - deterministic trigger-keyword dispatcher for inbound
-# channel messages (Discord via the bridge, or any other message source).
+# channel messages (any message source; the caller passes ids and body).
 #
 # Reads $BEHALFBOT_HOME/triggers.yaml (copy triggers.yaml.template to create
 # it). Pattern-matches the inbound message body against each trigger's
 # keyword_regex; on first match, runs the trigger's parser to extract
-# structured args, optionally reacts to the source message with the trigger's
-# react_emoji, then invokes the trigger's handler with the parsed args.
+# structured args, reports the trigger's react_emoji for the caller to apply,
+# then invokes the trigger's handler with the parsed args.
 #
 # Why this exists alongside LLM-driven dispatch: known-shape messages
 # (keyword-prefixed commands) don't burn model tokens. Pattern-matching shell
@@ -18,7 +18,7 @@
 # Output (stdout, single JSON object):
 #   {"matched": false, "reason": "no_trigger_matched"}
 #   {"matched": true, "trigger": "<name>", "react_emoji": "<emoji>",
-#    "react_status": "reacted|emit_only|react_failed|skipped",
+#    "react_status": "emit_only|skipped",
 #    "handler": "<path>", "args": {...}, "exit_code": <int>,
 #    "handler_stdout": "<text>", "handler_stderr": "<text>"}
 #
@@ -29,10 +29,6 @@
 #
 # Optional env:
 #   BEHALFBOT_HOME    - repo root (default: parent of this script's directory)
-#   DISCORD_BOT_TOKEN - if set, the dispatcher reacts to the source message
-#                       with the trigger's react_emoji via discord-react.py.
-#                       Without it, react_status is "emit_only" and the caller
-#                       is responsible for reacting.
 #   TRIGGERS_YAML     - override registry path (default: $BEHALFBOT_HOME/triggers.yaml)
 
 set -euo pipefail
@@ -180,16 +176,8 @@ fi
 # React (optional)
 react_status="skipped"
 if [[ -n "$matched_emoji" ]]; then
-    if [[ -n "${DISCORD_BOT_TOKEN:-}" && -x "$BEHALFBOT_HOME/scripts/discord-react.py" ]]; then
-        if "$BEHALFBOT_HOME/scripts/discord-react.py" \
-                "$CHANNEL_ID" "$MESSAGE_ID" "$matched_emoji" >/dev/null 2>&1; then
-            react_status="reacted"
-        else
-            react_status="react_failed"
-        fi
-    else
-        react_status="emit_only"
-    fi
+    # The caller owns the message source and reacts itself.
+    react_status="emit_only"
 fi
 
 # Invoke handler

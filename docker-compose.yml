@@ -436,9 +436,6 @@ services:
       HEARTBEAT_MODEL_SONNET: ${HEARTBEAT_MODEL_SONNET:-}
       HEARTBEAT_MODEL_HAIKU: ${HEARTBEAT_MODEL_HAIKU:-}
       OLLAMA_URL: ${OLLAMA_URL:-}
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
-      DISCORD_OPS_WEBHOOK_URL: ${DISCORD_OPS_WEBHOOK_URL:-}
-      INSTANCE_NAME: ${INSTANCE_NAME:-}
       # Control (#49, docs/control.md). The flags are read-only here.
       CONTROL_DIR: /state/control
       CONTROL_REQUIRE_ARMED: "1"
@@ -483,8 +480,8 @@ networks:
   # Ordinary outbound network for the gateways.
   jill-egress:
     driver: bridge
-  # Outbound for matrix-bridge and jill-control (Matrix) and the dispatcher
-  # (webhooks), kept apart from the gateways, which parse model-controlled
+  # Outbound for matrix-bridge and jill-control (Matrix) and the dispatcher,
+  # kept apart from the gateways, which parse model-controlled
   # input.
   jill-callers:
     driver: bridge

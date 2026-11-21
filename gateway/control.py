@@ -34,7 +34,7 @@ Whole-message words from the principal in the control room:
     reset meter               Today's Venice request count.
 
 `resume` (unmute, unhalt) and `reset meter spend` are REFUSED here with an
-ack (#50): this room is unencrypted on a homeserver Jill does not control,
+ack (#50); the break-glass is `control.py resume` run on the host: this room is unencrypted on a homeserver Jill does not control,
 so its admin could forge them. They work only in Jill's end-to-end
 encrypted chat room, through the Matrix bridge (matrix-bridge/). A forged
 `halt` only stops Jill, so it stays here.
@@ -820,7 +820,23 @@ def _loop(name, interval, fn):
         time.sleep(interval)
 
 
+def break_glass_resume(control_dir):
+    """Host-only resume, for when the encrypted chat bridge cannot do it
+    (locked, down, or Sean has no verified device). Reaching it needs a
+    shell on Jill's host with access to her Docker, which neither Jill nor
+    the homeserver has:
+        docker compose exec jill-control python3 /app/gateway/control.py resume
+    """
+    cfg = {"control_dir": control_dir, "control_room": "", "principal": "host-cli"}
+    text = Control(cfg, None).apply("resume", None, None)
+    log("BREAK-GLASS resume from the host CLI: halt and conservation cleared")
+    return text
+
+
 def main():
+    if sys.argv[1:] == ["resume"]:
+        print(break_glass_resume(os.environ.get("CONTROL_DIR", "/state/control")))
+        return 0
     cfg, problems = load_config()
     if problems:
         log("ERROR: the Matrix kill switch is UNARMED. Jill cannot be stopped from Matrix.")

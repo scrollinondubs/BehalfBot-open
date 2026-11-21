@@ -73,6 +73,20 @@ does not control, so its admin can forge any message there.
 - **Ignored entirely:** edits, a control word inside a sentence, and encrypted events.
 - **Age rule (control room).** `halt` and `conserve` are honoured at any age, in the order sent: a late stop is still a stop. `unconserve` and `reset meter` older than 10 minutes are NOT applied, and the room gets an ack saying so; send them again if you still mean them. A stale `status`, `resume` or `reset meter spend` is ignored silently.
 
+**Break-glass resume (host only).** There is no Matrix path to `resume`
+other than the encrypted chat room (Sean, 2026-11-21). If the bridge is
+identity-locked, down, or Sean has no verified device, lift a halt from a
+shell on Jill's host, as the macOS user that runs her Docker:
+
+```bash
+docker compose exec jill-control python3 /app/gateway/control.py resume
+```
+
+It clears halt and conservation and logs `BREAK-GLASS resume`. Neither Jill
+nor the homeserver can reach it. Halt words stay live in the chat room on
+purpose: a message starting with `halt`, `mute` or `silence` halts Jill
+(fail-safe).
+
 **What halt does not stop:** a tool call already executing finishes. Both
 rooms keep listening, so `resume` (in the chat room) still works. While
 halted, the chat bridge answers every non-command message with a refusal
