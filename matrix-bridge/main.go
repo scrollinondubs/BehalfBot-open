@@ -2,7 +2,10 @@
 //
 //	matrix-bridge run     sync, decrypt, accept or drop, hand accepted
 //	                      messages to the Python worker, encrypt replies
-//	matrix-bridge setup   interactive, once: login, cross-signing, pin
+//	matrix-bridge setup   interactive, once: login, cross-signing, emoji
+//	                      verification of the principal, pin
+//	matrix-bridge setup --no-sas
+//	                      fallback: pin after a typed fingerprint check
 //
 // The homeserver is run by someone else, so nothing here trusts it: every
 // accepted message must decrypt, come from the principal, and come from a
@@ -37,6 +40,7 @@ func main() {
 	}
 	switch os.Args[1] {
 	case "setup":
+		cfg.NoSAS = len(os.Args) > 2 && os.Args[2] == "--no-sas"
 		tty, err := openTTY()
 		if err != nil {
 			logf("ERROR: %v", err)

@@ -161,21 +161,31 @@ func Setup(ctx context.Context, cfg Config, p Prompter) error {
 		return fmt.Errorf("%s has no cross-signing master key; set up encryption in Element X first", cfg.Principal)
 	}
 	p.Say("")
-	p.Say(fmt.Sprintf("Master cross-signing key the server reports for %s:", cfg.Principal))
+	p.Say(fmt.Sprintf("Master cross-signing key the server reports for %s (secondary check):", cfg.Principal))
 	p.Say("")
 	p.Say("    " + Fingerprint(msk))
 	p.Say("")
-	p.Say("Compare it with the master key your own client shows for your account. Do not trust any")
-	p.Say("other copy: this server's admin could forge one.")
-	ans, err := p.Line("Type `yes` if it matches exactly: ")
-	if err != nil {
-		return err
-	}
-	if ans != "yes" {
-		return errors.New("not confirmed; nothing pinned")
-	}
-	if err := mach.SignUser(ctx, cfg.Principal, msk); err != nil {
-		return fmt.Errorf("could not sign the principal's master key: %w", err)
+	if cfg.NoSAS {
+		p.Say("--no-sas: compare it with the master key your own client shows for your account. Do not")
+		p.Say("trust any other copy: this server's admin could forge one.")
+		ans, err := p.Line("Type `yes` if it matches exactly: ")
+		if err != nil {
+			return err
+		}
+		if ans != "yes" {
+			return errors.New("not confirmed; nothing pinned")
+		}
+		if err := mach.SignUser(ctx, cfg.Principal, msk); err != nil {
+			return fmt.Errorf("could not sign the principal's master key: %w", err)
+		}
+	} else {
+		verified, err := verifyPrincipalSAS(ctx, cfg, cli, helper, p)
+		if err != nil {
+			return fmt.Errorf("verification with %s failed, nothing pinned: %w", cfg.Principal, err)
+		}
+		if verified != msk {
+			return fmt.Errorf("the verified master key differs from the one the server reports now; nothing pinned")
+		}
 	}
 	if err := SavePin(cfg.StateDir, Pin{Principal: cfg.Principal, MasterKey: msk, PinnedAt: nowUnix()}); err != nil {
 		return err

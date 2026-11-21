@@ -174,7 +174,7 @@ Things only a real Venice call can show, to check on the first live calls:
 
 The encrypted chat bridge (#50, `bridge/WIRING.md`):
 
-- [ ] Sean confirms the master-key fingerprint that `matrix-bridge setup` printed matches the one his own client shows for his account, compared on his device, not from a copy the server could supply.
+- [ ] The emoji verification in `matrix-bridge setup` completes with Element X: same seven emoji on both screens, confirmed on both sides, and setup prints `Pinned`. If it cannot complete, use `setup --no-sas` and compare the printed master-key fingerprint with the one Sean's own client shows.
 - [ ] Element X shows Jill as cross-signed (verified, no warning shield) in the room.
 - [ ] A real encrypted round trip: Sean sends a message, the log shows `accept event=...`, Jill replies, and Element X decrypts the reply. Then `halt`, a chat message (refused, no model call in the venice-proxy log), `resume` (lifts it), and `show draft` / `approve draft` on a test draft.
 - [ ] A replayed event does nothing. Restart the bridge (`docker compose restart matrix-bridge`): no message is answered twice, and the log shows no new `accept` for old event ids.
@@ -262,6 +262,7 @@ their keys are set.
 python3 -m unittest discover -s tests/control -v   # jill-control vs a fake homeserver
 python3 -m unittest discover -s tests/bridge -v    # chat commands, halt gate, approval screen
 (cd matrix-bridge && CGO_ENABLED=0 go test -tags goolm ./...)   # acceptance rule, pinned trust chain
+bash selftest/matrix-bridge-e2e.sh                 # whole bridge vs a throwaway continuwuity (docker, go, python3 + aiohttp)
 python3 -m unittest discover -s tests/gateway -v   # incl. venice gate + meter, credential probe
 bash scheduled-tasks/dispatcher-selftest.sh        # real dispatcher ticks, fake opencode
 ```

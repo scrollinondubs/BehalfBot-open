@@ -34,6 +34,7 @@ type Config struct {
 	Worker     []string
 	MaxAttach  int64
 	ReadyFile  string
+	NoSAS      bool
 }
 
 func LoadConfig() (Config, []string) {
@@ -85,7 +86,12 @@ func OpenCrypto(ctx context.Context, cfg Config, creds *Creds) (*mautrix.Client,
 		return nil, nil, err
 	}
 	cli.DeviceID = creds.DeviceID
-	cli.Log = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: true}).Level(zerolog.WarnLevel).With().Timestamp().Logger()
+	level := zerolog.WarnLevel
+	if l, err := zerolog.ParseLevel(os.Getenv("MATRIX_BRIDGE_LOG_LEVEL")); err == nil && l != zerolog.NoLevel && l >= zerolog.DebugLevel {
+		level = l
+	}
+	cli.Log = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: true}).Level(level).With().Timestamp().
+		Str("user", creds.UserID.String()).Logger()
 	pickle, err := PickleKey(cfg.StateDir)
 	if err != nil {
 		return nil, nil, err
@@ -224,6 +230,9 @@ func (b *Bridge) onDecryptError(evt *event.Event, err error) {
 }
 
 func (b *Bridge) onDecrypted(ctx context.Context, evt *event.Event) {
+	if evt.Sender == b.cli.UserID {
+		return
+	}
 	if evt.RoomID != b.cfg.Room {
 		logf("drop event=%s reason=%s", evt.ID, ReasonRoom)
 		return
@@ -419,26 +428,36 @@ func (b *Bridge) fetchAttachment(ctx context.Context, c *event.MessageEventConte
 }
 
 func Run(ctx context.Context, cfg Config) error {
+	b, err := NewBridge(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer b.helper.Close()
+	return b.cli.SyncWithContext(ctx)
+}
+
+// NewBridge loads the login, pin and stores and wires the handlers; the
+// caller runs the sync.
+func NewBridge(ctx context.Context, cfg Config) (*Bridge, error) {
 	creds, err := LoadCreds(cfg.StateDir)
 	if err != nil {
-		return fmt.Errorf("no usable login in %s (%v): run `matrix-bridge setup` first", cfg.StateDir, err)
+		return nil, fmt.Errorf("no usable login in %s (%v): run `matrix-bridge setup` first", cfg.StateDir, err)
 	}
 	if cfg.Homeserver == "" {
 		cfg.Homeserver = creds.Homeserver
 	}
 	pin, err := LoadPin(cfg.StateDir, cfg.Principal)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	handled, err := OpenHandledStore(cfg.StateDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	cli, helper, err := OpenCrypto(ctx, cfg, creds)
 	if err != nil {
-		return fmt.Errorf("crypto init failed: %w", err)
+		return nil, fmt.Errorf("crypto init failed: %w", err)
 	}
-	defer helper.Close()
 	b := &Bridge{cfg: cfg, cli: cli, helper: helper, handled: handled, pin: pin,
 		alerts: NewAlerter(cfg.SpoolDir), now: time.Now}
 	if l, _ := LoadLock(cfg.StateDir); l != nil {
@@ -467,5 +486,5 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 		return true
 	})
-	return cli.SyncWithContext(ctx)
+	return b, nil
 }

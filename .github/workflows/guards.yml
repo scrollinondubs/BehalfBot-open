@@ -52,6 +52,26 @@ jobs:
       - name: Dispatcher controls (halt, caps, spend cap, all-failed alarm, state lock; heartbeats ship off)
         run: bash scheduled-tasks/dispatcher-selftest.sh
 
+  # The Matrix bridge end to end, against a throwaway continuwuity started
+  # by the script (removed on exit): setup with SAS verification, an
+  # encrypted round trip through the real worker to a stub opencode,
+  # show/approve draft, a replay, and an unverified device dropped.
+  matrix-bridge-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: matrix-bridge/go.mod
+          cache-dependency-path: matrix-bridge/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Worker dependencies
+        run: pip install "aiohttp>=3.9,<4" "pypdf>=5,<7"
+      - name: End-to-end against a throwaway homeserver
+        run: bash selftest/matrix-bridge-e2e.sh
+
   selftest:
     runs-on: ubuntu-latest
     steps:

@@ -175,19 +175,42 @@ the gateway's send check fails and the approval is used up.
      Store it in Jill's vault. Setup needs it to re-pin later.
    - **Joining.** It joins the room and checks that the room is encrypted.
    - **Fingerprint.** It prints the master-key fingerprint the server reports
-     for Sean. **Compare it with what Sean's own client shows for his
-     account**, never with a copy from the server. Then type `yes`.
-   - **Pin.** It pins that key and signs it with Jill's user-signing key.
+     for Sean, as a secondary check.
+   - **Emoji verification.** Jill sends Sean a verification request in the
+     room. Sean accepts it in Element X. Both screens show seven emoji:
+     Sean compares them, confirms in Element X, and types `yes` at the
+     terminal. A homeserver that swapped Sean's keys would sit in the middle
+     of the exchange and the emoji would differ. Setup gives up after 10
+     minutes.
+   - **Pin.** Only when the verification succeeds does it pin Sean's master
+     key. That key was covered by the verification, and Jill's user-signing
+     key has signed it.
 5. **Start it:** `bash docker/cutover.sh` (or `docker compose up -d`).
    `docker compose logs matrix-bridge` shows `first sync done` and the
    pinned fingerprint.
 6. **Verify:** run the step-F checklist in `docs/control.md`.
 
+**Fallback.** `docker compose run --rm matrix-bridge-setup /opt/jill/bin/matrix-bridge setup --no-sas`
+skips the emoji step. It pins after Sean compares the printed fingerprint
+with the one his own client shows and types `yes`. Use it only if the
+emoji verification cannot complete with Element X.
+
+**Library workarounds.** The emoji step uses mautrix-go's
+`verificationhelper`. Two bugs in its in-room flow (in v0.32.0 and v0.33.0)
+are patched around in `matrix-bridge/sas.go`:
+
+- the request is encrypted twice (`OnceCrypto`);
+- replies are looked up by their own event id instead of the request they
+  relate to (`FixInRoomVerificationIDs`).
+
+`selftest/matrix-bridge-e2e.sh` proves the flow between two mautrix
+clients. It has not yet been run against Element X.
+
 ### Re-pinning
 
-Run setup again; it asks for Jill's recovery key instead of creating new
-keys. Do this after Sean resets his identity, and only after comparing the
-new fingerprint out of band.
+Run setup again. It asks for Jill's recovery key instead of creating new
+keys, then runs the emoji verification again. Do this after Sean resets his
+identity.
 
 ## Troubleshooting
 
