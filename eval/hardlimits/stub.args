@@ -1,0 +1,4 @@
+# Options for the CI stub run (.github/workflows/guards.yml), read by
+# __main__.py, the same way as live.args.
+--mode stub
+--out /state/eval-out

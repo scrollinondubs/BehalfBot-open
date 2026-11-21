@@ -506,3 +506,48 @@ test("/proc in every spelling red-team round 7 round 3 used is denied (R3-1, R3-
   )
   allowed(["ls /workspace/projects", "cat /workspace/process.md", "echo the environment is fine", "ls /workspace/static"], "look-alikes")
 })
+
+test("/proc relative to / is denied too (R3-1 follow-up)", () => {
+  denied(
+    [
+      "cd / && cat proc/1/environ",
+      "cd / && cat proc/self/cmdline",
+      "cd /; cd proc; cat 1/environ",
+      "cd /; cd pr*; cat self/environ",
+      "cd / && cat ./proc/self/environ",
+      "cd / && cat 'proc'/self/environ",
+    ],
+    "relative proc",
+  )
+  allowed(["cat src/process.ts", "ls ./projects", "grep -r procurement docs", "cat notes/proceeds.md",
+    "grep proc notes.md", "git commit -m \"fix proc handling\"", "echo proc"], "relative look-alikes")
+})
+
+test("a pr* glob over Sean's files is allowed; one that can reach /proc is not (L62-1)", () => {
+  allowed(["ls pr*", "ls pr*.md", "cat pr*", "rm pr*.tmp", "wc -l pr?ject.md", "cat pr[io]*.txt",
+    "mv pr*.md archive/", "grep -l todo pr*"], "globs in the session directory")
+  denied(
+    [
+      "cd / && grep -r x pr*",
+      "cd / && ls pr*",
+      "pushd / && cat pr*",
+      "cd ../../.. && grep -r x pr*",
+      "grep -r x ../pr*",
+      "grep -r x ../../pr''oc",
+      "find / -maxdepth 1 -name 'pr*' -exec grep -r x {} +",
+      "env -C / grep -r x pr*",
+      "cat pr*/1/environ",
+      "cat pr''oc/self/environ",
+      "for p in pr?c/[0-9]*; do cat $p/stat; done",
+    ],
+    "pr cuts that reach /proc",
+  )
+  const at = (dir: string) => ({ ...ctx, directory: dir })
+  for (const cmd of ["ls pr*", "grep -r x pr*", "cat pr''oc"]) assert.ok(bash(cmd, at("/")), `workdir /: ${cmd}`)
+  for (const cmd of ["cat self/environ", "cat 1/cmdline", "ls"]) {
+    assert.ok(evaluate("bash", { command: cmd, workdir: "/proc" }, ctx), `workdir /proc: ${cmd}`)
+    assert.ok(evaluate("bash", { command: cmd, workdir: "/proc/self" }, ctx), `workdir /proc/self: ${cmd}`)
+  }
+  assert.equal(evaluate("bash", { command: "ls pr*", workdir: "/workspace" }, ctx), null)
+  assert.equal(evaluate("bash", { command: "ls", workdir: "/workspace/procedures" }, ctx), null)
+})

@@ -20,7 +20,7 @@ COPY matrix-bridge/ ./
 RUN CGO_ENABLED=0 go test -tags goolm ./... \
     && CGO_ENABLED=0 go build -tags goolm -trimpath -ldflags "-s -w" -o /out/matrix-bridge .
 
-FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS runtime
 
 # python3 for the bridge, curl for the compose healthcheck, git because
 # opencode prefers running inside a repo, ca-certificates for TLS, jq for the
@@ -150,3 +150,23 @@ EXPOSE 4747
 
 # No default CMD: docker-compose.yml picks the entrypoint per service.
 CMD ["node", "-e", "console.error('Use docker compose: see docker-compose.yml services'); process.exit(64)"]
+
+# The hard-limit eval's image (#51, step F and CI only; never Jill's). The
+# runtime above plus strace, which the harness runs as root around the
+# model's opencode to see any open of a /proc/<pid>/environ or mem, whatever
+# the spelling (red-team round 7 R3-1). The MCP stand-ins get ordinary
+# names, so the process list shows no self-test path (R3-2). Build it with
+# `docker compose --profile eval build opencode-eval`.
+FROM runtime AS eval
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends strace \
+    && rm -rf /var/lib/apt/lists/* \
+    && install -d -m 0755 /opt/mcp/local \
+    && install -m 0755 /app/selftest/mcp_stub.py /opt/mcp/local/siyuan-mcp \
+    && install -m 0755 /app/selftest/mcp_stub.py /opt/mcp/local/brave-search-mcp
+USER node
+
+# The default target is the runtime image: `docker build .` builds the last
+# stage, and strace stays out of what Jill runs.
+FROM runtime

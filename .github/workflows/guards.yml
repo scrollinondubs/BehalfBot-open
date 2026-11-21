@@ -82,7 +82,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build image
-        run: docker build -t behalfbot-open:ci .
+        run: |
+          docker build -t behalfbot-open:ci .
+          # The eval image: the runtime plus strace (#51 R3-1). Never Jill's.
+          docker build --target eval -t behalfbot-open:ci-eval .
       - name: Matrix bridge worker isolation (round 6 M4)
         # As compose runs it: root with only SETUID/SETGID, no new privileges,
         # read-only root. The worker uid must not be able to list or read the
@@ -126,17 +129,36 @@ jobs:
           if docker run --rm --entrypoint test behalfbot-open:ci -e /app/eval; then
             echo "eval/ is in the runtime image"; exit 1
           fi
-          # As at step F: the harness is root and runs the model as uid 1000;
-          # eval/ under root-only /root, the report on a root 0700 volume.
-          # The harness refuses to run if uid 1000 can read either (R2-4).
+          if docker run --rm --entrypoint sh behalfbot-open:ci -c 'command -v strace'; then
+            echo "strace is in the runtime image"; exit 1
+          fi
+          # As at step F: the harness is root and runs the model as uid 1000
+          # under strace (SYS_PTRACE is the tracer's; the model's processes
+          # have no capabilities); eval/hardlimits under root-only /root as
+          # /root/job, options from a root-only file so the process list
+          # shows only `python3 /root/job` (R3-2), the report on a root 0700
+          # volume. The harness refuses to run if uid 1000 can read the eval
+          # or its options, or write the report (R2-4).
           docker run --rm --network none --read-only --user 0:0 --cap-drop ALL \
             --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE \
+            --cap-add SYS_PTRACE \
             --security-opt no-new-privileges \
             --tmpfs /tmp \
             --tmpfs /home/node/.cache:uid=1000,gid=1000 \
             --tmpfs /home/node/.local/state:uid=1000,gid=1000 \
-            -v "$PWD/eval:/root/eval:ro" -v /state/eval-out \
-            -w /app behalfbot-open:ci python3 /root/eval/hardlimits/run_eval.py --mode stub --out /state/eval-out
+            -v "$PWD/eval/hardlimits:/root/job:ro" -v /state/eval-out \
+            -e JOB_ARGS=/root/job/stub.args \
+            -w /app behalfbot-open:ci-eval python3 /root/job
+      - name: Hard-limit eval unit tests as root in the eval image (#51 R3-4)
+        # The root-only cases: fixtures planted, removed and the scratch git
+        # ref read as the model's uid, so a link it planted never gets a
+        # root write. Skipped by the unit job, which is not root.
+        run: |
+          docker run --rm --network none --read-only --user 0:0 --cap-drop ALL \
+            --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add DAC_OVERRIDE \
+            --security-opt no-new-privileges --tmpfs /tmp \
+            -v "$PWD:/opt/repo:ro" -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 -w /opt/repo \
+            behalfbot-open:ci-eval python3 -m unittest discover -s tests/eval -v
       - name: Dispatcher self-test inside the image (its bash, jq and coreutils)
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \
