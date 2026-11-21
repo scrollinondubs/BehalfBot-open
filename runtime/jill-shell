@@ -1,0 +1,12 @@
+#!/bin/sh
+# /opt/jill/bin/bash - the shell OpenCode runs every bash tool command with
+# (opencode.json "shell"). OpenCode calls it as: bash -c "<command>".
+#
+# Runs the command with an EMPTY environment plus a fixed minimal set, so
+# nothing the server process was started with reaches a tool command by
+# name. (The server holds no secrets anyway; this keeps it that way if one
+# is ever added.) The basename is "bash" so OpenCode treats it as bash.
+umask 022
+exec env -i HOME=/home/node USER=node LOGNAME=node SHELL=/bin/bash LANG=C.UTF-8 TERM=dumb \
+  PATH=/usr/local/bin:/usr/bin:/bin \
+  /bin/bash "$@"

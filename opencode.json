@@ -2,7 +2,15 @@
   "$schema": "https://opencode.ai/config.json",
   "model": "venice/zai-org-glm-5-2",
   "small_model": "venice/z-ai-glm-5-3-flash",
+  "enabled_providers": [
+    "venice"
+  ],
+  "shell": "/opt/jill/bin/bash",
+  "lsp": false,
+  "formatter": false,
   "instructions": [
+    "/app/AGENTS.md",
+    "/app/.opencode/instructions/response-style.md",
     ".opencode/instructions/response-style.md"
   ],
   "autoupdate": false,
@@ -12,8 +20,8 @@
       "npm": "@ai-sdk/openai-compatible",
       "name": "Venice AI",
       "options": {
-        "baseURL": "https://api.venice.ai/api/v1",
-        "apiKey": "{env:VENICE_API_KEY}"
+        "baseURL": "{env:VENICE_BASE_URL}",
+        "apiKey": "not-a-key-venice-proxy-holds-it"
       },
       "whitelist": [
         "zai-org-glm-5-2",
@@ -37,6 +45,11 @@
   },
   "permission": {
     "edit": "allow",
+    "external_directory": {
+      "*": "deny",
+      "/workspace/**": "allow",
+      "/tmp/**": "allow"
+    },
     "bash": {
       "*": "allow",
       "rm -rf *": "deny",
@@ -65,7 +78,9 @@
     },
     "skill": {
       "*": "allow"
-    }
+    },
+    "webfetch": "deny",
+    "websearch": "deny"
   },
   "mcp": {
     "memory": {
@@ -80,17 +95,10 @@
       }
     },
     "brave-search": {
-      "type": "local",
-      "command": [
-        "node",
-        "/opt/mcp/node_modules/@brave/brave-search-mcp-server/dist/index.js",
-        "--transport",
-        "stdio"
-      ],
+      "type": "remote",
+      "url": "http://brave-proxy:8080/mcp",
       "enabled": true,
-      "environment": {
-        "BRAVE_API_KEY": "{env:BRAVE_API_KEY}"
-      }
+      "oauth": false
     },
     "siyuan": {
       "type": "local",
@@ -100,31 +108,8 @@
       ],
       "enabled": true,
       "environment": {
-        "SIYUAN_URL": "{env:SIYUAN_URL}",
-        "SIYUAN_TOKEN": "{env:SIYUAN_TOKEN}"
+        "SIYUAN_URL": "http://siyuan-proxy:8080"
       }
-    },
-    "tavily": {
-      "type": "local",
-      "command": [
-        "node",
-        "/opt/mcp/node_modules/tavily-mcp/build/index.js"
-      ],
-      "enabled": false,
-      "environment": {
-        "TAVILY_API_KEY": "{env:TAVILY_API_KEY}"
-      }
-    },
-    "context7": {
-      "type": "local",
-      "command": [
-        "node",
-        "/opt/mcp/node_modules/@upstash/context7-mcp/dist/index.js"
-      ],
-      "enabled": false
     }
-  },
-  "enabled_providers": [
-    "venice"
-  ]
+  }
 }

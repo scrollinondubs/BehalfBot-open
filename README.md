@@ -83,7 +83,15 @@ mcp/package.json + lockfile        # MCP servers, exact versions, installed at i
 .opencode/
   skills/brand-voice/SKILL.md      # first ported skill
   agents/software-engineering.md   # first ported subagent
-  plugins/guardrails.ts            # TS port of the bash guardrail hooks
+  plugins/guardrails.ts            # wires the guards into OpenCode (one export only)
+  guards/policy.ts                 # the deny rules: secrets, egress, AgentMail, writes, rm, git
+config/guards.json                 # egress hosts, write roots, AgentMail recipients (read-only in the image)
+selftest/                          # boot self-test: real opencode run against a scripted model
+gateway/gateway.py                 # gateways: Venice, AgentMail, SiYuan, Brave MCP, fetch, serve API
+gateway/approvals.py               # Sean's one-shot approvals (draft send, URL fetch) + CLI
+runtime/setup-netns.sh             # firewall for opencode-serve's network namespace (jill-netns)
+runtime/jill-shell                 # the bash tool's shell: empty environment
+tests/                             # unit tests (node --test) and shell tests
   instructions/response-style.md   # loaded via the instructions array
 config/security-allowlist.json     # authorized security-scan targets
 scripts/run.sh                     # headless wrapper (claude -p analog)

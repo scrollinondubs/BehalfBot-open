@@ -29,6 +29,16 @@ if [[ -z "${VENICE_API_KEY:-}" ]]; then
   exit 1
 fi
 
+# Bare-host runs talk to Venice directly; the Docker stack points this at the
+# venice-proxy sidecar instead, which holds the key.
+export VENICE_BASE_URL="${VENICE_BASE_URL:-https://api.venice.ai/api/v1}"
+# opencode.json carries no key (the Docker stack's venice-proxy holds it);
+# bare-host runs supply the key from the environment instead.
+if [[ -z "${OPENCODE_CONFIG_CONTENT:-}" ]]; then
+  OPENCODE_CONFIG_CONTENT='{"provider":{"venice":{"options":{"apiKey":"{env:VENICE_API_KEY}"}}}}'
+  export OPENCODE_CONFIG_CONTENT
+fi
+
 # Default memory MCP store to a repo-local gitignored path.
 export BEHALFBOT_MEMORY_FILE="${BEHALFBOT_MEMORY_FILE:-$REPO_DIR/memory/memory.jsonl}"
 mkdir -p "$(dirname "$BEHALFBOT_MEMORY_FILE")"
