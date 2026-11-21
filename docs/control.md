@@ -16,10 +16,12 @@ None of it gives Jill a new secret or a new way out of her container.
 ## The pieces
 
 ```
-Sean (Matrix control room, NOT encrypted)
-   |  halt / resume / conserve / unconserve / status
-   v
-jill-control  (gateway/control.py)            holds MATRIX_CONTROL_TOKEN
+Sean (Matrix control room, NOT encrypted)      Sean (Jill's chat room, E2EE)
+   |  halt / conserve / unconserve /              |  halt / resume / status /
+   |  status / reset meter                        |  reset meter [spend]
+   v                                              v
+jill-control  (gateway/control.py)            matrix-bridge (#50, bridge/WIRING.md)
+holds MATRIX_CONTROL_TOKEN                    writes the same flags in control-state
    | writes                ^ reads                 ^ reads          ^ drains
    v                       |                       |                |
 control-state            cred-venice,           venice-meter     alert-spool
@@ -35,31 +37,46 @@ dispatcher    -> (heartbeats profile only) skips everything while halted
 ```
 
 `opencode-serve` (Jill) mounts none of these volumes and cannot reach
-`jill-control`. That sidecar is not on `jill-internal` and listens on no
+`jill-control` or `matrix-bridge`. That sidecar is not on `jill-internal` and listens on no
 port. `selftest/contain.sh` checks all of this from inside serve at every
 boot.
 
 ## Kill switch
 
-Send one of these as a whole message in the control room:
+Send one of these as a whole message. "Where" says which room accepts it:
 
-| Word | Effect |
-|---|---|
-| `halt [2h] [reason]` (also `mute`, `silence`) | `venice-proxy` refuses every model call, chat included. Heartbeats (if on) are skipped, `critical` too |
-| `resume` (also `unmute`, `unhalt`) | Clears halt and conservation |
-| `conserve [2h] [reason]` (also `throttle`, `conservation on`) | Heartbeats: only `critical` ones run. Chat is unaffected |
-| `unconserve` (also `conservation off`) | Clears conservation |
-| `status` | Reports both flags |
-| `reset meter` | Zeroes today's Venice request count and rate window (spend is kept). `jill-control` records the request in control-state; `venice-proxy` applies it once, on its next call |
-| `reset meter spend` | The same, and also zeroes today's dollar spend |
+| Word | Where | Effect |
+|---|---|---|
+| `halt [2h] [reason]` (also `mute`, `silence`) | both | `venice-proxy` refuses every model call, chat included. Heartbeats (if on) are skipped, `critical` too |
+| `resume` (also `unmute`, `unhalt`) | **chat room only** | Clears halt and conservation |
+| `conserve [2h] [reason]` (also `throttle`, `conservation on`) | control room | Heartbeats: only `critical` ones run. Chat is unaffected |
+| `unconserve` (also `conservation off`) | control room | Clears conservation |
+| `status` | both | Reports both flags |
+| `reset meter` | both | Zeroes today's Venice request count and rate window (spend is kept). The request is recorded in control-state; `venice-proxy` applies it once, on its next call |
+| `reset meter spend` | **chat room only** | The same, and also zeroes today's dollar spend |
+
+**Why two rooms (#50).** The control room is unencrypted on a homeserver Jill
+does not control, so its admin can forge any message there.
+
+- **Stops stay in the control room.** A forged `halt` only stops Jill, so
+  `halt` works there.
+- **Lifts move to the chat room.** The words that lift a stop or hand back
+  budget (`resume`, `reset meter spend`) are refused in the control room,
+  with an ack. They work only in Jill's end-to-end encrypted chat room.
+- **What the chat room requires.** The bridge accepts a message only when it
+  decrypts and comes from a device cross-signed by Sean's pinned key
+  (`bridge/WIRING.md`). In that room every command must be under 10 minutes
+  old; an older one is dropped.
 
 - **Duration.** A duration (`30m`, `2h`, `3d`, at least `1m`) sets an auto-lift. `halt 0m` is refused with an ack, because it would lift immediately. With no duration the flag stays until `resume`.
 - **Who.** Only `MATRIX_PRINCIPAL` (your full Matrix user id) is obeyed. Display names are never compared.
 - **Ignored entirely:** edits, a control word inside a sentence, and encrypted events.
-- **Age rule.** `halt` and `conserve` are honoured at any age, in the order sent: a late stop is still a stop. `resume`, `unconserve`, `reset meter` and `reset meter spend` older than 10 minutes are NOT applied, and the room gets an ack saying so; send them again if you still mean them. A stale `status` is ignored silently.
+- **Age rule (control room).** `halt` and `conserve` are honoured at any age, in the order sent: a late stop is still a stop. `unconserve` and `reset meter` older than 10 minutes are NOT applied, and the room gets an ack saying so; send them again if you still mean them. A stale `status`, `resume` or `reset meter spend` is ignored silently.
 
-**What halt does not stop:** a tool call already executing finishes. This
-room keeps listening, so `resume` still works.
+**What halt does not stop:** a tool call already executing finishes. Both
+rooms keep listening, so `resume` (in the chat room) still works. While
+halted, the chat bridge answers every non-command message with a refusal
+and sends nothing to the model.
 
 **Fail-closed rules**
 
@@ -78,9 +95,10 @@ unencrypted room.
 **The homeserver runs in Jax's Docker, so anything posted there is readable
 on Jax's side, and a homeserver admin could forge a message from Sean.** For
 the first reason, every alert is content-free: fixed templates with names,
-counts and dollar figures only. The E2EE chat bridge (package D, #50) is
-separate and can take over alert delivery later with no change to the spool
-format.
+counts and dollar figures only. For the second, `resume` and `reset meter
+spend` are accepted only in the E2EE chat room (#50). The chat bridge spools
+its own content-free alerts here: an identity change, or a change to the
+room.
 
 ## The Venice ceiling (the main spend control)
 
@@ -138,7 +156,15 @@ Things only a real Venice call can show, to check on the first live calls:
 - [ ] Venice accepts a request carrying both `max_tokens` and `max_completion_tokens`.
 - [ ] Billed prompt tokens stay below request bytes + 4096 (the hold's bound). The tripwire alert fires if not.
 - [ ] Prices in `VENICE_PRICES` match venice.ai/pricing for GLM 5.2 and GLM 5.3 Flash.
-- [ ] `status`, `halt`, `resume` and `reset meter` round-trip in the control room.
+- [ ] `status`, `halt` and `reset meter` round-trip in the control room, and `resume` there is refused with an ack.
+
+The encrypted chat bridge (#50, `bridge/WIRING.md`):
+
+- [ ] Sean confirms the master-key fingerprint that `matrix-bridge setup` printed matches the one his own client shows for his account, compared on his device, not from a copy the server could supply.
+- [ ] Element X shows Jill as cross-signed (verified, no warning shield) in the room.
+- [ ] A real encrypted round trip: Sean sends a message, the log shows `accept event=...`, Jill replies, and Element X decrypts the reply. Then `halt`, a chat message (refused, no model call in the venice-proxy log), `resume` (lifts it), and `show draft` / `approve draft` on a test draft.
+- [ ] A replayed event does nothing. Restart the bridge (`docker compose restart matrix-bridge`): no message is answered twice, and the log shows no new `accept` for old event ids.
+- [ ] A message from a second, non-principal device is dropped. Log in to Sean's account on a new session, do NOT verify it, send a message: the log shows `drop event=... reason=device-not-cross-signed` and Jill does not answer. Then log out that session.
 
 ## Heartbeats (off by default)
 
@@ -220,6 +246,8 @@ their keys are set.
 
 ```bash
 python3 -m unittest discover -s tests/control -v   # jill-control vs a fake homeserver
+python3 -m unittest discover -s tests/bridge -v    # chat commands, halt gate, approval screen
+(cd matrix-bridge && CGO_ENABLED=0 go test -tags goolm ./...)   # acceptance rule, pinned trust chain
 python3 -m unittest discover -s tests/gateway -v   # incl. venice gate + meter, credential probe
 bash scheduled-tasks/dispatcher-selftest.sh        # real dispatcher ticks, fake opencode
 ```

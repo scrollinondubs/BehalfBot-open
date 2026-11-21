@@ -43,7 +43,7 @@ briefings/
 .local/
 .DS_Store
 
-# discord bridge runtime state
+# bridge runtime state (legacy host runs)
 bridge/.venv/
 bridge/.sessions.json
 logs/

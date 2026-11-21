@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Single boot agent for the Dockerized stack. Replaces BOTH legacy agents
-     (com.jax.opencode-serve + com.jax.discord-bridge): it only ensures Colima
+<!-- Single boot agent for the Dockerized stack. Replaces the legacy host
+     agents (retired by docker/cutover.sh): it only ensures Colima
      is up and runs `docker compose up -d`; Docker's restart policy does the
      actual supervision. Install via docker/boot.sh header instructions. -->
 <plist version="1.0">

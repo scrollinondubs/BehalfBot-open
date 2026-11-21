@@ -4,7 +4,8 @@ name: Guards
 # ever made required deadlocks unrelated PRs.
 #
 # Two jobs, proving different things:
-#   unit      the deny rules themselves (fast, no Docker)
+#   unit      the deny rules, gateway and control policy, the Matrix bridge's
+#             acceptance rule (fast, no Docker)
 #   selftest  the built image: guard files read-only, plugin actually loaded
 #             by OpenCode, denials firing in the parent session AND in a
 #             subagent, against a scripted local model. No keys, no network
@@ -34,6 +35,20 @@ jobs:
         run: python3 -m unittest discover -s tests/gateway -v
       - name: Kill switch, alert spool, credential expiry (jill-control vs a fake homeserver)
         run: python3 -m unittest discover -s tests/control -v
+      - name: Matrix bridge worker (commands, halt gate, approval screen, approve binding)
+        run: python3 -m unittest discover -s tests/bridge -v
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: matrix-bridge/go.mod
+          cache-dependency-path: matrix-bridge/go.sum
+      - name: Matrix bridge acceptance rule and pinned trust chain (pure Go, goolm, no cgo)
+        working-directory: matrix-bridge
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go mod verify
+          go vet -tags goolm ./...
+          go test -tags goolm -count=1 -v ./...
       - name: Dispatcher controls (halt, caps, spend cap, all-failed alarm, state lock; heartbeats ship off)
         run: bash scheduled-tasks/dispatcher-selftest.sh
 

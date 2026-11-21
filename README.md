@@ -47,7 +47,7 @@ non-root user - the model process structurally cannot reach the macOS
 Keychain, Vaultwarden, or /Users files.
 
 ```bash
-cp .env.example .env        # fill VENICE_API_KEY, DISCORD_BOT_TOKEN, JAX_OPEN_CHANNEL_ID
+cp .env.example .env        # fill VENICE_API_KEY, OPENCODE_SERVER_PASSWORD, MATRIX_* (bridge/WIRING.md)
 bash docker/boot.sh         # ensures Colima is up, then docker compose up -d
 ```
 
@@ -58,9 +58,9 @@ Two services on a private compose network:
   network, by service name. The API has no auth layer, so the publish was
   removed on 2026-07-27; the `docker-compose.yml` header is the source of
   truth on why. For a host-side smoke test use `docker compose exec`.
-- `discord-bridge` - principal-only Discord relay, reaches serve at
-  `http://opencode-serve:4747`; ships with `BRIDGE_DRY_RUN=1` (no Discord
-  gateway session) until `bash docker/cutover.sh` flips it live
+- `matrix-bridge` - end-to-end encrypted Matrix chat with the principal
+  (#50), reaches serve through `api-proxy`; it needs a one-time interactive
+  `docker compose run --rm matrix-bridge-setup` before it will listen
 
 Proof the containerized serve answers GLM-5.2 end to end:
 `docker/serve-container-smoke.json`. Full wiring + cutover + rollback:
@@ -104,11 +104,11 @@ HEARTBEATS.md.template             # heartbeat schema + template (copy to HEARTB
 triggers.yaml.template             # trigger registry template (copy to triggers.yaml)
 memory/                            # file-based memory templates (MEMORY.md.template, WRITING_RULES.md)
 Dockerfile                         # one image, three services, non-root, no baked secrets
-docker-compose.yml                 # opencode-serve + discord-bridge (+ opt-in heartbeat-dispatcher)
+docker-compose.yml                 # opencode-serve, gateways, matrix-bridge (+ opt-in heartbeat-dispatcher)
 docker/
   boot.sh                          # ensure Colima up + compose up (single boot entrypoint)
   com.jax.behalfbot-docker.plist   # optional single launchd agent replacing both legacy agents
-  cutover.sh                       # host launchd -> Docker cutover with verify + rollback
+  cutover.sh                       # retire legacy host agents, start + verify the Matrix bridge
   serve-container-smoke.json       # proof: containerized serve answering GLM-5.2
 docs/PORTING.md                    # 6-phase plan + hardest gaps + issue links
 docs/heartbeat-dispatcher.md       # dispatcher architecture + claude-p -> opencode-run mapping
@@ -130,29 +130,25 @@ Heartbeats are **off by default**: the dispatcher sits behind the `heartbeats` c
 
 Full writeup: [docs/heartbeat-dispatcher.md](docs/heartbeat-dispatcher.md). The companion `scripts/dispatch-trigger.sh` routes keyword-prefixed inbound messages (registered in `triggers.yaml`) to shell handlers deterministically, without a model round trip.
 
-## Discord bridge (channel layer, Phase 4)
+## Matrix bridge (channel layer, #50)
 
-`bridge/` makes the open-weight Jill reachable from Discord:
+Jill's chat with Sean is an end-to-end encrypted Matrix room. The homeserver
+is administered by someone else, so the bridge trusts it for nothing:
 
-- `bridge/discord_bridge.py` - discord.py relay: principal-only, single
-  allowlisted channel, one persistent opencode session per channel,
-  `/reset` for a fresh session, replies chunked to Discord's 2000-char limit;
-  `BRIDGE_DRY_RUN=1` starts it without a Discord gateway session
-- Attachments: PDF and `text/*` uploads are extracted to plain text and
-  prepended to the prompt inside fenced UNTRUSTED DOCUMENT blocks, so a bill
-  or a log can be asked about directly. Discord native forwards are read from
-  `message_snapshots`. Other types are skipped with a note; a PDF with no text
-  layer (a scan or photo) is rejected with an explanation rather than sent
-  empty - there is no OCR in the container. Caps: `BRIDGE_MAX_ATTACHMENT_BYTES`
-  (default 10000000) and `BRIDGE_MAX_DOC_CHARS` (default 40000)
-- Canonical run mode is the Docker stack above; sessions persist in the
-  `bridge-state` named volume
-- Legacy host artifacts kept for rollback: `bridge/opencode-serve.sh` plus
-  the two launchd plists
-- `bridge/serve-smoke.json` - original host proof; `docker/serve-container-smoke.json` -
-  containerized proof of `venice/zai-org-glm-5-2` over the serve API
+- `matrix-bridge/` - Go (mautrix-go with its pure-Go `goolm` crypto, no cgo,
+  no libolm). It owns sync, decryption, encryption and the trust decision:
+  a message is acted on only if it decrypts, comes from the principal, and
+  comes from a device cross-signed by the master key pinned at setup. It is
+  also fresh, not an edit, and not a replay. Replies are encrypted only to
+  those devices.
+- `bridge/matrix_worker.py` - the policy the Discord bridge had, plus:
+  commands (`halt`, `resume`, `reset meter [spend]`, `status`, `new`), the
+  halt gate, the draft approval screen (`show draft`, `approve draft`),
+  opencode sessions, and PDF and text extraction from decrypted attachments.
+- Keys, token and pin live in the `matrix-bridge-state` volume, mounted into
+  no other service. No server-side key backup.
 
-Setup in under 10 minutes: [bridge/WIRING.md](bridge/WIRING.md).
+Setup, threat model and acceptance rules: [bridge/WIRING.md](bridge/WIRING.md).
 
 ## Porting plan
 

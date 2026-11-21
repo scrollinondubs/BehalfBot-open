@@ -1,12 +1,24 @@
-# BehalfBot-open runtime image - opencode serve + Discord bridge (Jill).
+# BehalfBot-open runtime image - opencode serve + Matrix bridge (Jill).
 #
-# One image, two services (see docker-compose.yml). Docker-native from the
+# One image, several services (see docker-compose.yml). Docker-native from the
 # ground up: this container IS the security isolation for the open-weight
 # lane (issue #9). It structurally cannot reach the host macOS Keychain,
 # Vaultwarden, or /Users/jax - nothing from the host home is ever mounted.
 #
 # Secrets are NEVER baked in: no ARG/ENV carries a key, no .env is copied
 # (.dockerignore excludes it). They arrive at runtime via compose.
+
+# The Matrix bridge (matrix-bridge/, #50): pure Go, no cgo, no libolm. The
+# `goolm` tag selects mautrix-go's Go Olm/Megolm; without it the build
+# would need libolm and fail here, loudly. Only the binary reaches the
+# runtime image.
+FROM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS matrix-bridge-build
+WORKDIR /src
+COPY matrix-bridge/go.mod matrix-bridge/go.sum ./
+RUN go mod download && go mod verify
+COPY matrix-bridge/ ./
+RUN CGO_ENABLED=0 go test -tags goolm ./... \
+    && CGO_ENABLED=0 go build -tags goolm -trimpath -ldflags "-s -w" -o /out/matrix-bridge .
 
 FROM node:22-bookworm-slim
 
@@ -33,10 +45,11 @@ COPY mcp/package.json mcp/package-lock.json /opt/mcp/
 RUN cd /opt/mcp && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
     && npm cache clean --force
 
-# Bridge deps (Debian bookworm is PEP 668, hence --break-system-packages;
-# this is a single-purpose container, not a shared host).
+# Bridge worker deps (Debian bookworm is PEP 668, hence
+# --break-system-packages; this is a single-purpose container, not a shared
+# host).
 RUN pip3 install --no-cache-dir --break-system-packages \
-        "discord.py>=2.4,<3" "aiohttp>=3.9,<4" "pypdf>=5,<7"
+        "aiohttp>=3.9,<4" "pypdf>=5,<7"
 
 WORKDIR /app
 
@@ -48,7 +61,8 @@ COPY selftest/ ./selftest/
 COPY gateway/gateway.py gateway/approvals.py gateway/control.py gateway/control_flags.py ./gateway/
 COPY runtime/jill-shell /opt/jill/bin/bash
 COPY runtime/setup-netns.sh /opt/jill/bin/setup-netns.sh
-COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
+COPY bridge/matrix_worker.py ./bridge/matrix_worker.py
+COPY --from=matrix-bridge-build /out/matrix-bridge /opt/jill/bin/matrix-bridge
 
 # opencode-serve runs as node (uid 1000), NON-ROOT, with NO capabilities,
 # and holds NO secrets (round-2 red-team C1): no upstream key, no API
@@ -66,7 +80,7 @@ COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
 #   /app, global config, /home/node   uid 65534 (nobody), read-only to all
 #   /var/lib/opencode, /data          node 0700 (OpenCode data, memory MCP)
 #   /workspace                        node (her files)
-#   /state/{bridge,dispatcher,gateway,approvals,control,alerts,credentials,venice}
+#   /state/{matrix-bridge,dispatcher,gateway,approvals,control,alerts,credentials,venice}
 #                                     node, per-container volumes
 RUN git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
@@ -75,14 +89,14 @@ RUN git init -q /app \
     && git -C /app add -A && git -C /app commit -qm "image snapshot" \
     && mkdir -p /etc/opencode-xdg/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode \
         /data /workspace /home/node/.local/state /home/node/.cache \
-        /state/bridge /state/dispatcher /state/gateway /state/approvals \
+        /state/matrix-bridge /state/dispatcher /state/gateway /state/approvals \
         /state/control /state/alerts /state/credentials /state/venice \
         /state/credentials/venice /state/credentials/agentmail /state/credentials/siyuan \
     && cp /app/.opencode/.gitignore /etc/opencode-xdg/opencode/.gitignore \
     && printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /etc/opencode-xdg/opencode/opencode.jsonc \
     && chown -R 65534:65534 /app /etc/opencode-xdg /home/node \
     && chmod -R u=rwX,go=rX /app /etc/opencode-xdg /home/node /opt/jill \
-    && chmod 0755 /opt/jill/bin/bash /opt/jill/bin/setup-netns.sh \
+    && chmod 0755 /opt/jill/bin/bash /opt/jill/bin/setup-netns.sh /opt/jill/bin/matrix-bridge \
     && chown -R node:node /var/lib/opencode /var/cache/opencode /data /workspace \
         /home/node/.local/state /home/node/.cache /state \
     && chmod 0700 /var/lib/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode /data
