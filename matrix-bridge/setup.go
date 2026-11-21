@@ -58,7 +58,7 @@ func (t *ttyPrompter) Say(text string) { fmt.Fprintln(t.f, text) }
 // self-signed device, joins the chat room, and pins the principal's master
 // key after Sean confirms its fingerprint.
 func Setup(ctx context.Context, cfg Config, p Prompter) error {
-	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+	if err := HardenState(cfg); err != nil {
 		return err
 	}
 	creds, err := LoadCreds(cfg.StateDir)
@@ -150,8 +150,25 @@ func Setup(ctx context.Context, cfg Config, p Prompter) error {
 	if err := cli.StateEvent(ctx, cfg.Room, event.StateEncryption, "", &enc); err != nil || enc.Algorithm != id.AlgorithmMegolmV1 {
 		return fmt.Errorf("room %s is not end-to-end encrypted; turn on encryption before setup", cfg.Room)
 	}
+	// Nothing in this setup may leave a usable room key behind: the room's
+	// outbound session is discarded however setup ends (round 6 H1).
+	defer func() {
+		if err := mach.CryptoStore.RemoveOutboundGroupSession(context.WithoutCancel(ctx), cfg.Room); err != nil {
+			p.Say("WARNING: could not discard the setup room key: " + err.Error())
+		}
+	}()
 
 	b := &Bridge{cfg: cfg, cli: cli}
+	// Before anything is encrypted: the room must hold Jill and the
+	// principal and nobody else (joined, invited or knocking).
+	facts, err := b.roomState(ctx)
+	if err != nil {
+		return fmt.Errorf("could not read the room's members: %w", err)
+	}
+	if !exactMembers(facts.members, cli.UserID, cfg.Principal) {
+		return fmt.Errorf("the room's members are %v; it must hold exactly %s and %s before setup shares any key",
+			facts.members, cli.UserID, cfg.Principal)
+	}
 	raw, err := b.principalKeys(ctx)
 	if err != nil {
 		return fmt.Errorf("could not read %s's keys: %w", cfg.Principal, err)
@@ -202,4 +219,15 @@ func Setup(ctx context.Context, cfg Config, p Prompter) error {
 	}
 	p.Say("Restart the bridge: docker compose up -d matrix-bridge")
 	return nil
+}
+
+func exactMembers(members []id.UserID, a, b id.UserID) bool {
+	seen := map[id.UserID]bool{}
+	for _, m := range members {
+		if m != a && m != b {
+			return false
+		}
+		seen[m] = true
+	}
+	return seen[a] && seen[b]
 }

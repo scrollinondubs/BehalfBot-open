@@ -6,6 +6,9 @@
 //	                      verification of the principal, pin
 //	matrix-bridge setup --no-sas
 //	                      fallback: pin after a typed fingerprint check
+//	matrix-bridge status  pin, login and identity lock, for the host
+//	matrix-bridge isolation-check
+//	                      proves the worker uid cannot read the bridge state
 //
 // The homeserver is run by someone else, so nothing here trusts it: every
 // accepted message must decrypt, come from the principal, and come from a
@@ -26,7 +29,7 @@ func nowUnix() int64 { return time.Now().Unix() }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: matrix-bridge run|setup")
+		fmt.Fprintln(os.Stderr, "usage: matrix-bridge run|setup|status|isolation-check")
 		os.Exit(64)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -58,8 +61,18 @@ func main() {
 			<-ctx.Done()
 			os.Exit(1)
 		}
+	case "status":
+		if err := Status(cfg); err != nil {
+			os.Exit(2)
+		}
+	case "isolation-check":
+		if err := IsolationCheck(ctx, cfg); err != nil {
+			logf("ISOLATION CHECK FAILED: %v", err)
+			os.Exit(1)
+		}
+		logf("isolation check passed: the worker cannot read the bridge state")
 	default:
-		fmt.Fprintln(os.Stderr, "usage: matrix-bridge run|setup")
+		fmt.Fprintln(os.Stderr, "usage: matrix-bridge run|setup|status|isolation-check")
 		os.Exit(64)
 	}
 }

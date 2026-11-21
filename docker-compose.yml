@@ -333,6 +333,17 @@ services:
     container_name: behalfbot-matrix-bridge
     command: ["/opt/jill/bin/matrix-bridge", "run"]
     working_dir: /app
+    # Round 6 M4. The bridge runs as root with every capability dropped but
+    # SETUID/SETGID, which it needs for one thing: starting the Python worker
+    # as node (1000). The kernel switches the child's uid before exec; with
+    # no capabilities left, the worker cannot switch back. Bridge state is
+    # root 0700, so the worker cannot read the token, pickle key or crypto
+    # store. `matrix-bridge isolation-check` proves it (CI runs it).
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID]
+    mem_limit: 512m
+    pids_limit: 128
     environment: &matrix-bridge-env
       MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-http://host.docker.internal:8008}
       MATRIX_PRINCIPAL: ${MATRIX_PRINCIPAL:?set MATRIX_PRINCIPAL in .env (bridge/WIRING.md)}
@@ -340,8 +351,11 @@ services:
       MATRIX_JILL_USER: ${MATRIX_JILL_USER:-}
       MATRIX_BRIDGE_STATE: /state/matrix-bridge
       BRIDGE_READY_FILE: /tmp/bridge-ready
-      # Python worker (bridge/matrix_worker.py), a child of the Go binary
-      WORKER_STATE_DIR: /state/matrix-bridge/worker
+      # Python worker (bridge/matrix_worker.py), a child of the Go binary,
+      # run as this uid/gid and kept out of /state/matrix-bridge
+      BRIDGE_WORKER_UID: "1000"
+      BRIDGE_WORKER_GID: "1000"
+      WORKER_STATE_DIR: /state/matrix-worker
       DEFAULT_MODEL: ${DEFAULT_MODEL:-venice/zai-org-glm-5-2}
       OPENCODE_SERVER_URL: http://api-proxy:4748
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
@@ -356,6 +370,7 @@ services:
       CONSUMED_DIRS: /state/agentmail-gw/consumed:/state/fetch-gw/consumed
     volumes:
       - matrix-bridge-state:/state/matrix-bridge
+      - matrix-worker-state:/state/matrix-worker
       - control-state:/state/control
       - alert-spool:/state/alerts
       - approvals:/state/approvals
@@ -367,7 +382,6 @@ services:
     networks: [jill-control, jill-callers]
     read_only: true
     tmpfs: [/tmp]
-    cap_drop: [ALL]
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -401,7 +415,10 @@ services:
       driver: none
     read_only: true
     tmpfs: [/tmp]
+    user: "0:0"
     cap_drop: [ALL]
+    mem_limit: 512m
+    pids_limit: 128
     security_opt:
       - no-new-privileges:true
 
@@ -495,7 +512,8 @@ volumes:
   serve-data:       # memory MCP jsonl
   matrix-bridge-state: # Jill's Matrix device keys, cross-signing state, access token, the pin
                        # of Sean's master key, handled event ids, opencode session map.
-                       # Mounted ONLY into matrix-bridge and matrix-bridge-setup.
+                       # Mounted ONLY into matrix-bridge and matrix-bridge-setup. root 0700.
+  matrix-worker-state: # the worker's one-time codes and opencode session map (node)
   dispatcher-state: # heartbeat state, logs, telemetry, briefings
   approvals:        # Sean's one-shot approvals (matrix-bridge/dispatcher write, gateways read)
   agentmail-state:  # draft snapshots (what a send delivers), consumed approvals

@@ -20,7 +20,7 @@ COPY matrix-bridge/ ./
 RUN CGO_ENABLED=0 go test -tags goolm ./... \
     && CGO_ENABLED=0 go build -tags goolm -trimpath -ldflags "-s -w" -o /out/matrix-bridge .
 
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
 
 # python3 for the bridge, curl for the compose healthcheck, git because
 # opencode prefers running inside a repo, ca-certificates for TLS, jq for the
@@ -48,8 +48,11 @@ RUN cd /opt/mcp && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
 # Bridge worker deps (Debian bookworm is PEP 668, hence
 # --break-system-packages; this is a single-purpose container, not a shared
 # host).
-RUN pip3 install --no-cache-dir --break-system-packages \
-        "aiohttp>=3.9,<4" "pypdf>=5,<7"
+# Exact versions with hashes, wheels only, no dependency resolution
+# (round 6 L5).
+COPY bridge/requirements.lock /tmp/bridge-requirements.lock
+RUN pip3 install --no-cache-dir --break-system-packages --require-hashes --no-deps --only-binary=:all: \
+        -r /tmp/bridge-requirements.lock && rm /tmp/bridge-requirements.lock
 
 WORKDIR /app
 
@@ -80,7 +83,10 @@ COPY --from=matrix-bridge-build /out/matrix-bridge /opt/jill/bin/matrix-bridge
 #   /app, global config, /home/node   uid 65534 (nobody), read-only to all
 #   /var/lib/opencode, /data          node 0700 (OpenCode data, memory MCP)
 #   /workspace                        node (her files)
-#   /state/{matrix-bridge,dispatcher,gateway,approvals,control,alerts,credentials,venice}
+#   /state/matrix-bridge              root 0700: the Matrix bridge runs as root
+#                                     with only CAP_SETUID/CAP_SETGID and starts
+#                                     its worker as node, which cannot read it
+#   /state/{matrix-worker,dispatcher,gateway,approvals,control,alerts,credentials,venice}
 #                                     node, per-container volumes
 RUN git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
@@ -89,7 +95,7 @@ RUN git init -q /app \
     && git -C /app add -A && git -C /app commit -qm "image snapshot" \
     && mkdir -p /etc/opencode-xdg/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode \
         /data /workspace /home/node/.local/state /home/node/.cache \
-        /state/matrix-bridge /state/dispatcher /state/gateway /state/approvals \
+        /state/matrix-bridge /state/matrix-worker /state/dispatcher /state/gateway /state/approvals \
         /state/control /state/alerts /state/credentials /state/venice \
         /state/credentials/venice /state/credentials/agentmail /state/credentials/siyuan \
     && cp /app/.opencode/.gitignore /etc/opencode-xdg/opencode/.gitignore \
@@ -99,7 +105,8 @@ RUN git init -q /app \
     && chmod 0755 /opt/jill/bin/bash /opt/jill/bin/setup-netns.sh /opt/jill/bin/matrix-bridge \
     && chown -R node:node /var/lib/opencode /var/cache/opencode /data /workspace \
         /home/node/.local/state /home/node/.cache /state \
-    && chmod 0700 /var/lib/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode /data
+    && chmod 0700 /var/lib/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode /data \
+    && chown root:root /state/matrix-bridge && chmod 0700 /state/matrix-bridge
 
 USER node
 ENV HOME=/home/node \

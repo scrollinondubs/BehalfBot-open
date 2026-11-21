@@ -1,29 +1,28 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"os"
-	"path/filepath"
+	"context"
 	"sync"
 	"time"
 )
 
-// Alerter writes content-free alerts to the spool jill-control drains (it
-// posts them to the unencrypted alerts room, so fixed texts only). One
-// alert per kind per hour.
+// Alerter spools content-free alerts for jill-control, which posts them to
+// the unencrypted alerts room, so fixed texts only. One alert per kind per
+// hour. The spool belongs to the worker uid, so the file is written by a
+// worker process: the bridge itself holds no write access outside its own
+// state (round 6 M4).
 type Alerter struct {
-	dir  string
-	mu   sync.Mutex
-	last map[string]time.Time
+	worker WorkerSpec
+	mu     sync.Mutex
+	last   map[string]time.Time
 }
 
-func NewAlerter(dir string) *Alerter { return &Alerter{dir: dir, last: map[string]time.Time{}} }
+func NewAlerter(worker WorkerSpec) *Alerter {
+	return &Alerter{worker: worker, last: map[string]time.Time{}}
+}
 
 func (a *Alerter) Send(kind, text string) {
-	if a == nil || a.dir == "" {
+	if a == nil || len(a.worker.Argv) == 0 {
 		return
 	}
 	a.mu.Lock()
@@ -31,16 +30,7 @@ func (a *Alerter) Send(kind, text string) {
 	if t, ok := a.last[kind]; ok && time.Since(t) < time.Hour {
 		return
 	}
-	suffix := make([]byte, 4)
-	_, _ = rand.Read(suffix)
-	name := fmt.Sprintf("%d-matrix-bridge-%s.json", time.Now().UnixNano(), hex.EncodeToString(suffix))
-	data, _ := json.Marshal(map[string]string{"kind": kind, "text": text})
-	tmp := filepath.Join(a.dir, "."+name+".tmp")
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		logf("WARN: could not spool alert %s: %v", kind, err)
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(a.dir, name)); err != nil {
+	if _, err := RunWorker(context.Background(), a.worker, "alert", WorkerRequest{AlertKind: kind, Text: text}, 30*time.Second); err != nil {
 		logf("WARN: could not spool alert %s: %v", kind, err)
 		return
 	}

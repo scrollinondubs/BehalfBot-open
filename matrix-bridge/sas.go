@@ -100,11 +100,11 @@ func VerifyUserSAS(ctx context.Context, cli *mautrix.Client, helper *cryptohelpe
 	mach.SendKeysMinTrust = id.TrustStateCrossSignedTOFU
 	defer func() { mach.SendKeysMinTrust = prevMin }()
 	prevCrypto := cli.Crypto
-	cli.Crypto = OnceCrypto{helper}
+	cli.Crypto = OnceCrypto{helper, []id.UserID{user, cli.UserID}}
 	defer func() { cli.Crypto = prevCrypto }()
 
 	cb := &sasCallbacks{ev: make(chan sasEvent, 16)}
-	FixInRoomVerificationIDs(cli.Syncer.(mautrix.ExtensibleSyncer), cli.UserID)
+	FixInRoomVerificationIDs(cli.Syncer.(mautrix.ExtensibleSyncer), room, user)
 	vh := verificationhelper.NewVerificationHelper(cli, mach, nil, cb, false, false, true)
 	if err := vh.Init(ctx); err != nil {
 		return "", err
@@ -173,15 +173,24 @@ func VerifyUserSAS(ctx context.Context, cli *mautrix.Client, helper *cryptohelpe
 // which encrypts the request itself and then hands it to SendMessageEvent,
 // which encrypts it again: the other side decrypts a ciphertext and never
 // sees a request. Content that is already encrypted passes through.
+//
+// It also shares the room key with Users only, never with whatever member
+// list the server gave the state store (round 6 H1): during setup that is
+// the principal and Jill. The session is discarded when setup ends.
 type OnceCrypto struct {
 	*cryptohelper.CryptoHelper
+	Users []id.UserID
 }
 
 func (o OnceCrypto) Encrypt(ctx context.Context, room id.RoomID, t event.Type, content any) (*event.EncryptedEventContent, error) {
 	if enc, ok := content.(*event.EncryptedEventContent); ok {
 		return enc, nil
 	}
-	return o.CryptoHelper.Encrypt(ctx, room, t, content)
+	mach := o.Machine()
+	if err := mach.ShareGroupSession(ctx, room, o.Users); err != nil {
+		return nil, err
+	}
+	return mach.EncryptMegolmEvent(ctx, room, t, content)
 }
 
 // FixInRoomVerificationIDs works around a second v0.32.0 (and v0.33.0) bug:
@@ -189,11 +198,12 @@ func (o OnceCrypto) Encrypt(ctx context.Context, room id.RoomID, t event.Type, c
 // event by the event's own id, while the transaction is the id of the
 // request it relates to, so every reply to a request is dropped as unknown.
 // Registered before the helper, this sets the event id to the relation
-// target for those event types; nothing else reads it. Our own echoes keep
-// their id, so the helper ignores them as before.
-func FixInRoomVerificationIDs(syncer mautrix.ExtensibleSyncer, self id.UserID) {
+// target for those event types; nothing else reads it. Only events in
+// `room` from `peer` are rewritten (round 6 L4): anything else keeps its id
+// and the helper ignores it as an unknown transaction, our own echoes too.
+func FixInRoomVerificationIDs(syncer mautrix.ExtensibleSyncer, room id.RoomID, peer id.UserID) {
 	fix := func(_ context.Context, evt *event.Event) {
-		if evt.Sender == self {
+		if evt.RoomID != room || evt.Sender != peer {
 			return
 		}
 		var c struct {

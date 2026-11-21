@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"maunium.net/go/mautrix/id"
@@ -223,4 +224,34 @@ func (s *HandledStore) Claim(evt id.EventID) (bool, error) {
 	}
 	s.seen[evt] = now
 	return true, nil
+}
+
+// HardenState makes the bridge state readable by the bridge's uid only and
+// refuses to run a separate-uid worker unless the bridge can switch to it
+// (round 6 M4). New files get 0600 from the umask.
+func HardenState(cfg Config) error {
+	syscall.Umask(0o077)
+	if cfg.Worker.UID > 0 && os.Getuid() != 0 {
+		return errors.New("BRIDGE_WORKER_UID is set but the bridge is not running as root with CAP_SETUID; refusing to run the worker as the bridge's own uid")
+	}
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(cfg.StateDir, 0o700); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(cfg.StateDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		mode := os.FileMode(0o600)
+		if e.IsDir() {
+			mode = 0o700
+		}
+		if err := os.Chmod(filepath.Join(cfg.StateDir, e.Name()), mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -110,7 +111,7 @@ func newPeer(t *testing.T, ctx context.Context, hs string, creds *Creds, minTrus
 		t.Fatal(err)
 	}
 	helper.Machine().SendKeysMinTrust = minTrust
-	cli.Crypto = OnceCrypto{helper}
+	cli.Crypto = helper
 	p := &peer{cli: cli, helper: helper}
 	cli.Syncer.(*mautrix.DefaultSyncer).OnEventType(event.EventMessage, func(_ context.Context, evt *event.Event) {
 		if c, ok := evt.Content.Parsed.(*event.MessageEventContent); ok && evt.Sender != creds.UserID {
@@ -282,7 +283,7 @@ func TestE2E(t *testing.T) {
 	}
 	room := created.RoomID
 	sas := &seanSAS{emojis: make(chan []string, 1), match: make(chan bool, 1), done: make(chan struct{}), logf: t.Logf}
-	FixInRoomVerificationIDs(sean.cli.Syncer.(mautrix.ExtensibleSyncer), sean.cli.UserID)
+	FixInRoomVerificationIDs(sean.cli.Syncer.(mautrix.ExtensibleSyncer), room, jillID)
 	sas.vh = verificationhelper.NewVerificationHelper(sean.cli, smach, nil, sas, false, false, true)
 	if err := sas.vh.Init(ctx); err != nil {
 		t.Fatal(err)
@@ -298,6 +299,7 @@ func TestE2E(t *testing.T) {
 		}
 	}
 	t.Setenv("OPENCODE_SERVER_URL", stubOpencode(t).URL)
+	t.Setenv("ALERT_SPOOL_DIR", filepath.Join(work, "spool"))
 	t.Setenv("MATRIX_PRINCIPAL", seanID.String())
 	t.Setenv("CONTROL_DIR", filepath.Join(work, "control"))
 	t.Setenv("APPROVALS_DIR", filepath.Join(work, "approvals"))
@@ -314,8 +316,8 @@ func TestE2E(t *testing.T) {
 
 	cfg := Config{
 		Homeserver: hs, Principal: seanID, Room: room, JillUser: jillID,
-		StateDir: filepath.Join(work, "jill-state"), SpoolDir: filepath.Join(work, "spool"),
-		Worker: []string{"python3", "-I", worker}, MaxAttach: 1 << 20, ReadyFile: filepath.Join(work, "ready"),
+		StateDir: filepath.Join(work, "jill-state"),
+		Worker:   WorkerSpec{Argv: []string{"python3", "-I", worker}}, MaxAttach: 1 << 20, ReadyFile: filepath.Join(work, "ready"),
 	}
 
 	// 1. Setup: login, cross-signing, SAS with Sean, pin.
@@ -374,7 +376,16 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("approval screen incomplete:\n%s", screen)
 	}
 	sha := strings.TrimPrefix(last, "sha256 ")
-	say("approve draft " + draftID + " " + sha)
+	code := regexp.MustCompile(`approve draft \S+ [0-9a-f]{64} (\S+)`).FindStringSubmatch(screen)
+	if code == nil {
+		t.Fatalf("no approval code on the screen:\n%s", screen)
+	}
+	say("approve draft " + draftID + " " + sha + " " + code[1])
+	challenge := expect("send `confirm ")
+	if m, _ := filepath.Glob(filepath.Join(work, "approvals", "draft", "*.json")); len(m) != 0 {
+		t.Fatal("an approval was written before `confirm`")
+	}
+	say("confirm " + confirmCode(t, challenge))
 	expect("Approved draft " + draftID)
 	matches, _ := filepath.Glob(filepath.Join(work, "approvals", "draft", "*.json"))
 	if len(matches) != 1 {
@@ -383,6 +394,18 @@ func TestE2E(t *testing.T) {
 	if data, _ := os.ReadFile(matches[0]); !strings.Contains(string(data), sha) {
 		t.Fatal("approval is not bound to the typed sha256")
 	}
+
+	// 4b. halt, then resume needs a confirm on the bridge's clock.
+	haltFile := filepath.Join(work, "control", "halt.json")
+	say("halt")
+	expect("HALTED")
+	say("resume")
+	resumeChallenge := expect("lift the halt")
+	if data, _ := os.ReadFile(haltFile); !strings.Contains(string(data), `"enabled": true`) {
+		t.Fatal("resume without confirm lifted the halt")
+	}
+	say("confirm " + confirmCode(t, resumeChallenge))
+	expect("RESUMED")
 
 	// 5. Replay: the server delivers the round-trip event again.
 	raw, err := b.cli.GetEvent(ctx, room, hello)
@@ -422,4 +445,13 @@ func TestE2E(t *testing.T) {
 	if sean.find("taxes") != "" {
 		t.Fatal("the bridge answered the rogue device")
 	}
+}
+
+func confirmCode(t *testing.T, text string) string {
+	t.Helper()
+	m := regexp.MustCompile("confirm ([a-z0-9]{10})").FindStringSubmatch(text)
+	if m == nil {
+		t.Fatalf("no confirm code in %q", text)
+	}
+	return m[1]
 }

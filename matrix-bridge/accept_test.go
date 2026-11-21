@@ -136,3 +136,32 @@ func TestOutboundGate(t *testing.T) {
 		})
 	}
 }
+
+func TestExactMembers(t *testing.T) {
+	if !exactMembers([]id.UserID{testJill, testPrincipal}, testJill, testPrincipal) {
+		t.Fatal("Jill and the principal must pass")
+	}
+	for _, m := range [][]id.UserID{
+		{testJill}, {testPrincipal}, {testJill, testPrincipal, "@eve:test.local"}, {testJill, "@eve:test.local"},
+	} {
+		if exactMembers(m, testJill, testPrincipal) {
+			t.Fatalf("%v must fail", m)
+		}
+	}
+}
+
+func TestRecipientKeyChangesWithMembersDevicesAndPin(t *testing.T) {
+	base := recipientKey("PIN", []id.UserID{testJill, testPrincipal}, []id.DeviceID{"A", "B"})
+	if base != recipientKey("PIN", []id.UserID{testPrincipal, testJill}, []id.DeviceID{"B", "A"}) {
+		t.Fatal("order must not matter")
+	}
+	for _, other := range []string{
+		recipientKey("PIN2", []id.UserID{testJill, testPrincipal}, []id.DeviceID{"A", "B"}),
+		recipientKey("PIN", []id.UserID{testJill, testPrincipal, "@eve:test.local"}, []id.DeviceID{"A", "B"}),
+		recipientKey("PIN", []id.UserID{testJill, testPrincipal}, []id.DeviceID{"A"}),
+	} {
+		if other == base {
+			t.Fatal("a change of pin, member or device must rotate the session")
+		}
+	}
+}

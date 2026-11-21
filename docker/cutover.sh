@@ -50,7 +50,8 @@ done
 log "building image (no-op if current)"
 docker compose build --quiet
 
-if ! docker compose run --rm --no-deps matrix-bridge test -s /state/matrix-bridge/pin.json; then
+if ! docker compose run --rm --no-deps matrix-bridge /opt/jill/bin/matrix-bridge status \
+    | grep -q '^pin: @'; then
   log "matrix-bridge setup has not completed (no pin in the state volume)."
   log "Run it first, interactively: docker compose run --rm matrix-bridge-setup"
   exit 1
@@ -98,7 +99,9 @@ if ! wait_healthy behalfbot-matrix-bridge "$VERIFY_TIMEOUT"; then
   exit 1
 fi
 
-if docker compose logs --since 10m matrix-bridge 2>/dev/null | grep -q "IDENTITY LOCK"; then
+# The identity-lock alert goes through the homeserver admin's room and can
+# be dropped; this check reads the bridge's own state (round 6 L1).
+if ! docker compose exec -T matrix-bridge /opt/jill/bin/matrix-bridge status; then
   log "WARNING: matrix-bridge is up but IDENTITY-LOCKED: it refuses all chat. Re-run setup to re-pin."
   exit 1
 fi
