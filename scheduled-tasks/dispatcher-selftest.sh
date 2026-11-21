@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# dispatcher-selftest.sh - prove every dispatcher control holds, before the
+# dispatcher loop starts (compose runs this first and refuses to loop on a
+# failure). CI runs it too.
+#
+# Each case drives REAL dispatcher ticks (heartbeat-dispatcher.sh, unmodified)
+# in a throwaway state home, against a fake `opencode` that counts its
+# invocations and emits a JSON event stream. Nothing reaches the network,
+# Venice or Matrix: alerts land in a sandbox spool and are inspected.
+#
+#   halt         halt.json on: nothing fires, critical included
+#   halt-expired an auto-lift in the past: fires
+#   halt-garbage an unparseable halt.json: nothing fires (fail closed)
+#   unarmed      CONTROL_REQUIRE_ARMED=1 with no armed.json: nothing fires,
+#                one alert
+#   fire-cap     max_fires_per_day: 1 holds across two ticks, one alert
+#   default-cap  DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY covers a heartbeat
+#                that sets no cap
+#   spend-cap    OpenCode reports $0; the token estimate is what trips the
+#                daily cap, one alert
+#   all-failed   failures across two heartbeats raise one alarm; the next
+#                success posts a recovery
+#   content-free no alert carries gather data or model output
+#   state-lock   40 concurrent state writes, none lost
+#   live         (SELFTEST_LIVE=1, in compose) the real control dir is
+#                read-only and the real spool is writable
+#
+# Exit 0 only when every case passes.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DISPATCHER="$HERE/heartbeat-dispatcher.sh"
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dispatcher-selftest.XXXXXX")"
+CANARY="SELFTEST-PRIVATE-CANARY"
+fail=0
+
+say() { printf '[dispatcher-selftest] %s\n' "$*"; }
+ok() { say "ok   $*"; }
+bad() { say "FAIL $*"; fail=1; }
+
+cleanup() {
+    case "$ROOT" in
+        */dispatcher-selftest.*) find "$ROOT" -depth -delete 2>/dev/null ;;
+    esac
+}
+trap cleanup EXIT
+
+# Fake opencode: count calls, fail while $SB/fail exists, else emit a text
+# event and a step_finish with 1M input tokens and NO cost (what OpenCode
+# reports for a model with no price in opencode.json).
+mkdir -p "$ROOT/bin"
+cat > "$ROOT/bin/opencode" <<'SH'
+#!/usr/bin/env bash
+echo x >> "$FAKE_SB/calls"
+if [[ -f "$FAKE_SB/fail" ]]; then
+    echo "fake opencode failure $FAKE_CANARY" >&2
+    exit 1
+fi
+printf '%s\n' '{"type":"text","part":{"text":"FAKE-MODEL-OUTPUT"}}'
+printf '%s\n' '{"type":"step_finish","part":{"cost":0,"tokens":{"input":1000000,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}'
+SH
+chmod 755 "$ROOT/bin/opencode"
+if ! FAKE_SB="$ROOT" "$ROOT/bin/opencode" >/dev/null 2>&1; then
+    say "FAIL cannot execute the fake opencode in $ROOT (a noexec TMPDIR?); set TMPDIR to an exec-able directory"
+    exit 1
+fi
+rm -f "$ROOT/calls"
+
+# A clean PATH for the ticks, plus wherever timeout/gtimeout and jq live
+# (Homebrew on macOS; /usr/bin in the image).
+TICK_PATH="$ROOT/bin:/usr/local/bin:/usr/bin:/bin"
+for tool in timeout gtimeout jq; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        TICK_PATH="$TICK_PATH:$(dirname "$(command -v "$tool")")"
+    fi
+done
+
+# new_sandbox <name> <heartbeats...>: each heartbeat is "name|extra yaml"
+new_sandbox() {
+    SB="$ROOT/$1"
+    shift
+    mkdir -p "$SB/home/scheduled-tasks" "$SB/state" "$SB/control" "$SB/spool"
+    echo "Selftest prompt. Reply ok." > "$SB/home/scheduled-tasks/prompt.md"
+    {
+        echo "# HEARTBEATS"
+        local hb name extra
+        for hb in "$@"; do
+            name="${hb%%|*}"
+            extra="${hb#*|}"
+            echo
+            echo "## $name"
+            echo
+            echo '```yaml'
+            echo "schedule: every 0m"
+            echo "gather: echo '{\"count\": 1, \"note\": \"$CANARY\"}'"
+            echo "condition: threshold count > 0"
+            echo "prompt: scheduled-tasks/prompt.md"
+            echo "model: venice/zai-org-glm-5-2"
+            echo "criticality: critical"
+            [[ -n "$extra" && "$extra" != "$hb" ]] && printf '%b\n' "$extra"
+            echo '```'
+        done
+    } > "$SB/home/HEARTBEATS.md"
+    : > "$SB/calls"
+}
+
+# tick [VAR=value ...]: one real dispatcher run in the sandbox, clean env.
+tick() {
+    env -i PATH="$TICK_PATH" HOME="$SB" LANG=C.UTF-8 \
+        BEHALFBOT_HOME="$SB/home" BEHALFBOT_STATE_HOME="$SB/state" \
+        CONTROL_DIR="$SB/control" ALERT_SPOOL_DIR="$SB/spool" \
+        OPENCODE_BIN="$ROOT/bin/opencode" DISPATCHER_RETRY_BASE_SECONDS=0 \
+        DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY=0 DISPATCHER_MAX_USD_PER_DAY=1000 \
+        FAKE_SB="$SB" FAKE_CANARY="$CANARY" "$@" \
+        bash "$DISPATCHER" >/dev/null 2>&1
+    return 0
+}
+
+calls() { wc -l < "$SB/calls" | tr -d ' '; }
+alerts() { find "$SB/spool" -name "*-$1.json" 2>/dev/null | wc -l | tr -d ' '; }
+logged() { grep -q -- "$1" "$SB"/state/logs/scheduled/*-dispatcher.log 2>/dev/null; }
+
+halt_json() {
+    printf '{"enabled": true, "enabled_at": "2026-01-01T00:00:00Z", "enabled_by": "selftest", "auto_lift_after": %s, "reason": "selftest"}\n' "$1" \
+        > "$SB/control/halt.json"
+}
+
+# --- halt -----------------------------------------------------------------
+new_sandbox halt "hb-a|"
+halt_json null
+tick
+[[ "$(calls)" == 0 ]] && logged "HALTED - every heartbeat skipped" \
+    && ok "halt: nothing fired, critical included" || bad "halt: $(calls) run(s) fired while halted"
+
+new_sandbox halt-expired "hb-a|"
+halt_json '"2001-01-01T00:00:00Z"'
+tick
+[[ "$(calls)" -ge 1 ]] && ok "halt with a past auto-lift: fired" || bad "halt with a past auto-lift still blocked"
+grep -q '"enabled": true' "$SB/control/halt.json" && ok "halt-expired: the dispatcher did not rewrite the flag (jill-control owns it)" \
+    || bad "halt-expired: the dispatcher rewrote halt.json"
+
+new_sandbox halt-garbage "hb-a|"
+echo '{"enabled": tru' > "$SB/control/halt.json"
+tick
+[[ "$(calls)" == 0 ]] && ok "unparseable halt.json: treated as halted" || bad "unparseable halt.json let $(calls) run(s) fire"
+
+new_sandbox halt-badlift "hb-a|"
+halt_json '"next tuesday"'
+tick
+[[ "$(calls)" == 0 ]] && ok "unparseable auto_lift_after: stays halted" || bad "unparseable auto_lift_after lifted the halt"
+
+# --- unarmed kill switch --------------------------------------------------
+new_sandbox unarmed "hb-a|"
+tick CONTROL_REQUIRE_ARMED=1
+tick CONTROL_REQUIRE_ARMED=1
+[[ "$(calls)" == 0 && "$(alerts unarmed)" == 1 ]] && ok "unarmed switch: nothing fired, one alert over two ticks" \
+    || bad "unarmed switch: calls=$(calls) alerts=$(alerts unarmed)"
+printf '{"armed_at": %s}\n' "$(date +%s)" > "$SB/control/armed.json"
+tick CONTROL_REQUIRE_ARMED=1
+[[ "$(calls)" -ge 1 ]] && ok "armed switch: fires" || bad "armed switch: still blocked"
+
+# --- per-heartbeat fire cap -----------------------------------------------
+new_sandbox fire-cap "hb-a|max_fires_per_day: 1"
+tick
+tick
+tick
+[[ "$(calls)" == 1 && "$(alerts fire-cap)" == 1 ]] && logged "CAPPED hb-a" \
+    && ok "max_fires_per_day: 1 run over three ticks, one alert" \
+    || bad "max_fires_per_day: calls=$(calls) alerts=$(alerts fire-cap)"
+
+new_sandbox default-cap "hb-a|"
+tick DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY=2
+tick DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY=2
+tick DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY=2
+[[ "$(calls)" == 2 ]] && ok "default per-heartbeat cap: 2 runs over three ticks" || bad "default cap: calls=$(calls)"
+
+# --- daily spend cap --------------------------------------------------------
+new_sandbox spend-cap "hb-a|" "hb-b|"
+tick DISPATCHER_MAX_USD_PER_DAY=1
+first=$(calls)
+tick DISPATCHER_MAX_USD_PER_DAY=1
+tick DISPATCHER_MAX_USD_PER_DAY=1
+cost=$(jq -s '[.[].cost_usd] | add' "$SB"/state/logs/telemetry/*-usage.jsonl 2>/dev/null || echo 0)
+reported=$(jq -s '[.[].reported_cost_usd] | add' "$SB"/state/logs/telemetry/*-usage.jsonl 2>/dev/null || echo 1)
+[[ "$reported" == 0 ]] && awk -v c="$cost" 'BEGIN { exit !(c >= 1.39) }' \
+    && ok "spend estimate: OpenCode reported \$0, telemetry records \$$cost from tokens" \
+    || bad "spend estimate: reported=$reported recorded=$cost"
+[[ "$first" == 1 && "$(calls)" == 1 && "$(alerts spend-cap)" == 1 ]] && logged "SPEND-CAPPED" \
+    && ok "daily spend cap: tripped after the first \$1.40 run, nothing more fired, one alert" \
+    || bad "daily spend cap: first=$first total=$(calls) alerts=$(alerts spend-cap)"
+
+# --- all-runs-failed alarm --------------------------------------------------
+new_sandbox all-failed "hb-a|" "hb-b|"
+touch "$SB/fail"
+tick OPENCODE_GLOBAL_FAIL_THRESHOLD=2
+[[ "$(alerts all-failed)" == 1 ]] && ok "all-failed alarm: raised after failures across two heartbeats" \
+    || bad "all-failed alarm: $(alerts all-failed) alert(s)"
+rm -f "$SB/fail"
+tick OPENCODE_GLOBAL_FAIL_THRESHOLD=2
+[[ "$(alerts recovered)" == 1 ]] && ok "all-failed alarm: recovery posted on the next success" \
+    || bad "all-failed alarm: $(alerts recovered) recovery alert(s)"
+
+# --- content-free alerts ----------------------------------------------------
+if grep -rlE "$CANARY|FAKE-MODEL-OUTPUT|fake opencode failure" "$ROOT"/*/spool >/dev/null 2>&1; then
+    bad "an alert carried gather data, model output or opencode stderr"
+else
+    total=$(find "$ROOT"/*/spool -name '*.json' | wc -l | tr -d ' ')
+    ok "content-free: none of $total alerts carries gather data, model output or stderr"
+fi
+if find "$ROOT"/*/spool -name '*.json' -exec jq -e '(.kind | type == "string") and (.text | type == "string")' {} \; >/dev/null 2>&1; then
+    ok "alert spool records are well-formed"
+else
+    bad "a spool record is not {kind, text}"
+fi
+
+# --- state lock -------------------------------------------------------------
+new_sandbox state-lock "hb-a|"
+(
+    export BEHALFBOT_HOME="$SB/home" BEHALFBOT_STATE_HOME="$SB/state" DISPATCHER_TEST_SOURCE=1
+    # shellcheck source=/dev/null
+    source "$DISPATCHER"
+    init_state
+    for i in $(seq 1 20); do
+        set_state "race-$i" "v" "$i" &
+        increment_fire_count "count-$i" &
+    done
+    wait
+)
+lost=$(jq '[range(1;21) as $i | select(.["race-\($i)"].v != "\($i)" or .["count-\($i)"].fire_count != "1")] | length' \
+    "$SB/state/scheduled-tasks/heartbeat-state.json" 2>/dev/null || echo 40)
+[[ "$lost" == 0 ]] && ok "state lock: 40 concurrent writes, none lost" || bad "state lock: $lost write(s) lost"
+
+# --- live mounts (compose only) ---------------------------------------------
+if [[ "${SELFTEST_LIVE:-0}" == 1 ]]; then
+    : "${CONTROL_DIR:?}" "${ALERT_SPOOL_DIR:?}"
+    if [[ -d "$CONTROL_DIR" ]] && ! touch "$CONTROL_DIR/.selftest-write" 2>/dev/null; then
+        ok "live: $CONTROL_DIR is read-only to the dispatcher"
+    else
+        rm -f "$CONTROL_DIR/.selftest-write"
+        bad "live: $CONTROL_DIR is missing or writable; only jill-control may write the flags"
+    fi
+    if touch "$ALERT_SPOOL_DIR/.selftest-write" 2>/dev/null; then
+        rm -f "$ALERT_SPOOL_DIR/.selftest-write"
+        ok "live: the alert spool is writable"
+    else
+        bad "live: cannot write the alert spool $ALERT_SPOOL_DIR"
+    fi
+fi
+
+if [[ "$fail" != 0 ]]; then
+    say "DISPATCHER SELF-TEST FAILED"
+    exit 1
+fi
+say "all dispatcher controls held"

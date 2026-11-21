@@ -57,6 +57,30 @@
 #                             `notify: true` in their output
 #   DISCORD_OPS_WEBHOOK_URL - output-validator quarantine alerts
 #   DRY_RUN                 - "true" logs the FIRE and skips the invocation
+#
+# Control (Jill v2 C, BehalfBot-open#49; see docs/control.md):
+#   CONTROL_DIR             - where halt.json and conservation-mode.json live.
+#                             Compose mounts jill-control's volume here
+#                             READ-ONLY. Default: $BEHALFBOT_STATE_HOME/scheduled-tasks
+#   CONTROL_REQUIRE_ARMED   - "1": refuse to fire unless jill-control has
+#                             refreshed armed.json in the last
+#                             CONTROL_ARMED_MAX_AGE_SECONDS (default 900).
+#                             A kill switch that is not listening is treated
+#                             as a halt. Compose sets 1; default 0.
+#   ALERT_SPOOL_DIR         - alerts are dropped here as JSON for jill-control
+#                             to post to Matrix. Content-free by contract.
+#   DISPATCHER_MAX_USD_PER_DAY - daily spend ceiling across ALL heartbeats
+#                             (default 5). Critical heartbeats included.
+#   DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY - per-heartbeat fire cap used when a
+#                             heartbeat sets no max_fires_per_day (default 24;
+#                             0 disables the default).
+#   VENICE_PRICES           - "model=in:out:cache_read,..." USD per million
+#                             tokens, used when OpenCode reports no cost.
+#                             An unlisted model is priced at the highest rate.
+#   OPENCODE_GLOBAL_FAIL_THRESHOLD / OPENCODE_GLOBAL_DISTINCT_THRESHOLD /
+#   OPENCODE_GLOBAL_ALERT_COOLDOWN_SECONDS - the all-runs-failed alarm
+#                             (defaults 3, 2, 14400)
+#   DISPATCHER_RETRY_BASE_SECONDS - first retry wait (default 20; tests use 0)
 
 set -euo pipefail
 
@@ -71,7 +95,14 @@ TIMEOUT_CMD="$(command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null
 HEARTBEATS_FILE="$BEHALFBOT_HOME/HEARTBEATS.md"
 STATE_DIR="$BEHALFBOT_STATE_HOME/scheduled-tasks"
 STATE_FILE="$STATE_DIR/heartbeat-state.json"
-CONSERVATION_FILE="$STATE_DIR/conservation-mode.json"
+CONTROL_DIR="${CONTROL_DIR:-$STATE_DIR}"
+CONSERVATION_FILE="$CONTROL_DIR/conservation-mode.json"
+# Remote kill switch. Written only by jill-control (gateway/control.py) from
+# the principal's Matrix control room, with no model and no shell in the
+# path. Same five-key schema as conservation-mode.json.
+HALT_FILE="$CONTROL_DIR/halt.json"
+ARMED_FILE="$CONTROL_DIR/armed.json"
+ALERT_SPOOL_DIR="${ALERT_SPOOL_DIR:-}"
 LOG_DIR="$BEHALFBOT_STATE_HOME/logs/scheduled"
 LOCK_FILE="$LOG_DIR/dispatcher.lock"
 TELEMETRY_DIR="$BEHALFBOT_STATE_HOME/logs/telemetry"
@@ -127,31 +158,49 @@ epoch_from_iso() {
         || echo 0
 }
 
-# --- Conservation Mode ---
+# --- Control flags: halt + conservation ---
+#
+# The flag arithmetic lives in _control-flags.sh, shared by both flags so
+# they never disagree about what "expired" means, and it never writes: the
+# control volume is read-only here and jill-control owns it. If the library
+# is missing (a partial update), keep reading `.enabled` so the kill switch
+# survives; only the auto-lift arithmetic is lost.
+if [[ -f "$SCRIPT_DIR/_control-flags.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/_control-flags.sh"
+else
+    control_flag_state() {
+        [[ -e "$1" ]] || { echo off; return 0; }
+        local enabled
+        enabled=$(jq -r '.enabled // false' "$1" 2>/dev/null) || { echo on; return 0; }
+        [[ "$enabled" == "true" ]] && echo on || echo off
+    }
+fi
 
-is_conservation_mode() {
-    if [[ ! -f "$CONSERVATION_FILE" ]]; then
-        return 1
+flag_on() {
+    local file="$1" label="$2" st
+    st=$(control_flag_state "$file")
+    if [[ "$st" == "expired" ]]; then
+        log "$label - auto-lift time has passed; treated as off (jill-control clears the file)"
     fi
-    local enabled
-    enabled=$(jq -r '.enabled // false' "$CONSERVATION_FILE")
-    if [[ "$enabled" != "true" ]]; then
-        return 1
-    fi
+    [[ "$st" == "on" ]]
+}
 
-    local auto_lift
-    auto_lift=$(jq -r '.auto_lift_after // ""' "$CONSERVATION_FILE")
-    if [[ -n "$auto_lift" && "$auto_lift" != "null" ]]; then
-        local lift_epoch now_epoch
-        lift_epoch=$(epoch_from_iso "${auto_lift%Z}")
-        now_epoch=$(date +%s)
-        if [[ $lift_epoch -gt 0 && $now_epoch -ge $lift_epoch ]]; then
-            log "CONSERVATION - auto-lift triggered (past $auto_lift), disabling"
-            printf '{"enabled": false, "enabled_at": null, "enabled_by": null, "auto_lift_after": null, "reason": null}\n' > "$CONSERVATION_FILE"
-            return 1
-        fi
-    fi
-    return 0
+is_halted() { flag_on "$HALT_FILE" "HALT"; }
+
+is_conservation_mode() { flag_on "$CONSERVATION_FILE" "CONSERVATION"; }
+
+# A kill switch that is not listening cannot stop anything, so with
+# CONTROL_REQUIRE_ARMED=1 an unarmed switch is a halt. jill-control
+# refreshes armed.json after every successful read of the control room.
+kill_switch_unarmed() {
+    [[ "${CONTROL_REQUIRE_ARMED:-0}" == "1" ]] || return 1
+    local armed_at max_age now
+    armed_at=$(jq -r '.armed_at // 0' "$ARMED_FILE" 2>/dev/null) || armed_at=0
+    [[ "$armed_at" =~ ^[0-9]+$ ]] || armed_at=0
+    max_age="${CONTROL_ARMED_MAX_AGE_SECONDS:-900}"
+    now=$(date +%s)
+    (( now - armed_at > max_age ))
 }
 
 # --- Locking ---
@@ -188,21 +237,63 @@ get_state() {
     jq -r --arg n "$name" --arg f "$field" '.[$n][$f] // ""' "$STATE_FILE"
 }
 
+# Mutex around the whole read-modify-write cycle (ported from chassis
+# a22251c). A unique temp path alone only stops two writers' staging files
+# colliding; it does nothing about two writers both reading the state file,
+# computing from the same stale snapshot, and the second mv discarding the
+# first writer's change. mkdir is atomic everywhere this runs and needs no
+# flock. A dead holder's lock is recovered; after 10s the write proceeds
+# unlocked (a possibly lost write beats a hung dispatcher). The lock is a
+# directory holding one pid file, removed with rm -f + rmdir: never a
+# recursive delete of a computed path.
+_state_lock_acquire() {
+    local lock_dir="${STATE_FILE}.lock" waited=0 holder=""
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        holder=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
+        if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null; then
+            rm -f "$lock_dir/pid" 2>/dev/null || true
+            rmdir "$lock_dir" 2>/dev/null || true
+            continue
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+        if [[ $waited -ge 100 ]]; then
+            log "WARNING state lock held >10s by pid ${holder:-unknown} - proceeding unlocked, a write may be lost"
+            return 1
+        fi
+    done
+    echo $$ > "$lock_dir/pid"
+}
+
+_state_lock_release() {
+    rm -f "${STATE_FILE}.lock/pid" 2>/dev/null || true
+    rmdir "${STATE_FILE}.lock" 2>/dev/null || true
+}
+
+# _state_update <jq filter> [jq args...] - one locked read-modify-write.
+# Released only when THIS call holds the lock: releasing on the timeout path
+# would delete a lock another writer still owns.
+_state_update() {
+    local filter="$1"; shift
+    local tmp="${STATE_FILE}.$$.${RANDOM}.tmp" locked=0
+    _state_lock_acquire && locked=1
+    if jq "$@" "$filter" "$STATE_FILE" > "$tmp"; then
+        mv "$tmp" "$STATE_FILE"
+    else
+        rm -f "$tmp"
+    fi
+    if [[ $locked -eq 1 ]]; then _state_lock_release; fi
+}
+
 set_state() {
     local name="$1" field="$2" value="$3"
-    local tmp="${STATE_FILE}.tmp"
-    jq --arg n "$name" --arg f "$field" --arg v "$value" \
-        '.[$n] = (.[$n] // {}) | .[$n][$f] = $v' "$STATE_FILE" > "$tmp" \
-        && mv "$tmp" "$STATE_FILE"
+    _state_update '.[$n] = (.[$n] // {}) | .[$n][$f] = $v' --arg n "$name" --arg f "$field" --arg v "$value"
 }
 
 increment_fire_count() {
     local name="$1"
-    local tmp="${STATE_FILE}.tmp"
-    jq --arg n "$name" \
-        '.[$n] = (.[$n] // {}) | .[$n].fire_count = ((.[$n].fire_count // "0") | tonumber + 1 | tostring)' \
-        "$STATE_FILE" > "$tmp" \
-        && mv "$tmp" "$STATE_FILE"
+    _state_update '.[$n] = (.[$n] // {}) | .[$n].fire_count = ((.[$n].fire_count // "0") | tonumber + 1 | tostring)' \
+        --arg n "$name"
 }
 
 # --- Model alias resolution ---
@@ -522,19 +613,31 @@ invoke_opencode() {
             "$tmp_events" > "$output_file" 2>> "$LOG_FILE" \
             || cp "$tmp_events" "$output_file"
 
-        # Telemetry: sum cost/tokens over step_finish events.
+        # Telemetry: sum cost/tokens over step_finish events. cost_usd is the
+        # larger of OpenCode's figure and our own token-based estimate:
+        # opencode.json carries no prices, so OpenCode reports 0, and a spend
+        # cap summing zeros never trips.
+        local price
+        price=$(model_price "$model")
         jq -cs \
             --arg name "$heartbeat_name" \
             --arg model "$model" \
             --arg ts "$ts_iso" \
             --argjson wall "$wall_secs" \
             --argjson exit_code "$exit_code" \
+            --argjson price "$price" \
             '[.[] | select(.type == "step_finish") | .part] as $steps |
+            ([$steps[].cost // 0] | add // 0) as $reported |
+            ((([$steps[].tokens.input // 0] | add // 0) * $price[0]
+              + ([$steps[].tokens.output // 0] | add // 0) * $price[1]
+              + ([$steps[].tokens.reasoning // 0] | add // 0) * $price[1]
+              + ([$steps[].tokens.cache.read // 0] | add // 0) * $price[2]) / 1000000) as $estimated |
             {
                 ts: $ts,
                 heartbeat: $name,
                 model: $model,
-                cost_usd: ([$steps[].cost // 0] | add // 0),
+                cost_usd: ([$reported, $estimated] | max),
+                reported_cost_usd: $reported,
                 input_tokens: ([$steps[].tokens.input // 0] | add // 0),
                 output_tokens: ([$steps[].tokens.output // 0] | add // 0),
                 cache_read_tokens: ([$steps[].tokens.cache.read // 0] | add // 0),
@@ -547,7 +650,7 @@ invoke_opencode() {
 
         # Advisory budget check (no hard cap in OpenCode).
         local run_cost over_budget
-        run_cost=$(jq -rs '[.[] | select(.type == "step_finish") | .part.cost // 0] | add // 0' "$tmp_events" 2>/dev/null || echo 0)
+        run_cost=$(tail -n 1 "$telemetry_file" 2>/dev/null | jq -r '.cost_usd // 0' 2>/dev/null || echo 0)
         over_budget=$(jq -n --argjson c "${run_cost:-0}" --argjson b "${budget:-0}" '$c > $b' 2>/dev/null || echo false)
         if [[ "$over_budget" == "true" ]]; then
             log "WARN $heartbeat_name - run cost \$$run_cost exceeded advisory budget \$$budget"
@@ -682,7 +785,13 @@ run_output_validator() {
     if [[ -s "$validator_events" ]]; then
         local ts_iso cost_usd
         ts_iso=$(date +%Y-%m-%dT%H:%M:%S)
-        cost_usd=$(jq -rs '[.[] | select(.type == "step_finish") | .part.cost // 0] | add // 0' "$validator_events" 2>/dev/null || echo 0)
+        cost_usd=$(jq -rs --argjson price "$(model_price "$validator_model")" '
+            [.[] | select(.type == "step_finish") | .part] as $s |
+            [([$s[].cost // 0] | add // 0),
+             ((([$s[].tokens.input // 0] | add // 0) * $price[0] + ([$s[].tokens.output // 0] | add // 0) * $price[1]
+               + ([$s[].tokens.reasoning // 0] | add // 0) * $price[1]
+               + ([$s[].tokens.cache.read // 0] | add // 0) * $price[2]) / 1000000)] | max' \
+            "$validator_events" 2>/dev/null || echo 0)
         printf '%s\n' "{\"ts\":\"$ts_iso\",\"heartbeat\":\"${name}-validator\",\"model\":\"$validator_model\",\"cost_usd\":${cost_usd:-0},\"input_tokens\":0,\"output_tokens\":0,\"cache_read_tokens\":0,\"cache_create_tokens\":0,\"wall_seconds\":0,\"exit_code\":0}" \
             >> "$TELEMETRY_DIR/$DATE-usage.jsonl" 2>> "$LOG_FILE" || true
 
@@ -716,16 +825,214 @@ run_output_validator() {
 
     log "VALIDATOR $name - FAIL mode=$mode_val reason=$reason_val - artifact quarantined at $quarantine_file"
 
-    local ops_webhook="${DISCORD_OPS_WEBHOOK_URL:-${DISCORD_WEBHOOK_URL:-}}"
-    if [[ -n "$ops_webhook" ]]; then
-        local alert_msg="**Five Failure Modes validator blocked ${name}** - mode: \`${mode_val}\`\n${reason_val}\nArtifact at: \`${quarantine_file}\`"
-        curl -sf -X POST "$ops_webhook" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg content "$alert_msg" '{content: $content}')" \
-            >> "$LOG_FILE" 2>&1 || true
-    fi
+    # The reason is model-written prose about private material, so it stays
+    # in the log; the alert carries only the heartbeat name and the mode,
+    # which is one of five fixed words.
+    case "$mode_val" in
+        hallucinated_actions|scope_creep|cascading_errors|context_loss|tool_misuse) ;;
+        *) mode_val="other" ;;
+    esac
+    alert_ops validator "Five Failure Modes validator blocked ${name} (mode: ${mode_val}). The artifact is quarantined; the reason is in the dispatcher log."
 
     return 1
+}
+
+# --- Alerts ---
+#
+# alert_ops <kind> <text>. The text goes to the principal's Matrix alerts
+# room through jill-control, which is NOT end-to-end encrypted and runs on a
+# homeserver Jill does not own. So every caller passes a fixed template with
+# heartbeat names, counts and dollar figures only: never model output,
+# gather data, prompt text or log lines. Delivery: a JSON file in
+# ALERT_SPOOL_DIR (jill-control drains it), and the Discord ops webhook as
+# well when one is configured. With neither, the alert is logged and
+# dropped, loudly.
+alert_ops() {
+    local kind="$1" msg="$2" delivered=0
+    if [[ -n "$ALERT_SPOOL_DIR" ]]; then
+        local f
+        f="$ALERT_SPOOL_DIR/$(date +%s)-$$-${RANDOM}-${kind}"
+        if jq -n --arg kind "$kind" --arg text "$msg" --argjson ts "$(date +%s)" \
+                '{kind: $kind, text: $text, ts: $ts}' > "$f.tmp" 2>/dev/null \
+            && mv "$f.tmp" "$f.json"; then
+            delivered=1
+        else
+            rm -f "$f.tmp"
+            log "WARN: could not write alert to spool $ALERT_SPOOL_DIR"
+        fi
+    fi
+    if [[ -n "${DISCORD_OPS_WEBHOOK_URL:-}" ]]; then
+        if curl -sf -X POST "$DISCORD_OPS_WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg content "$msg" '{content: $content}')" >> "$LOG_FILE" 2>&1; then
+            delivered=1
+        else
+            log "WARN: ops webhook POST failed"
+        fi
+    fi
+    if [[ $delivered -eq 0 ]]; then
+        log "WARN: no alert path (ALERT_SPOOL_DIR and DISCORD_OPS_WEBHOOK_URL unset), dropped: $kind"
+    fi
+    return 0
+}
+
+# --- Spend accounting ---
+#
+# model_price <provider/model> -> JSON [in, out, cache_read], USD per million
+# tokens. From VENICE_PRICES; an unlisted model gets the highest listed rate
+# in each column, so a model missing from the table is over-counted, never
+# free. The defaults are Venice list prices for GLM 5.2 and GLM 5.3 Flash
+# as seen 2026-11-21; confirm them against venice.ai/pricing.
+DEFAULT_VENICE_PRICES="zai-org-glm-5-2=1.40:4.40:0.26,z-ai-glm-5-3-flash=0.17:0.55:0.03"
+
+model_price() {
+    local id="${1#venice/}"
+    printf '%s' "${VENICE_PRICES:-$DEFAULT_VENICE_PRICES}" | awk -v id="$id" -v RS=',' '
+        {
+            gsub(/[[:space:]]/, "")
+            split($0, kv, "="); n = split(kv[2], p, ":")
+            if (n < 2 || p[1] == "" || p[2] == "") next
+            if (n < 3 || p[3] == "") p[3] = p[1]
+            for (i = 1; i <= 3; i++) if (p[i] + 0 > max[i]) max[i] = p[i] + 0
+            if (kv[1] == id) { hit = 1; for (i = 1; i <= 3; i++) got[i] = p[i] + 0 }
+        }
+        END {
+            if (!hit) for (i = 1; i <= 3; i++) got[i] = max[i] + 0
+            if (got[1] == 0 && got[2] == 0) { got[1] = 5; got[2] = 15; got[3] = 5 }
+            printf "[%s,%s,%s]\n", got[1], got[2], got[3]
+        }'
+}
+
+_num_ge() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a + 0 >= b + 0) }'
+}
+
+_state_int() {
+    local v
+    v=$(get_state "$1" "$2")
+    [[ "$v" =~ ^[0-9]+$ ]] || v=0
+    echo "$v"
+}
+
+# Dollars spent today from the dispatcher's own telemetry: the surface an
+# operator audits afterwards, so the cap cannot disagree with it. With a
+# name, that heartbeat plus its validator rows; without, everything.
+usd_today() {
+    local name="${1:-}"
+    local tfile="$TELEMETRY_DIR/$DATE-usage.jsonl"
+    [[ -f "$tfile" ]] || { echo 0; return 0; }
+    jq -R -s --arg n "$name" '
+        [ split("\n")[] | select(length > 0) | (fromjson? // empty)
+          | select($n == "" or .heartbeat == $n or .heartbeat == ($n + "-validator"))
+          | (.cost_usd // 0) ] | add // 0
+    ' "$tfile" 2>/dev/null || echo 0
+}
+
+# --- Daily fire caps (ported from chassis 3205a7f) ---
+#
+# `budget:` is per invocation and does not bound a loop: the chassis's
+# repo-drift heartbeat fired 514 times in five days at ~$0.09 each, never
+# once over its budget, because its condition could only be cleared by a
+# human who was off-grid. Caps are absolute: once hit, no more model runs
+# for that heartbeat until the date rolls. A changed condition does not
+# lift one. The chassis's alert dedup (realert_after, dedupe_key) and its
+# suppression ledger are not ported.
+
+fires_today() {
+    local name="$1"
+    if [[ "$(get_state "$name" "fires_date")" != "$DATE" ]]; then
+        echo 0
+        return 0
+    fi
+    _state_int "$name" "fires_today"
+}
+
+# One count per fire decision, not per retry attempt; a failed fire still
+# spent tokens, so it counts.
+note_fire() {
+    local name="$1" n=1
+    if [[ "$(get_state "$name" "fires_date")" == "$DATE" ]]; then
+        n=$(( $(_state_int "$name" "fires_today") + 1 ))
+    else
+        set_state "$name" "fires_date" "$DATE"
+    fi
+    set_state "$name" "fires_today" "$n"
+}
+
+CAP_REASON=""
+
+# 0 = capped (do not fire), 1 = may fire. Sets CAP_REASON.
+fire_cap_check() {
+    local name="$1" max_fires max_usd fired spent
+    CAP_REASON=""
+    max_fires=$(get_config_field "$name" "max_fires_per_day")
+    max_usd=$(get_config_field "$name" "max_usd_per_day")
+    if [[ -z "$max_fires" ]]; then
+        max_fires="${DISPATCHER_DEFAULT_MAX_FIRES_PER_DAY:-24}"
+        [[ "$max_fires" == "0" ]] && max_fires=""
+    fi
+    if [[ -n "$max_fires" ]]; then
+        if [[ ! "$max_fires" =~ ^[0-9]+$ ]]; then
+            log "WARN $name - max_fires_per_day '$max_fires' is not a whole number. Ignoring."
+        else
+            fired=$(fires_today "$name")
+            if [[ $fired -ge $max_fires ]]; then
+                CAP_REASON="max_fires_per_day reached: $fired of $max_fires model runs already spent today"
+                return 0
+            fi
+        fi
+    fi
+    if [[ -n "$max_usd" ]]; then
+        if [[ ! "$max_usd" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            log "WARN $name - max_usd_per_day '$max_usd' is not a number. Ignoring."
+        else
+            spent=$(usd_today "$name")
+            if _num_ge "$spent" "$max_usd"; then
+                CAP_REASON="max_usd_per_day reached: \$$spent of \$$max_usd already spent today"
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+# One notice per heartbeat per day; the notice itself is capped or it
+# recreates the 50-alert problem in miniature.
+cap_alert_once() {
+    local name="$1" reason="$2"
+    [[ "$(get_state "$name" "cap_alert_date")" == "$DATE" ]] && return 0
+    set_state "$name" "cap_alert_date" "$DATE"
+    alert_ops fire-cap "${name} hit its daily cap and will not run the model again today. ${reason}. Its gather still runs every tick; only the date rolling lifts a cap."
+}
+
+# --- Daily Venice spend cap (all heartbeats) ---
+#
+# The per-heartbeat caps bound one loop. This bounds the dispatcher: once
+# today's summed telemetry reaches DISPATCHER_MAX_USD_PER_DAY, nothing fires
+# until the date rolls, `critical` included. It does NOT bound chat through
+# the bridge, which does not go through the dispatcher.
+SPEND_REASON=""
+
+# 0 = over the cap (do not fire), 1 = may fire.
+global_spend_capped() {
+    local cap="${DISPATCHER_MAX_USD_PER_DAY:-5}" spent
+    SPEND_REASON=""
+    if [[ ! "$cap" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        log "WARN: DISPATCHER_MAX_USD_PER_DAY '$cap' is not a number - using 5"
+        cap=5
+    fi
+    spent=$(usd_today)
+    if _num_ge "$spent" "$cap"; then
+        SPEND_REASON="\$$spent of the \$$cap daily Venice budget is spent"
+        return 0
+    fi
+    return 1
+}
+
+spend_alert_once() {
+    [[ "$(get_state "_dispatcher" "spend_alert_date")" == "$DATE" ]] && return 0
+    set_state "_dispatcher" "spend_alert_date" "$DATE"
+    alert_ops spend-cap "Daily spend cap reached: ${SPEND_REASON}. No heartbeat will run the model again today, critical ones included. Raise DISPATCHER_MAX_USD_PER_DAY and restart the dispatcher to lift it."
 }
 
 # --- Recovery Hooks ---
@@ -752,6 +1059,27 @@ main() {
 
     if [[ ! -f "$HEARTBEATS_FILE" ]]; then
         log "No HEARTBEATS.md at $HEARTBEATS_FILE (copy HEARTBEATS.md.template to get started)"
+        return
+    fi
+
+    # Remote kill switch, before anything else in the tick: ahead of the
+    # recovery hooks, conservation mode and every gather. Unlike conservation
+    # this ignores `criticality`: the principal asking for silence outranks a
+    # heartbeat's own opinion of how important it is.
+    if is_halted; then
+        local halt_reason halt_lift
+        halt_reason=$(jq -r '.reason // "no reason given"' "$HALT_FILE" 2>/dev/null || echo "unreadable flag file")
+        halt_lift=$(jq -r '.auto_lift_after // "none"' "$HALT_FILE" 2>/dev/null || echo "unknown")
+        log "HALTED - every heartbeat skipped (reason: $halt_reason, auto-lift: $halt_lift)"
+        log "HALTED - say 'resume' in the Matrix control room to lift"
+        return
+    fi
+    if kill_switch_unarmed; then
+        log "HALTED - the kill switch is not armed (no fresh $ARMED_FILE); nothing fires until jill-control is listening"
+        if [[ "$(get_state "_dispatcher" "unarmed_alert_date")" != "$DATE" ]]; then
+            set_state "_dispatcher" "unarmed_alert_date" "$DATE"
+            alert_ops unarmed "The Matrix kill switch is not listening, so Jill's heartbeats are paused until it is. Check the jill-control container."
+        fi
         return
     fi
 
@@ -852,6 +1180,22 @@ main() {
             continue
         fi
 
+        # Daily caps, before the DRY_RUN branch so a dry run reports exactly
+        # what a live run would suppress. Both suppress the FIRE, not just a
+        # notification: the model run is the expensive half.
+        if global_spend_capped; then
+            log "SPEND-CAPPED $name - $SPEND_REASON"
+            set_state "$name" "last_result" "spend_capped"
+            spend_alert_once
+            continue
+        fi
+        if fire_cap_check "$name"; then
+            log "CAPPED $name - $CAP_REASON"
+            set_state "$name" "last_result" "fire_capped"
+            cap_alert_once "$name" "$CAP_REASON"
+            continue
+        fi
+
         # Resolve prompt path (relative to BEHALFBOT_HOME, absolute allowed)
         local full_prompt_path
         if [[ "$prompt_file" == /* ]]; then
@@ -890,6 +1234,8 @@ main() {
             continue
         fi
 
+        note_fire "$name"
+
         local output_file="$OUTPUT_DIR/${DATE}-${name}.md"
 
         # Build the prompt input. Explicit ="" initializer prevents a prior
@@ -916,7 +1262,7 @@ ${gathered_data}
                 break
             fi
             if [[ $attempt -lt 3 ]]; then
-                local wait_s=$(( 20 * (3 ** (attempt - 1)) ))
+                local wait_s=$(( ${DISPATCHER_RETRY_BASE_SECONDS:-20} * (3 ** (attempt - 1)) ))
                 log "RETRY $name - opencode failed (attempt $attempt/3), waiting ${wait_s}s..."
                 sleep "$wait_s"
             fi
@@ -946,6 +1292,39 @@ ${gathered_data}
                 log "CIRCUIT-OPENED $name - streak=$fail_streak, skipping FIRE for $backoff_ticks ticks (~$((backoff_sec/60))min)"
             fi
 
+            # Cross-heartbeat failure alarm (ported from chassis 22fdfd4).
+            # The per-heartbeat breaker is right for ONE flaky heartbeat and
+            # wrong when opencode cannot run at all: each failing heartbeat
+            # opens its own breaker and goes quiet, gathers keep reporting
+            # "no work", and the install looks healthy from outside. So count
+            # failures across DIFFERENT heartbeats and alert once (with a
+            # cooldown) when both thresholds are crossed. Unlike the chassis
+            # this alert does not quote the last error line: it goes to an
+            # unencrypted room, and opencode's stderr can carry prompt text.
+            local global_streak failed_names distinct_count
+            global_streak=$(_state_int "_dispatcher" "opencode_global_fail_streak")
+            global_streak=$(( global_streak + 1 ))
+            set_state "_dispatcher" "opencode_global_fail_streak" "$global_streak"
+            failed_names=$(get_state "_dispatcher" "opencode_global_failed_names")
+            case " $failed_names " in
+                *" $name "*) : ;;
+                *) failed_names="${failed_names:+$failed_names }$name" ;;
+            esac
+            set_state "_dispatcher" "opencode_global_failed_names" "$failed_names"
+            distinct_count=$(wc -w <<<"$failed_names" | tr -d ' ')
+
+            if [[ $global_streak -ge ${OPENCODE_GLOBAL_FAIL_THRESHOLD:-3} \
+                  && $distinct_count -ge ${OPENCODE_GLOBAL_DISTINCT_THRESHOLD:-2} ]]; then
+                local now_epoch last_alert cooldown
+                now_epoch=$(date +%s)
+                last_alert=$(get_state "_dispatcher" "opencode_global_alerted_at")
+                cooldown="${OPENCODE_GLOBAL_ALERT_COOLDOWN_SECONDS:-14400}"
+                if [[ -z "$last_alert" ]] || (( now_epoch - last_alert >= cooldown )); then
+                    alert_ops all-failed "Every heartbeat run is failing: ${global_streak} consecutive failed runs across ${distinct_count} heartbeats, most recently ${name}. Each one is opening its own circuit breaker, so Jill will look quiet rather than broken. The cause is in the dispatcher log (logs/scheduled/${DATE}-dispatcher.log). Re-alerts at most every $(( cooldown / 3600 ))h."
+                    set_state "_dispatcher" "opencode_global_alerted_at" "$now_epoch"
+                fi
+            fi
+
             continue
         fi
 
@@ -955,6 +1334,16 @@ ${gathered_data}
         increment_fire_count "$name"
         set_state "$name" "opencode_fail_streak" "0"
         set_state "$name" "circuit_open_until" ""
+
+        # One success proves opencode can run, so the cross-heartbeat counter
+        # resets too. If we had alerted, say so: an alarm that never clears
+        # trains you to ignore it.
+        if [[ -n "$(get_state "_dispatcher" "opencode_global_alerted_at")" ]]; then
+            alert_ops recovered "Heartbeat runs are working again (first success: ${name}). Breakers opened during the outage stay open until their cooldown ends."
+            set_state "_dispatcher" "opencode_global_alerted_at" ""
+        fi
+        set_state "_dispatcher" "opencode_global_fail_streak" "0"
+        set_state "_dispatcher" "opencode_global_failed_names" ""
 
         # Five Failure Modes post-output validator (opt-in per heartbeat)
         if ! run_output_validator "$name" "$output_file"; then
@@ -969,4 +1358,7 @@ ${gathered_data}
     log "=== Dispatcher run complete ==="
 }
 
-main "$@" >> "$LOG_FILE" 2>&1
+# Guarded so tests can source this file for its functions without a tick.
+if [[ "${DISPATCHER_TEST_SOURCE:-0}" != "1" ]]; then
+    main "$@" >> "$LOG_FILE" 2>&1
+fi
