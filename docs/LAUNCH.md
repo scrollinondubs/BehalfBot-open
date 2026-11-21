@@ -11,7 +11,8 @@ safety hooks, not by the OS. The kit keeps `.env`, the Colima VM and Jill's
 state readable only by `jillvibe`, and Jax's hooks forbid reaching for them.
 That stops accidents, not a determined admin: on this host Jax owns the
 Homebrew tools `jillvibe` runs, and the Matrix homeserver runs in Jax's
-Docker. Any admin user on this Mac could obtain Jill's credentials. Real OS
+Docker, reached over plain HTTP on a port (8008) Jax's process holds, so
+Matrix passwords typed during setup cross a listener Jax owns. Any admin user on this Mac could obtain Jill's credentials. Real OS
 isolation would mean a separate machine and a homeserver Jax does not run
 (red-team round 4, H63-1).
 
