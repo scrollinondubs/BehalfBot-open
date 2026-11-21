@@ -561,11 +561,11 @@ class OpencodeClient:
 
 
 async def handle_chat(req, client=None):
-    import aiohttp
     if halted():
         return {"handled": True, "replies": [HALTED_REPLY]}
     if PROVIDER_ID != "venice" or not MODEL_ID:
         return {"handled": True, "replies": ["DEFAULT_MODEL must be a venice/ model (BehalfBot-open#46)."]}
+    import aiohttp
     text = normalise(req)
     blocks, notes, fatal = gather_documents(req.get("attachments") or [])
     if fatal:
