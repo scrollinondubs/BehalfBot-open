@@ -385,8 +385,8 @@ new_sandbox state-lock "hb-a|"
     source "$DISPATCHER"
     init_state
     for i in $(seq 1 20); do
-        set_state "race-$i" "v" "$i" &
-        increment_fire_count "count-$i" &
+        ( set_state "race-$i" "v" "$i"; echo "race-$i rc=$?" >> "$SB/writers.log" ) 2>> "$SB/writers.err" &
+        ( increment_fire_count "count-$i"; echo "count-$i rc=$?" >> "$SB/writers.log" ) 2>> "$SB/writers.err" &
     done
     wait
 )
@@ -394,7 +394,7 @@ lost=$(jq '[range(1;21) as $i | select(.["race-\($i)"].v != "\($i)" or .["count-
     "$SB/state/scheduled-tasks/heartbeat-state.json" 2>/dev/null || echo 40)
 logcount() { cat "$SB"/state/logs/scheduled/*-dispatcher.log 2>/dev/null | grep -c "$1"; }
 [[ "$lost" == 0 ]] && ok "state lock: 40 concurrent writes, none lost" \
-    || bad "state lock: $lost write(s) missing (refused: $(logcount "write refused"), discarded: $(logcount "discarded"), orphan removals: $(logcount "orphaned"), dead-holder recoveries: $(logcount "dead holder"))"
+    || bad "state lock: $lost write(s) missing (refused: $(logcount "write refused"), discarded: $(logcount "discarded"), orphan removals: $(logcount "orphaned"), dead-holder recoveries: $(logcount "dead holder"), writers finished: $(wc -l < "$SB/writers.log" 2>/dev/null | tr -d ' ')/40, missing: $(jq -r '[range(1;21) as $i | select(.["race-\($i)"].v != "\($i)") | "race-\($i)"] + [range(1;21) as $i | select(.["count-\($i)"].fire_count != "1") | "count-\($i)"] | join(",")' "$SB/state/scheduled-tasks/heartbeat-state.json" 2>/dev/null), stderr: $(tr '\n' ' ' < "$SB/writers.err" 2>/dev/null | cut -c1-400))"
 
 # --- live mounts (compose only) ---------------------------------------------
 if [[ "${SELFTEST_LIVE:-0}" == 1 ]]; then
