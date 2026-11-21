@@ -48,14 +48,13 @@ cleanup() {
 trap cleanup EXIT
 
 # --- 1. static checks ------------------------------------------------------
-# The server runs as root with ONLY CAP_KILL, CAP_SETGID, CAP_SETUID (0xe0)
-# and no_new_privs: no DAC_OVERRIDE, so it cannot write the nobody-owned app
-# tree either. Tool commands drop to node through /opt/jill/bin/bash.
-if [[ "$(id -u)" != 0 ]]; then
-  bad "the server must start as root (cap-dropped) so tool shells can drop to node"
-fi
+# The server runs as node: non-root, NO capabilities, no_new_privs, and NO
+# secrets in its environment (round-2 red-team C1: OpenCode has code paths
+# that read files as the server without any guard hook, so the server must
+# have nothing worth reading).
+[[ "$(id -u)" == 1000 ]] || bad "the server must run as node (uid 1000), not uid $(id -u)"
 capeff=$(awk '/^CapEff:/ {print $2}' /proc/self/status)
-[[ "$capeff" == 00000000000000e0 ]] || bad "effective capabilities are $capeff, expected 00000000000000e0 (KILL, SETGID, SETUID only)"
+[[ "$capeff" == 0000000000000000 ]] || bad "the server has capabilities ($capeff); it must have none"
 [[ "$(awk '/^NoNewPrivs:/ {print $2}' /proc/self/status)" == 1 ]] || bad "no_new_privs is not set"
 for p in "$APP" "$APP/AGENTS.md" "$APP/opencode.json" "$APP/.opencode" "$APP/.opencode/plugins" \
          "$APP/.opencode/plugins/guardrails.ts" "$APP/.opencode/guards" "$APP/.opencode/guards/policy.ts" \
@@ -67,6 +66,23 @@ for p in "$APP" "$APP/AGENTS.md" "$APP/opencode.json" "$APP/.opencode" "$APP/.op
 done
 [[ "${OPENCODE_AUTH_CONTENT:-}" == "{}" ]] || bad "OPENCODE_AUTH_CONTENT is not {}; auth.json would be read"
 [[ "${XDG_CONFIG_HOME:-}" == /etc/opencode-xdg ]] || bad "XDG_CONFIG_HOME is not /etc/opencode-xdg"
+[[ -r "$APP/config/guards.json" ]] || bad "config/guards.json is not readable"
+# No secret of any kind in the server's environment (names printed, never values).
+while IFS= read -r name; do
+  [[ -n "${!name:-}" ]] && bad "$name is set in the serve container; the server must hold no secrets"
+done < <(compgen -e | grep -E '(^|_)(KEYS?|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|PAT|CREDENTIALS?)(_|$)')
+[[ "${OPENCODE_CONFIG:-}" == "$APP/opencode.json" ]] || bad "OPENCODE_CONFIG is not $APP/opencode.json"
+[[ "${OPENCODE_CONFIG_DIR:-}" == "$APP/.opencode" ]] || bad "OPENCODE_CONFIG_DIR is not $APP/.opencode"
+[[ "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" == 1 ]] || bad "OPENCODE_DISABLE_PROJECT_CONFIG is not 1; config would follow the session directory"
+# Round-2 M1: LSP and formatters would spawn binaries from the session
+# directory as the server. Pinned off; enabling them must be a reviewed change.
+python3 - "$APP/opencode.json" <<'PY' || bad "opencode.json must pin lsp:false, formatter:false, and deny webfetch and websearch"
+import json, sys
+c = json.load(open(sys.argv[1]))
+perm = c.get("permission", {})
+ok = c.get("lsp") is False and c.get("formatter") is False and perm.get("webfetch") == "deny" and perm.get("websearch") == "deny"
+sys.exit(0 if ok else 1)
+PY
 # The containment checks, run directly as a tool shell would run them, so a
 # failure names the check (names only, never what was read).
 contain_out=$(/opt/jill/bin/bash /app/selftest/contain.sh 2>/dev/null)
@@ -74,18 +90,6 @@ grep -q '^selftest-ok$' <<<"$contain_out" || bad "contain.sh did not complete un
 while IFS= read -r line; do
   [[ "$line" == selftest-escaped:* ]] && bad "containment: ${line#selftest-escaped:}"
 done <<<"$contain_out"
-[[ -r "$APP/config/guards.json" ]] || bad "config/guards.json is not readable"
-# No upstream credential may be in this container. Only the API password
-# and the gateway caller tokens are allowed (names printed, never values).
-while IFS= read -r name; do
-  case "$name" in
-    OPENCODE_SERVER_PASSWORD|*_CALLER_TOKEN) ;;
-    *) [[ -n "${!name:-}" ]] && bad "$name is set in the serve container; upstream keys belong only in their gateway" ;;
-  esac
-done < <(compgen -e | grep -E '(^|_)(KEYS?|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|PAT|CREDENTIALS?)(_|$)')
-[[ "${OPENCODE_CONFIG:-}" == "$APP/opencode.json" ]] || bad "OPENCODE_CONFIG is not $APP/opencode.json"
-[[ "${OPENCODE_CONFIG_DIR:-}" == "$APP/.opencode" ]] || bad "OPENCODE_CONFIG_DIR is not $APP/.opencode"
-[[ "${OPENCODE_DISABLE_PROJECT_CONFIG:-}" == 1 ]] || bad "OPENCODE_DISABLE_PROJECT_CONFIG is not 1; config would follow the session directory"
 say "static checks done"
 
 # --- 2. live runs through OpenCode -----------------------------------------

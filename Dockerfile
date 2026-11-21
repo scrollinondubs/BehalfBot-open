@@ -13,10 +13,11 @@ FROM node:22-bookworm-slim
 # python3 for the bridge, curl for the compose healthcheck, git because
 # opencode prefers running inside a repo, ca-certificates for TLS, jq for the
 # heartbeat dispatcher's JSON parsing, ripgrep for OpenCode's grep/glob tools
-# (otherwise it downloads rg at runtime into a noexec tmpfs).
+# (otherwise it downloads rg at runtime into a noexec tmpfs), iptables for
+# the jill-netns container that firewalls opencode-serve's network namespace.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3 python3-pip curl git ca-certificates jq ripgrep \
+        python3 python3-pip curl git ca-certificates jq ripgrep iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # opencode pinned exactly. 1.19.6 differs from 1.19.5 only in
@@ -44,56 +45,45 @@ COPY opencode.json AGENTS.md ./
 COPY .opencode/ ./.opencode/
 COPY config/ ./config/
 COPY selftest/ ./selftest/
-COPY gateway/gateway.py ./gateway/gateway.py
+COPY gateway/gateway.py gateway/approvals.py ./gateway/
 COPY runtime/jill-shell /opt/jill/bin/bash
+COPY runtime/setup-netns.sh /opt/jill/bin/setup-netns.sh
 COPY bridge/discord_bridge.py ./bridge/discord_bridge.py
 
-# Two identities in opencode-serve (#46 red-team C1/C2/H1/H2/H6):
+# opencode-serve runs as node (uid 1000), NON-ROOT, with NO capabilities,
+# and holds NO secrets (round-2 red-team C1): no upstream key, no API
+# password, no caller token. Anything the server can be tricked into reading
+# (@file expansion, a raced symlink, /proc/1/environ) is therefore worth
+# nothing. What protects the rest is structural, outside the container:
+#   - its network namespace is owned and firewalled by jill-netns: no
+#     loopback access to the API, no route to the Docker/Colima gateway
+#     host, no route out except the gateway sidecars
+#   - the API is reachable only from api-proxy, which requires a password
+#     the serve container does not have and refuses MCP registration,
+#     shells, PTY, config writes and upgrades
 #
-#   root, cap-dropped to SETUID/SETGID/KILL, no DAC_OVERRIDE: the OpenCode
-#     server itself. It holds the API password and the Venice caller token,
-#     owns its data dir, and is the only user that can run `opencode`.
-#   node (1000): every bash tool command. /opt/jill/bin/bash (the shell
-#     OpenCode is configured to use) drops to node with an empty environment
-#     before running anything. node cannot read root's /proc/<pid>/environ,
-#     cannot execute or read the opencode binary, and cannot write OpenCode's
-#     data dir (no auth.json poisoning) or any guard file.
-#
-# Ownership, and why:
-#   /app, global config,    uid 65534 (nobody), read-only to everyone: not
-#   /home/node
-#                           even root-without-DAC_OVERRIDE can change them
-#   opencode binaries       root:ocrun 0750; the dispatcher gets group ocrun
-#   /var/lib/opencode       root 0700 (data volume, auth.json, sessions)
-#   /data                   root 0700 (memory MCP, runs as root in serve)
-#   /state/{bridge,dispatcher}  node, for the containers that run as node
-#   /workspace              node:jillwork 2775, root in jillwork, umask 002,
-#                           so files made by the write tool (root) and by
-#                           shell commands (node) are editable by both
-RUN groupadd -g 1500 jillwork && groupadd -g 1600 ocrun \
-    && usermod -aG jillwork node && usermod -aG jillwork root \
-    && git init -q /app \
+# Ownership:
+#   /app, global config, /home/node   uid 65534 (nobody), read-only to all
+#   /var/lib/opencode, /data          node 0700 (OpenCode data, memory MCP)
+#   /workspace                        node (her files)
+#   /state/{bridge,dispatcher,gateway,approvals}  node, per-container volumes
+RUN git init -q /app \
     && git -C /app config user.email "jill-agent@agentmail.to" \
     && git -C /app config user.name "Jill" \
     && printf '%s\n' node_modules package.json package-lock.json bun.lock .gitignore > /app/.opencode/.gitignore \
     && git -C /app add -A && git -C /app commit -qm "image snapshot" \
     && mkdir -p /etc/opencode-xdg/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode \
-        /data /workspace /home/node/.local/state /home/node/.cache /state/bridge /state/dispatcher \
+        /data /workspace /home/node/.local/state /home/node/.cache \
+        /state/bridge /state/dispatcher /state/gateway /state/approvals \
     && cp /app/.opencode/.gitignore /etc/opencode-xdg/opencode/.gitignore \
     && printf '{\n  "$schema": "https://opencode.ai/config.json"\n}\n' > /etc/opencode-xdg/opencode/opencode.jsonc \
-    && chown -R 65534:65534 /app /etc/opencode-xdg \
-    && chmod -R u=rwX,go=rX /app /etc/opencode-xdg /opt/jill \
-    && chmod 0755 /opt/jill/bin/bash \
-    && chown -R 65534:65534 /home/node && chown -R root:root /opt/jill && chmod -R u=rwX,go=rX /home/node \
-    && chmod 0700 /var/lib/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode /data \
-    && chown node:jillwork /workspace && chmod 2775 /workspace \
-    && chown node:node /home/node/.local/state /home/node/.cache /state/bridge /state/dispatcher \
-    && chown -R root:ocrun /usr/local/lib/node_modules/opencode-ai \
-    && chmod -R o-rwx /usr/local/lib/node_modules/opencode-ai
+    && chown -R 65534:65534 /app /etc/opencode-xdg /home/node \
+    && chmod -R u=rwX,go=rX /app /etc/opencode-xdg /home/node /opt/jill \
+    && chmod 0755 /opt/jill/bin/bash /opt/jill/bin/setup-netns.sh \
+    && chown -R node:node /var/lib/opencode /var/cache/opencode /data /workspace \
+        /home/node/.local/state /home/node/.cache /state \
+    && chmod 0700 /var/lib/opencode /var/lib/opencode/data /var/lib/opencode/state /var/cache/opencode /data
 
-# Default user for the bridge and dispatcher. opencode-serve runs as root
-# with a reduced capability set (docker-compose.yml) and drops tool commands
-# to node through /opt/jill/bin/bash.
 USER node
 ENV HOME=/home/node \
     npm_config_cache=/tmp/.npm \

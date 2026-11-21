@@ -6,6 +6,8 @@
     "venice"
   ],
   "shell": "/opt/jill/bin/bash",
+  "lsp": false,
+  "formatter": false,
   "instructions": [
     "/app/AGENTS.md",
     "/app/.opencode/instructions/response-style.md",
@@ -19,7 +21,7 @@
       "name": "Venice AI",
       "options": {
         "baseURL": "{env:VENICE_BASE_URL}",
-        "apiKey": "{env:VENICE_CALLER_TOKEN}"
+        "apiKey": "not-a-key-venice-proxy-holds-it"
       },
       "whitelist": [
         "zai-org-glm-5-2",
@@ -76,7 +78,9 @@
     },
     "skill": {
       "*": "allow"
-    }
+    },
+    "webfetch": "deny",
+    "websearch": "deny"
   },
   "mcp": {
     "memory": {
@@ -94,10 +98,7 @@
       "type": "remote",
       "url": "http://brave-proxy:8080/mcp",
       "enabled": true,
-      "oauth": false,
-      "headers": {
-        "Authorization": "Bearer {env:BRAVE_CALLER_TOKEN}"
-      }
+      "oauth": false
     },
     "siyuan": {
       "type": "local",
@@ -107,8 +108,7 @@
       ],
       "enabled": true,
       "environment": {
-        "SIYUAN_URL": "http://siyuan-proxy:8080",
-        "SIYUAN_TOKEN": "{env:SIYUAN_CALLER_TOKEN}"
+        "SIYUAN_URL": "http://siyuan-proxy:8080"
       }
     }
   }
