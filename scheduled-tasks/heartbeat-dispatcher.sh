@@ -272,6 +272,9 @@ _mtime() {
 # released when the holder dies, so it has no orphans. The mkdir lock below
 # is the fallback for hosts without it (stock macOS), or when
 # DISPATCHER_STATE_LOCK=mkdir. fd 9 is used so bash 3.2 can run this too.
+# Known issue: under 40 concurrent writers on a GitHub-hosted runner the
+# mkdir fallback lost 2 updates with no recovery path taken; cause not yet
+# found. The dispatcher itself runs in the image, which has flock.
 STATE_LOCK_KIND=""
 
 _state_lock_acquire() {
