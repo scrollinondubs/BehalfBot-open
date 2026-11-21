@@ -27,6 +27,8 @@ const (
 	ReasonNotSigned  = "device-not-cross-signed"
 	ReasonCheckError = "trust-check-failed"
 	ReasonReplay     = "replay"
+	ReasonLate       = "late-delivery"
+	ReasonNoIndex    = "megolm-index-unknown"
 )
 
 // Inbound is everything the acceptance rule looks at, gathered by the
@@ -62,6 +64,11 @@ type Inbound struct {
 	// (VerifyPrincipalDevice). ErrIdentityChanged means the pin no longer
 	// matches.
 	DeviceCheck func() error
+	// IndexKnown is false when the Megolm session and index of the event
+	// were not recorded on arrival; Late reports a message older than one
+	// already accepted from the same session (round 6b N2).
+	IndexKnown bool
+	Late       func() bool
 	// Claim records the event id as handled and reports whether it was new.
 	// Persisted, so a replay across restarts is refused.
 	Claim func() (bool, error)
@@ -127,6 +134,12 @@ func Accept(in Inbound) string {
 		default:
 			return ReasonCheckError
 		}
+	}
+	if !in.IndexKnown {
+		return ReasonNoIndex
+	}
+	if in.Late != nil && in.Late() {
+		return ReasonLate
 	}
 	if in.Claim == nil {
 		return ReasonCheckError

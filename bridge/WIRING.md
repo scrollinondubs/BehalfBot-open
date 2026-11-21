@@ -46,6 +46,7 @@ with the event id and the reason, never the content:
 | under 10 minutes old, and not more than 1 minute in the future, checked after decryption | `stale`, `future-timestamp` |
 | the principal's master key equals the pin (a fresh `/keys/query`) | `identity-changed` |
 | the device is signed by a self-signing key that the pinned master key signed, and the device's own keys match the keys that encrypted the event | `device-not-cross-signed` |
+| no newer message from the same Megolm session was accepted before it (persisted per session; round 6b N2) | `late-delivery`, and a `[bridge]` notice quoting its first 40 characters |
 | the event id was never handled before (persisted, so it survives restarts) | `replay` |
 
 Megolm's own message-index check, also persisted in the crypto store, refuses
@@ -194,8 +195,15 @@ the bridge says so and voids those codes (round 6b N1). A newer
 - Every message the bridge writes starts with `[bridge]`.
 - Every reply from Jill starts with
   `Jill, re "<your message, 60 chars>" (received <time> UTC):`.
-- Lines in Jill's text that begin like a bridge message are defused, so
-  model output can never pass for the bridge. After `confirm`, the approval is
+- In Jill's text, invisible and line-breaking characters are made visible,
+  and `[bridge]` anywhere in a line (after Unicode normalisation, so
+  full-width or look-alike forms count) is defused (round 6b R3-2).
+- Model-server error bodies are logged, never relayed. The chat shows a
+  fixed `[bridge]` error with the HTTP status only.
+- The code filter folds case and width and ignores spaces, hyphens and other
+  separators, so a retyped code is still caught (round 6b R3-1).
+- A `halt` with a leading mention takes the fast path too (round 6b R3-6).
+  A halt is written to disk before its event id is claimed. After `confirm`, the approval is
 written bound to the typed sha256 (TTL 15 minutes, `DRAFT_APPROVAL_TTL`),
 without re-reading the draft. If Jill changes the draft after you looked,
 the gateway's send check fails and the approval is used up.
@@ -216,8 +224,9 @@ worker cannot switch back.
   PDFs and relays model output, and keeps its session map in
   `matrix-chat-state`. It cannot write approvals, the halt or meter flags or
   the alert spool, and cannot read the worker's codes or the bridge state.
-- The bridge refuses to start as root unless both of those uids are set
-  (round 6b N5).
+- The bridge refuses to start as root unless both of those uids are set,
+  non-root and different from each other (round 6b N5, R3-5). The chat step
+  never falls back to the worker uid.
 - Alerts are written through the worker, which owns the spool.
 - The service has `mem_limit` 512m and `pids_limit` 128.
 - PDF parsing happens only in the worker.

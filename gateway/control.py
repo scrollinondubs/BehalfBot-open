@@ -374,6 +374,8 @@ class Control:
         if command == "halt":
             lift_at = self._tightened_lift(self.halt_file, duration)
             if lift_at is False:
+                # Still a halt: it voids pending confirms (round 6b R3-4).
+                flags.touch(self.halt_file)
                 return "Already halted until at least then; the halt is unchanged.\n" + self.describe_state()
             flags.write(self.halt_file, True, by, lift_at, reason)
             lift = "Auto-lift %s." % lift_at if lift_at else "No auto-lift - stays halted until you say `resume`."

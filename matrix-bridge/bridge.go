@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,8 +58,7 @@ func LoadConfig() (Config, []string) {
 		// meter flags (round 6b N6). Defaults to the worker uid off-container.
 		ChatWorker: WorkerSpec{
 			Argv: []string{"python3", "-I", envOr("BRIDGE_WORKER", "/app/bridge/matrix_worker.py")},
-			UID:  int(envInt("BRIDGE_CHAT_UID", envInt("BRIDGE_WORKER_UID", 0))),
-			GID:  int(envInt("BRIDGE_CHAT_GID", envInt("BRIDGE_WORKER_GID", 0))),
+			UID:  int(envInt("BRIDGE_CHAT_UID", 0)), GID: int(envInt("BRIDGE_CHAT_GID", 0)),
 		},
 		MaxAttach: envInt("BRIDGE_MAX_ATTACHMENT_BYTES", 10_000_000),
 		ReadyFile: envOr("BRIDGE_READY_FILE", "/tmp/bridge-ready"),
@@ -77,9 +77,14 @@ func LoadConfig() (Config, []string) {
 // workerUIDProblems refuses any configuration in which a worker would run
 // with the bridge's own uid, and above all as root next to the keys
 // (round 6b N5).
-func workerUIDProblems(bridgeUID int, workers ...WorkerSpec) []string {
+func workerUIDProblems(bridgeUID int, worker, chat WorkerSpec) []string {
 	var out []string
-	for _, w := range workers {
+	// Never fall back: as root, the chat step needs its own uid (round 6b
+	// R3-5).
+	if bridgeUID == 0 && chat.UID > 0 && chat.UID == worker.UID {
+		out = append(out, "BRIDGE_CHAT_UID must differ from BRIDGE_WORKER_UID")
+	}
+	for _, w := range []WorkerSpec{worker, chat} {
 		switch {
 		case bridgeUID == 0 && w.UID <= 0:
 			out = append(out, "running as root, so BRIDGE_WORKER_UID/GID (and BRIDGE_CHAT_UID/GID) must name a non-root uid and gid for the worker")
@@ -111,7 +116,9 @@ func logf(format string, args ...any) {
 
 // OpenCrypto opens the crypto store in the state volume with a pure-Go
 // SQLite driver, so the binary needs neither cgo nor libolm.
-func OpenCrypto(ctx context.Context, cfg Config, creds *Creds) (*mautrix.Client, *cryptohelper.CryptoHelper, error) {
+// OpenCrypto opens the client and crypto store. Each `pre` handler sees
+// m.room.encrypted events before they are decrypted.
+func OpenCrypto(ctx context.Context, cfg Config, creds *Creds, pre ...mautrix.EventHandler) (*mautrix.Client, *cryptohelper.CryptoHelper, error) {
 	cli, err := mautrix.NewClient(cfg.Homeserver, creds.UserID, creds.AccessToken)
 	if err != nil {
 		return nil, nil, err
@@ -137,6 +144,9 @@ func OpenCrypto(ctx context.Context, cfg Config, creds *Creds) (*mautrix.Client,
 	if err != nil {
 		return nil, nil, err
 	}
+	for _, h := range pre {
+		cli.Syncer.(*mautrix.DefaultSyncer).OnEventType(event.EventEncrypted, h)
+	}
 	helper, err := cryptohelper.NewCryptoHelper(cli, pickle, db)
 	if err != nil {
 		return nil, nil, err
@@ -161,6 +171,8 @@ type Bridge struct {
 	cli     *mautrix.Client
 	helper  *cryptohelper.CryptoHelper
 	handled *HandledStore
+	index   *IndexStore
+	enc     *encRecorder
 	pin     Pin
 	locked  atomic.Bool
 	alerts  *Alerter
@@ -300,6 +312,22 @@ func (b *Bridge) onDecrypted(ctx context.Context, evt *event.Event) {
 		return
 	}
 	dev := evt.Mautrix.TrustSource
+	ref, refOK := b.enc.Take(evt.ID)
+	var key string
+	if refOK && dev != nil {
+		key = indexKey(dev.IdentityKey, ref.session)
+	}
+	content, _ := evt.Content.Parsed.(*event.MessageEventContent)
+	// A halt is written to disk before its event id is claimed (round 6b
+	// R3-6): a crash between the two cannot lose it.
+	var haltReq *WorkerRequest
+	if content != nil && content.MsgType == event.MsgText && IsHalt(content.Body) {
+		haltReq = &WorkerRequest{EventID: evt.ID.String(), Room: b.cfg.Room.String(), Text: content.Body,
+			ReceivedAt: float64(time.Now().UnixNano()) / 1e9}
+		if err := b.savePendingHalt(*haltReq); err != nil {
+			logf("ERROR: could not persist halt %s: %v", evt.ID, err)
+		}
+	}
 	in := Inbound{
 		IdentityLocked: b.locked.Load(),
 		RoomID:         evt.RoomID, ExpectedRoom: b.cfg.Room,
@@ -317,7 +345,9 @@ func (b *Bridge) onDecrypted(ctx context.Context, evt *event.Event) {
 			}
 			return VerifyPrincipalDevice(raw, b.cfg.Principal, b.pin.MasterKey, dev.DeviceID, dev.SigningKey, dev.IdentityKey)
 		},
-		Claim: func() (bool, error) { return b.handled.Claim(evt.ID) },
+		IndexKnown: refOK && dev != nil,
+		Late:       func() bool { return b.index.Late(key, ref.index) },
+		Claim:      func() (bool, error) { return b.handled.Claim(evt.ID) },
 	}
 	reason := Accept(in)
 	if reason == ReasonIdentity {
@@ -325,20 +355,23 @@ func (b *Bridge) onDecrypted(ctx context.Context, evt *event.Event) {
 	}
 	if reason != ReasonAccepted {
 		logf("drop event=%s reason=%s", evt.ID, reason)
+		if haltReq != nil {
+			b.clearPendingHalt(haltReq.EventID)
+		}
+		if reason == ReasonLate {
+			go b.send(context.WithoutCancel(ctx), "[bridge] An older message arrived late and was not sent to Jill: \""+
+				preview(content, 40)+"\". If you still mean it, send it again.")
+		}
 		return
 	}
+	if err := b.index.Accept(key, ref.index); err != nil {
+		logf("ERROR: could not persist the Megolm index: %v", err)
+	}
 	logf("accept event=%s device=%s", evt.ID, dev.DeviceID)
-	if c, ok := evt.Content.Parsed.(*event.MessageEventContent); ok && c.MsgType == event.MsgText && IsHalt(c.Body) {
-		// A halt skips the queue and its length limit, and is persisted
-		// before it is handled, so a crash or restart cannot lose it after
-		// its event id was claimed (round 6b N8).
-		req := WorkerRequest{EventID: evt.ID.String(), Room: b.cfg.Room.String(), Text: c.Body,
-			ReceivedAt: float64(time.Now().UnixNano()) / 1e9}
-		if err := b.savePendingHalt(req); err != nil {
-			logf("ERROR: could not persist halt %s: %v", evt.ID, err)
-		}
-		b.process(context.WithoutCancel(ctx), req)
-		b.clearPendingHalt(req.EventID)
+	if haltReq != nil {
+		// A halt skips the queue and its length limit (round 6b N8).
+		b.process(context.WithoutCancel(ctx), *haltReq)
+		b.clearPendingHalt(haltReq.EventID)
 		return
 	}
 	select {
@@ -349,7 +382,27 @@ func (b *Bridge) onDecrypted(ctx context.Context, evt *event.Event) {
 	}
 }
 
-var haltRE = regexp.MustCompile(`(?i)^\s*[!.?,;:]*\s*(halt|mute|silence)(\s|[!.?,;:]|$)`)
+// A leading mention is allowed, as the worker's parser allows it (round 6b
+// R3-6).
+// preview is the first n characters of a message, on one line, with control
+// characters removed, for a bridge notice.
+func preview(c *event.MessageEventContent, n int) string {
+	if c == nil {
+		return "(no text)"
+	}
+	body := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == '"' {
+			return ' '
+		}
+		return r
+	}, c.Body)
+	if r := []rune(body); len(r) > n {
+		body = string(r[:n]) + "..."
+	}
+	return body
+}
+
+var haltRE = regexp.MustCompile(`(?i)^\s*(@[^:\s]+:[A-Za-z0-9.\-\[\]]+(:\d+)?:?\s*)?[!.?,;:]*\s*(halt|mute|silence)(\s|[!.?,;:]|$)`)
 
 // IsHalt matches the halt words the worker's parser accepts.
 func IsHalt(body string) bool { return haltRE.MatchString(body) }
@@ -651,11 +704,16 @@ func NewBridge(ctx context.Context, cfg Config) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
-	cli, helper, err := OpenCrypto(ctx, cfg, creds)
+	index, err := OpenIndexStore(cfg.StateDir)
+	if err != nil {
+		return nil, err
+	}
+	enc := newEncRecorder()
+	cli, helper, err := OpenCrypto(ctx, cfg, creds, enc.Record)
 	if err != nil {
 		return nil, fmt.Errorf("crypto init failed: %w", err)
 	}
-	b := &Bridge{cfg: cfg, cli: cli, helper: helper, handled: handled, pin: pin,
+	b := &Bridge{cfg: cfg, cli: cli, helper: helper, handled: handled, index: index, enc: enc, pin: pin,
 		alerts: NewAlerter(cfg.Worker), now: time.Now,
 		commands: make(chan *event.Event, queueDepth), chats: make(chan WorkerRequest, queueDepth)}
 	// Whatever session is in the store was created under an earlier state

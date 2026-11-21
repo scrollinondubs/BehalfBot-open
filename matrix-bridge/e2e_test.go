@@ -436,14 +436,18 @@ func TestE2E(t *testing.T) {
 	if err := raw.Content.ParseRaw(raw.Type); err != nil {
 		t.Fatal(err)
 	}
+	b.enc.Record(ctx, raw)
 	dec, err := b.helper.Decrypt(ctx, raw)
 	if err != nil {
 		t.Fatalf("decrypting the replayed event: %v", err)
 	}
 	dec.Mautrix.EventSource |= event.SourceDecrypted
 	b.onDecrypted(ctx, dec)
-	if !strings.Contains(logs.String(), "drop event="+hello.String()+" reason=replay") {
-		t.Fatal("replayed event was not dropped as a replay")
+	// Dropped either as a replay (event id) or, since newer messages from the
+	// same Megolm session were accepted after it, as a late delivery.
+	if !strings.Contains(logs.String(), "drop event="+hello.String()+" reason=replay") &&
+		!strings.Contains(logs.String(), "drop event="+hello.String()+" reason="+ReasonLate) {
+		t.Fatal("replayed event was not dropped")
 	}
 
 	// 6. A second, non-cross-signed device on Sean's account.

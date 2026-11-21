@@ -22,6 +22,7 @@ func goodInbound() Inbound {
 		TimestampMS: 1_000_000, NowMS: 1_000_000 + 5_000,
 		DeviceCheck: func() error { return nil },
 		Claim:       func() (bool, error) { return true, nil },
+		IndexKnown:  true,
 	}
 }
 
@@ -56,6 +57,8 @@ func TestAcceptRules(t *testing.T) {
 		{"keys query failed", func(in *Inbound) { in.DeviceCheck = func() error { return errors.New("timeout") } }, ReasonCheckError},
 		{"no device check wired", func(in *Inbound) { in.DeviceCheck = nil }, ReasonCheckError},
 		{"replay", func(in *Inbound) { in.Claim = func() (bool, error) { return false, nil } }, ReasonReplay},
+		{"late delivery (older Megolm index)", func(in *Inbound) { in.Late = func() bool { return true } }, ReasonLate},
+		{"Megolm index not recorded", func(in *Inbound) { in.IndexKnown = false }, ReasonNoIndex},
 		{"replay store error", func(in *Inbound) { in.Claim = func() (bool, error) { return false, errors.New("disk") } }, ReasonCheckError},
 	}
 	for _, c := range cases {
@@ -168,35 +171,38 @@ func TestRecipientKeyChangesWithMembersDevicesAndPin(t *testing.T) {
 }
 
 func TestWorkerUIDProblems(t *testing.T) {
-	ok := WorkerSpec{UID: 1000, GID: 1000}
+	w, chat := WorkerSpec{UID: 1000, GID: 1000}, WorkerSpec{UID: 1001, GID: 1001}
 	cases := []struct {
-		name   string
-		bridge int
-		specs  []WorkerSpec
-		bad    bool
+		name        string
+		bridge      int
+		worker, cht WorkerSpec
+		bad         bool
 	}{
-		{"root with separate worker and chat uids", 0, []WorkerSpec{ok, {UID: 1001, GID: 1001}}, false},
-		{"root, worker uid unset (round 6b N5)", 0, []WorkerSpec{{}}, true},
-		{"root, worker uid 0", 0, []WorkerSpec{{UID: 0, GID: 1000}}, true},
-		{"root, chat uid unset", 0, []WorkerSpec{ok, {}}, true},
-		{"uid without gid", 0, []WorkerSpec{{UID: 1000}}, true},
-		{"worker uid equals the bridge uid", 1000, []WorkerSpec{ok}, true},
-		{"laptop: non-root, no worker uid", 501, []WorkerSpec{{}, {}}, false},
+		{"root with separate worker and chat uids", 0, w, chat, false},
+		{"root, worker uid unset (round 6b N5)", 0, WorkerSpec{}, chat, true},
+		{"root, worker uid 0", 0, WorkerSpec{UID: 0, GID: 1000}, chat, true},
+		{"root, chat uid unset: no fallback (R3-5)", 0, w, WorkerSpec{}, true},
+		{"root, chat uid 0 (R3-5)", 0, w, WorkerSpec{UID: 0, GID: 1001}, true},
+		{"root, chat uid equals worker uid (R3-5)", 0, w, w, true},
+		{"uid without gid", 0, WorkerSpec{UID: 1000}, chat, true},
+		{"worker uid equals the bridge uid", 1000, w, WorkerSpec{}, true},
+		{"laptop: non-root, no worker uids", 501, WorkerSpec{}, WorkerSpec{}, false},
 	}
 	for _, c := range cases {
-		if got := len(workerUIDProblems(c.bridge, c.specs...)) > 0; got != c.bad {
+		if got := len(workerUIDProblems(c.bridge, c.worker, c.cht)) > 0; got != c.bad {
 			t.Errorf("%s: problems=%v, want %v", c.name, got, c.bad)
 		}
 	}
 }
 
 func TestIsHalt(t *testing.T) {
-	for _, s := range []string{"halt", "HALT", " halt now", "halt 2h travelling", "mute", "silence!", "Halt."} {
+	for _, s := range []string{"halt", "HALT", " halt now", "halt 2h travelling", "mute", "silence!", "Halt.",
+		"@jill:example.org halt", "@jill:example.org: halt now", "@jill:m.grid7.com:8448 mute"} {
 		if !IsHalt(s) {
 			t.Errorf("%q should be a halt", s)
 		}
 	}
-	for _, s := range []string{"halting", "should we halt?", "resume", "", "halftime"} {
+	for _, s := range []string{"halting", "should we halt?", "resume", "", "halftime", "@jill:example.org resume"} {
 		if IsHalt(s) {
 			t.Errorf("%q should not be a halt", s)
 		}
@@ -217,5 +223,36 @@ func TestPendingHaltSurvivesRestart(t *testing.T) {
 	b.clearPendingHalt("$h1")
 	if _, err := os.Stat(b.pendingHaltPath("$h1")); !os.IsNotExist(err) {
 		t.Fatal("pending halt not cleared")
+	}
+}
+
+func TestIndexStoreLateDeliveryAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenIndexStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := indexKey("devkey", "session1")
+	if s.Late(k, 3) {
+		t.Fatal("nothing accepted yet: not late")
+	}
+	if err := s.Accept(k, 5); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Late(k, 4) {
+		t.Fatal("index 4 after 5 must be late")
+	}
+	if s.Late(k, 5) || s.Late(k, 6) {
+		t.Fatal("equal (replay, caught by the event id) or newer must not count as late")
+	}
+	if s.Late(indexKey("devkey", "session2"), 0) {
+		t.Fatal("another session is independent")
+	}
+	again, err := OpenIndexStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.Late(k, 4) {
+		t.Fatal("the highest index must survive a restart")
 	}
 }

@@ -505,8 +505,8 @@ def sync_halt(now=None):
     if not flags.is_on(path):
         return
     data, ok = flags.read(path)
-    precise = data.get("enabled_epoch") if ok else None
-    if isinstance(precise, (int, float)) and not isinstance(precise, bool):
+    precise = flags.last_asserted(path) if ok else None
+    if precise is not None:
         before = precise
     else:
         # Written without enabled_epoch (older writer): enabled_at has
@@ -535,10 +535,17 @@ def leaked_codes(texts, now=None):
     """Retire, and return, every live code (or the sha of a draft with a live
     screen or pending approval) that appears in these texts (round 6b N1).
     A code that reached the model could be put on a forged screen."""
-    hay = "\n".join(t.lower() for t in texts if t)
+    hay = squash("\n".join(t for t in texts if t))
     if not hay:
         return []
     return retire_codes(lambda code, rec: code in hay or (rec.get("sha") and rec["sha"] in hay), now)
+
+
+def squash(text):
+    """Fold case and width and drop everything but letters and digits, so a
+    code retyped with spaces, hyphens, other separators or full-width digits
+    still matches (round 6b R3-1)."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text).casefold() if ch.isascii() and ch.isalnum())
 
 
 def show_draft(draft_id):
@@ -785,7 +792,8 @@ class OpencodeClient:
         async with http.post(f"{self.base_url}/session/{sid}/message", json=body) as resp:
             if resp.status != 200:
                 detail = (await resp.text())[:200]
-                raise RuntimeError(f"opencode returned HTTP {resp.status}: {detail}")
+                log.warning("opencode returned HTTP %s: %s", resp.status, detail)
+                raise UpstreamError(resp.status)
             data = await resp.json()
         texts = [p.get("text", "") for p in data.get("parts", []) if p.get("type") == "text" and p.get("text")]
         return "\n".join(texts).strip() or "(model returned no text)"
@@ -800,7 +808,38 @@ class OpencodeClient:
             return False
 
 
-BRIDGE_LIKE = re.compile(r"(?im)^([ \t>]*)\[\s*bridge\s*\]")
+BRIDGE_LIKE = re.compile(r"\[\s*bridge\s*\]", re.IGNORECASE)
+
+
+class UpstreamError(RuntimeError):
+    """opencode answered with an error status. Its body is logged, never
+    relayed: Jill can shape it (round 6b R3-2)."""
+
+    def __init__(self, status):
+        super().__init__("HTTP %s" % status)
+        self.status = status
+
+
+def defuse_line(line):
+    """Make invisible and line-breaking characters visible (no hidden line
+    can start with a fake marker), then, after Unicode normalisation,
+    neutralise `[bridge]` anywhere in the line (round 6b R3-2)."""
+    out = []
+    for ch in line:
+        o = ord(ch)
+        if ch == "\t":
+            out.append(ch)
+        elif o < 0x20 or 0x7F <= o <= 0x9F:
+            out.append("\\x%02x" % o)
+        elif o in BLANKS or (unicodedata.category(ch) in ("Cf", "Zs", "Zl", "Zp", "Co", "Cs", "Cn") and ch != " "):
+            out.append("\\u{%04x}" % o)
+        else:
+            out.append(ch)
+    visible = "".join(out)
+    normal = unicodedata.normalize("NFKC", visible)
+    if BRIDGE_LIKE.search(normal):
+        return BRIDGE_LIKE.sub("(bridge?)", normal)
+    return visible
 
 
 def model_reply(reply, req):
@@ -812,7 +851,7 @@ def model_reply(reply, req):
     quote = esc(asked[:60]) + ("..." if len(asked) > 60 else "")
     at = req.get("received_at")
     when = time.strftime("%H:%M:%S UTC", time.gmtime(at if isinstance(at, (int, float)) else time.time()))
-    safe = BRIDGE_LIKE.sub(lambda m: m.group(1) + "(bridge?)", reply)
+    safe = "\n".join(defuse_line(line) for line in reply.split("\n"))
     chunks = chunk_message(safe, MATRIX_CHUNK - 200)
     first = 'Jill, re "%s" (received %s):\n' % (quote, when)
     return [first + chunks[0]] + ["Jill (continued):\n" + c for c in chunks[1:]]
@@ -855,7 +894,10 @@ async def handle_chat(req, client=None):
         log.warning("opencode error: %s", type(exc).__name__)
         if not await client.health():
             return bridge_says("opencode server is unreachable - is the stack running?")
-        return bridge_says("opencode error: {}".format(str(exc)[:300]))
+        if isinstance(exc, UpstreamError):
+            return bridge_says("Jill's model server returned an error (HTTP %s). Details are in the bridge log." % exc.status)
+        return bridge_says("Jill's model server could not be reached properly (%s). Details are in the bridge log."
+                           % type(exc).__name__)
     finally:
         await client.close()
     if halted():

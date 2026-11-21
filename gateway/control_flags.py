@@ -140,6 +140,39 @@ def write(path, enabled, by=None, auto_lift=None, reason=None):
         os.close(dfd)
 
 
+def touch(path, now=None):
+    """Record that the flag was asserted again while already on, without
+    changing it: `last_epoch` voids anything issued before this moment
+    (round 6b R3-4). Same atomic, fsynced write as write()."""
+    data, ok = read(path)
+    if not ok or data.get("enabled") is not True:
+        return
+    data["last_epoch"] = time.time() if now is None else now
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def last_asserted(path):
+    """Epoch seconds of the latest time this flag was set or re-asserted, or
+    None when unknown."""
+    data, ok = read(path)
+    if not ok:
+        return None
+    times = [v for v in (data.get("enabled_epoch"), data.get("last_epoch"))
+             if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return max(times) if times else None
+
+
 def lift_expired(path, now=None):
     """Writer side: clear a flag whose auto-lift has passed. True if cleared."""
     if state(path, now) == "expired":

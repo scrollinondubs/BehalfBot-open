@@ -372,7 +372,9 @@ func TestRT3PlantedJillDevice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dec, err := b2.helper.Decrypt(ctx, fetch())
+	again := fetch()
+	b2.enc.Record(ctx, again)
+	dec, err := b2.helper.Decrypt(ctx, again)
 	if err != nil {
 		t.Fatalf("restart replay decrypt: %v", err)
 	}
@@ -569,4 +571,132 @@ func dropLeave(v any, hidden string) any {
 		return out
 	}
 	return v
+}
+
+// --- Round 6b N2: a held-back message delivered after a newer one --------
+
+// holdBack drops the principal's encrypted timeline events from the
+// bridge's /sync while hold is set; to-device room keys still pass. The
+// test then delivers the held events itself, in the order it chooses.
+func holdBack(t *testing.T, upstream string, sender id.UserID, hold *atomic.Bool) string {
+	u, _ := url.Parse(upstream)
+	rp := httputil.NewSingleHostReverseProxy(u)
+	dir := rp.Director
+	rp.Director = func(r *http.Request) { dir(r); r.Header.Del("Accept-Encoding") }
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if !strings.Contains(resp.Request.URL.Path, "/sync") || !hold.Load() {
+			return nil
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		dec := json.NewDecoder(bytes.NewReader(body))
+		dec.UseNumber()
+		var doc any
+		if dec.Decode(&doc) == nil {
+			var buf bytes.Buffer
+			enc := json.NewEncoder(&buf)
+			enc.SetEscapeHTML(false)
+			_ = enc.Encode(dropEncryptedFrom(doc, sender.String()))
+			body = buf.Bytes()
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return nil
+	}
+	srv := httptest.NewServer(rp)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func dropEncryptedFrom(v any, sender string) any {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, c := range x {
+			x[k] = dropEncryptedFrom(c, sender)
+		}
+		return x
+	case []any:
+		out := make([]any, 0, len(x))
+		for _, c := range x {
+			if m, ok := c.(map[string]any); ok && m["type"] == "m.room.encrypted" && m["sender"] == sender && m["event_id"] != nil {
+				continue
+			}
+			out = append(out, dropEncryptedFrom(c, sender))
+		}
+		return out
+	}
+	return v
+}
+
+func TestN2LateDelivery(t *testing.T)              { n2(t, "n2a", false) }
+func TestN2LateDeliveryAcrossRestart(t *testing.T) { n2(t, "n2b", true) }
+
+func n2(t *testing.T, tag string, restart bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	sasTimeout = 2 * time.Minute
+	hs := os.Getenv("IT_HS_URL")
+	if hs == "" {
+		t.Skip()
+	}
+	var hold atomic.Bool
+	seanID := id.NewUserID("sean"+tag, e2eServer)
+	e := rtBase(t, ctx, tag, holdBack(t, hs, seanID, &hold))
+	if err := Setup(ctx, e.cfg, e.tty); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	b := e.bridge(t, ctx)
+
+	// The server holds both back; Sean sent the first one first.
+	hold.Store(true)
+	older := e.say(t, ctx, e.sean, "yes, go ahead and do it")
+	newer := e.say(t, ctx, e.sean, "what is on my calendar today")
+	time.Sleep(3 * time.Second) // the room key reaches the bridge by to-device
+
+	deliver := func(to *Bridge, evtID id.EventID) {
+		t.Helper()
+		var dec *event.Event
+		waitUntil(t, 30*time.Second, "the bridge to decrypt "+evtID.String(), func() bool {
+			raw, err := to.cli.GetEvent(ctx, e.room, evtID)
+			if err != nil {
+				return false
+			}
+			raw.RoomID = e.room
+			if raw.Content.ParseRaw(raw.Type) != nil {
+				return false
+			}
+			to.enc.Record(ctx, raw)
+			dec, err = to.helper.Decrypt(ctx, raw)
+			return err == nil
+		})
+		dec.Mautrix.EventSource |= event.SourceDecrypted
+		to.onDecrypted(ctx, dec)
+	}
+
+	deliver(b, newer)
+	if !e.waitLog(t, 30*time.Second, "accept event="+newer.String()) {
+		t.Fatal("the newer message was not accepted")
+	}
+	target := b
+	if restart {
+		b2, err := NewBridge(ctx, e.cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target = b2
+	}
+	deliver(target, older)
+	if !e.waitLog(t, 30*time.Second, "drop event="+older.String()+" reason="+ReasonLate) {
+		t.Fatalf("FIX REGRESSED (round 6b N2, restart=%v): a held-back older message was not dropped as late", restart)
+	}
+	waitUntil(t, 60*time.Second, "the late-delivery notice", func() bool {
+		return e.sean.find(`An older message arrived late and was not sent to Jill: "yes, go ahead and do it"`) != ""
+	})
+	if e.sean.find("stub-reply: yes, go ahead") != "" {
+		t.Fatal("the late message reached the model")
+	}
 }

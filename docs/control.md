@@ -81,19 +81,28 @@ proves nothing.
   nothing.
 
 A halt from the control room (jill-control writes the same `halt.json`)
-voids every confirm issued before it, too (round 6b N4).
+voids every confirm issued before it, too, even when Jill is already halted
+and the flag does not change (round 6b N4, R3-4).
 
 **A halt is never lost (round 6b N8).** A `halt` skips the command queue
 and its length limit. The bridge writes it to its state, with fsync, before
 handling it, and replays it after a restart. The flag file itself is
 fsynced before the ack is sent.
 
-**Residual risk for Sean to accept: delayed chat (round 6b N2).** The
-homeserver admin cannot read or forge the chat. It can delay one of your
-ordinary messages and deliver it later, for example a "yes, go ahead" sent
-about something else. It cannot do this to anything that lifts a stop,
-hands back budget or approves an email, because those need a fresh
-`confirm` code.
+**Delayed chat (round 6b N2).** The homeserver admin cannot read or forge
+the chat, but it can hold one of your messages back and deliver it later.
+
+- **Caught.** Megolm numbers every message of a session inside the
+  authenticated ciphertext. The bridge remembers the highest number it
+  accepted per session, across restarts. A message that arrives after a
+  newer one from the same session is dropped, and the bridge tells you:
+  `[bridge] An older message arrived late and was not sent to Jill: "..."`.
+- **Not caught.** A held-back message that was the last one of a session
+  your client has since replaced. That message can still reach Jill late.
+- **Never at risk.** Nothing that lifts a stop, hands back budget or
+  approves an email: those always need a fresh `confirm` code.
+
+The residual for Sean to accept is the "not caught" case.
 
 So you can spot a delay, every reply from Jill opens with
 `Jill, re "<first 60 characters of your message>" (received <time> UTC):`.
