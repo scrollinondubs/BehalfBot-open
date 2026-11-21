@@ -58,6 +58,13 @@
 #             (each gateway writes its own probe result, it reads) and
 #             venice-meter (venice-proxy writes, it reads). venice-proxy
 #             refuses every model call while halted. docs/control.md.
+#   scan      the injection scanner (#51) in serve creates one empty file
+#             per hit in scan-alerts, the ONE volume serve shares with
+#             jill-control. It is root:1002 mode 1773: serve (uid 1000, not
+#             in group 1002) can create but not list, delete what it cannot
+#             name, or chmod. jill-control (group 1002) counts, removes and
+#             posts one fixed line with a bucketed count; tampering posts a
+#             fixed "tampered" line. A 1 MB, 256-inode tmpfs.
 #
 #   Matrix (E2EE) -> matrix-bridge -> api-proxy -> opencode-serve -> venice-proxy -> Venice
 #                                                    -> agentmail-proxy -> AgentMail
@@ -124,6 +131,7 @@ services:
       VENICE_BASE_URL: http://venice-proxy:8080/api/v1
       BEHALFBOT_MEMORY_FILE: /data/memory.jsonl
       JILL_EXPECT_FIREWALL: "1"
+      INJECTION_ALERT_DIR: /state/scan-alerts
     read_only: true
     tmpfs:
       - /tmp
@@ -135,6 +143,13 @@ services:
       - opencode-data:/var/lib/opencode/data
       - serve-data:/data
       - workspace:/workspace
+      # nocopy: without it Docker copies the image dir's owner (node) onto
+      # the empty volume and the root:1002 1773 mode is lost (verified).
+      - type: volume
+        source: scan-alerts
+        target: /state/scan-alerts
+        volume:
+          nocopy: true
     depends_on:
       jill-netns:
         condition: service_healthy
@@ -307,9 +322,18 @@ services:
       CREDENTIAL_EXPIRES: ${CREDENTIAL_EXPIRES:-}
       VENICE_METER_DIR: /state/venice/meter
       VENICE_ALERT_USD_PER_DAY: ${VENICE_ALERT_USD_PER_DAY:-1}
+      SCAN_ALERT_DIR: /state/scan-alerts
+      SCAN_ALERT_COOLDOWN_SECONDS: ${SCAN_ALERT_COOLDOWN_SECONDS:-900}
     volumes:
       - control-state:/state/control
       - alert-spool:/state/alerts
+      # opencode-serve's injection scanner creates files here; this only
+      # counts and clears them (gateway/control.py, INJECTION-SCAN ALERTS).
+      - type: volume
+        source: scan-alerts
+        target: /state/scan-alerts
+        volume:
+          nocopy: true
       # One volume per gateway, each read-only here: no gateway can write
       # another's credential record.
       - cred-venice:/state/credentials/venice:ro
@@ -317,6 +341,9 @@ services:
       - cred-siyuan:/state/credentials/siyuan:ro
       - venice-meter:/state/venice:ro
     networks: [jill-callers]
+    # Group 1002 owns scan-alerts: this container can list and clear it;
+    # opencode-serve (not in the group) can only create files there.
+    group_add: ["1002"]
     tmpfs: [/tmp]
     healthcheck:
       test: ["CMD", "test", "-f", "/tmp/control-ready"]
@@ -528,6 +555,12 @@ volumes:
   fetch-state:      # consumed URL approvals, URL requests
   control-state:    # halt.json, conservation-mode.json, armed.json, cursors (jill-control and matrix-bridge write)
   alert-spool:      # content-free alerts from the dispatcher and matrix-bridge, drained by jill-control
+  scan-alerts:      # injection-scanner hits from opencode-serve (model-writable), drained by jill-control
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=1m,nr_inodes=256,uid=0,gid=1002,mode=1773"
   cred-venice:      # status-only credential probe result, venice-proxy writes
   cred-agentmail:   # ... agentmail-proxy writes
   cred-siyuan:      # ... siyuan-proxy writes

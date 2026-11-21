@@ -30,8 +30,15 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { defaultContext, evaluate, shellEnvOverrides } from "../guards/policy.ts"
+// Shared with the injection scanner, which leaves the text of these denials
+// alone when it scans tool errors (#51 round 7 R2-2).
+import { noteOwnError } from "../guards/injection.ts"
+import { makeNonDumpable } from "../guards/nodump.ts"
 
 export const GuardrailsPlugin: Plugin = async ({ directory }) => {
+  // Tool shells share this uid: keep them out of the server's /proc files
+  // (environ, mem) whatever spelling gets past the text rules (R3-1).
+  await makeNonDumpable()
   const base = defaultContext(directory)
   // callIDs of bash tool calls this guard has approved. Every shell OpenCode
   // starts fires shell.env; one that does not belong to an approved bash
@@ -40,7 +47,10 @@ export const GuardrailsPlugin: Plugin = async ({ directory }) => {
   return {
     "tool.execute.before": async (input, output) => {
       const reason = evaluate(input.tool, (output.args ?? {}) as Record<string, unknown>, base)
-      if (reason) throw new Error(reason)
+      if (reason) {
+        noteOwnError(input.callID)
+        throw new Error(reason)
+      }
       if (input.tool === "bash") approved.add(input.callID)
     },
     "shell.env": async (input, output) => {

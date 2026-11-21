@@ -334,6 +334,145 @@ class Alerts(Base):
         self.assertTrue(os.path.exists(os.path.join(self.cfg["spool_dir"], "1.json")))
 
 
+class ScanAlerts(Base):
+    """#51 and red-team round 7 (H3, M5, L5, L6): the scan-alert dir is
+    written by opencode-serve, so by the model. Only a bucketed COUNT may
+    reach the room, silencing must itself alert, and the line has its own
+    budget and survives a restart."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = os.path.join(self.tmp.name, "scan")
+        os.makedirs(self.scan)
+        self.cfg["scan_dir"] = self.scan
+        self.cfg["scan_cooldown"] = 900
+        self.cfg["scan_expect"] = {}
+        self.now = [1000.0]
+        self.ctl.clock = lambda: self.now[0]
+
+    def drop(self, name, body=""):
+        with open(os.path.join(self.scan, name), "w") as f:
+            f.write(body)
+
+    def test_entries_are_counted_deleted_and_posted_as_one_fixed_line(self):
+        for i in range(3):
+            self.drop("%d.alert" % i)
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.assertEqual(len(self.hs.sent), 1)
+        self.assertIn("flagged 2-9 item(s)", self.hs.sent[0][1])
+        self.assertEqual(os.listdir(self.scan), [])
+
+    def test_nothing_model_written_reaches_the_room(self):
+        secret = "SEAN-TAX-ID-123456789"
+        self.drop(secret + ".alert", json.dumps({"kind": "injection-scan", "severity": "high", "source": secret}))
+        self.drop("x", secret)
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        body = self.hs.sent[0][1]
+        self.assertNotIn(secret, body)
+        self.assertNotIn("high", body.lower().replace("flagged", ""))
+        self.assertEqual(body, "[Jill] " + c.scan_alert_text(2, False, 0), "the line is fixed apart from the bucket")
+
+    def test_counts_are_bucketed(self):
+        for i in range(37):
+            self.drop("%d.alert" % i)
+        self.ctl.drain_scan_alerts()
+        self.assertIn("flagged 10+ item(s)", self.hs.sent[0][1])
+        self.assertNotIn("37", self.hs.sent[0][1])
+
+    def test_cooldown_coalesces_and_has_a_floor(self):
+        self.drop("1.alert")
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.cfg["scan_cooldown"] = 60  # below the floor
+        self.now[0] += 120
+        self.drop("2.alert")
+        self.assertFalse(self.ctl.drain_scan_alerts(), "inside the 900 s floor nothing is posted")
+        self.assertEqual(os.listdir(self.scan), [], "but the file is still consumed")
+        self.now[0] += 900
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.assertEqual(len(self.hs.sent), 2)
+
+    def test_own_budget_not_the_shared_hourly_one(self):
+        self.cfg["alerts_per_hour"] = 1
+        self.ctl.sent = [self.now[0]] * 5  # the shared budget is exhausted
+        self.drop("1.alert")
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.assertEqual(len(self.ctl.sent), 5, "a scan alert does not spend the shared budget")
+
+    def test_pending_count_survives_a_restart(self):
+        self.hs.token = "rotated"
+        for i in range(4):
+            self.drop("%d.alert" % i)
+        self.assertFalse(self.ctl.drain_scan_alerts())
+        again = c.Control(self.cfg, c.Matrix(self.hs.url, TOKEN), clock=lambda: self.now[0])
+        self.hs.token = TOKEN
+        self.assertTrue(again.drain_scan_alerts())
+        self.assertIn("flagged 2-9 item(s)", self.hs.sent[0][1])
+
+    def test_unlistable_dir_is_a_tamper_alert(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        os.chmod(self.scan, 0o300)
+        try:
+            self.assertTrue(self.ctl.drain_scan_alerts())
+            self.assertIn("tampered", self.hs.sent[0][1])
+        finally:
+            os.chmod(self.scan, 0o700)
+
+    def test_wrong_owner_or_mode_is_a_tamper_alert(self):
+        self.cfg["scan_expect"] = {"mode": 0o1773}
+        os.chmod(self.scan, 0o700)
+        self.assertTrue(self.ctl.drain_scan_alerts())
+        self.assertIn("tampered", self.hs.sent[0][1])
+
+    def test_a_planted_locked_tree_is_removed(self):
+        d = os.path.join(self.scan, "trap")
+        os.makedirs(os.path.join(d, "inner"))
+        with open(os.path.join(d, "inner", "f"), "w") as f:
+            f.write("x")
+        os.chmod(os.path.join(d, "inner"), 0)
+        os.chmod(d, 0)
+        self.ctl.drain_scan_alerts()
+        self.assertEqual(os.listdir(self.scan), [])
+        self.assertNotIn("tampered", self.hs.sent[0][1])
+
+    def test_a_symlink_is_removed_not_followed(self):
+        target = os.path.join(self.tmp.name, "keep")
+        os.makedirs(target)
+        os.symlink(target, os.path.join(self.scan, "l"))
+        self.ctl.drain_scan_alerts()
+        self.assertTrue(os.path.isdir(target))
+        self.assertEqual(os.listdir(self.scan), [])
+
+    def test_severity_is_one_coarse_bit_from_the_name(self):
+        self.drop("l-a.alert")
+        self.drop("h-b.alert")
+        self.ctl.drain_scan_alerts()
+        self.assertIn("at least one HIGH", self.hs.sent[0][1])
+        self.now[0] += 1000
+        self.drop("l-c.alert")
+        self.ctl.drain_scan_alerts()
+        self.assertIn("all low", self.hs.sent[1][1])
+
+    def test_a_nearly_full_dir_is_tampering(self):
+        # R2-3: a model fills the inodes so the scanner's write fails.
+        for i in range(c.SCAN_FULL_AT):
+            self.drop("x%d" % i)
+        self.ctl.drain_scan_alerts()
+        self.assertIn("tampered", self.hs.sent[0][1])
+
+    def test_unset_dir_is_a_no_op(self):
+        self.cfg["scan_dir"] = None
+        self.assertFalse(self.ctl.drain_scan_alerts())
+
+    def test_config_reads_the_env(self):
+        env = {"MATRIX_CONTROL_TOKEN": TOKEN, "MATRIX_PRINCIPAL": PRINCIPAL, "MATRIX_CONTROL_ROOM": ROOM,
+               "SCAN_ALERT_DIR": "/state/scan-alerts", "SCAN_ALERT_COOLDOWN_SECONDS": "5"}
+        cfg, _ = c.load_config(env)
+        self.assertEqual(cfg["scan_dir"], "/state/scan-alerts")
+        self.assertEqual(cfg["scan_cooldown"], 900, "the cooldown has a 900 s floor")
+        self.assertEqual(cfg["scan_expect"], {"uid": 0, "mode": 0o1773})
+
+
 class Credentials(Base):
     def status(self, route, **rec):
         os.makedirs(os.path.join(self.cfg["cred_dir"], route), exist_ok=True)

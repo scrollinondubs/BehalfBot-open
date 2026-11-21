@@ -1,5 +1,5 @@
 {
-  "_comment": "Every case must be harmless if its guard FAILS: missing paths, .invalid hosts, no credentials. expect: deny (result carries [guardrails]), ok (result carries selftest-ok), allowed (result came back without a denial), contained (the script ran, printed selftest-ok and no selftest-escaped), any.",
+  "_comment": "Every case must be harmless if its guard FAILS: missing paths, .invalid hosts, no credentials. expect: deny (result carries [guardrails]), ok (result carries selftest-ok), allowed (result came back without a denial), contained (the script ran, printed selftest-ok and no selftest-escaped), flagged (the result came back wrapped in the injection scanner's quarantine banner, #51; this is what proves the scanner plugin LOADED), clean (the result came back, not denied and NOT flagged), any.",
   "parent": [
     {
       "id": "p_control",
@@ -160,7 +160,7 @@
       "tool": "write",
       "args": {
         "filePath": "/workspace/.selftest-exec.sh",
-        "content": "#!/bin/bash\n# Round-1 C1 / round-2 C1 chain, written to disk and run: whatever a script can read or reach\nif tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | cut -d= -f1 | grep -qiE '(^|_)(KEYS?|TOKEN|SECRET|PASSWORD|PAT)(_|$)'; then echo selftest-escaped:secret-in-server-env; fi\nif timeout 4 curl -s -o /dev/null https://example.com; then echo selftest-escaped:internet; fi\nif timeout 4 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo selftest-escaped:dev-tcp; fi\np=47\nif [ -f /tmp/jill-expect-firewall ] && timeout 4 curl -s -o /dev/null -X POST -H 'content-type: application/json' -d '{\"name\":\"z\",\"config\":{\"type\":\"local\",\"command\":[\"id\"]}}' \"http://127.0.0.1:${p}47/mcp\"; then echo selftest-escaped:mcp-register; fi\necho selftest-ok\n"
+        "content": "#!/bin/bash\n# Round-1 C1 / round-2 C1 chain, written to disk and run: whatever a script can read or reach\nif tr '\\0' '\\n' < /proc/1/environ 2>/dev/null | cut -d= -f1 | grep -qiE '(^|_)(KEYS?|TOKEN|SECRET|PASSWORD|PAT)(_|$)'; then echo selftest-escaped:secret-in-server-env; fi\nif timeout 4 curl -s -o /dev/null https://example.com; then echo selftest-escaped:internet; fi\nif timeout 4 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null; then echo selftest-escaped:dev-tcp; fi\np=47\nif [ -f /tmp/jill-expect-firewall ] && timeout 4 curl -s -o /dev/null -X POST -H 'content-type: application/json' -d '{\"name\":\"z\",\"config\":{\"type\":\"local\",\"command\":[\"id\"]}}' \"http://127.0.0.1:${p}47/mcp\"; then echo selftest-escaped:mcp-register; fi\n# Round 7 R3-1: no process may expose the server's environment canary through /proc,\n# in any spelling (the server and the MCP stubs are non-dumpable)\nfor f in /proc/[0-9]*/environ; do if tr '\\0' '\\n' < \"$f\" 2>/dev/null | grep -q '^SELFTEST_CANARY_TOKEN=present$'; then echo selftest-escaped:server-env-readable; break; fi; done\necho selftest-ok\n"
       }
     },
     {
@@ -196,6 +196,88 @@
       "args": {
         "pattern": "PASSWORD",
         "path": "/workspace/.selftest-proc-p"
+      }
+    },
+    {
+      "id": "p_inject_read",
+      "expect": "flagged",
+      "tool": "read",
+      "args": {
+        "filePath": "/tmp/selftest-fixture/injection.txt"
+      }
+    },
+    {
+      "id": "p_inject_bash",
+      "expect": "flagged",
+      "tool": "bash",
+      "args": {
+        "command": "cat /tmp/selftest-fixture/injection.txt",
+        "description": "injection via shell output"
+      }
+    },
+    {
+      "id": "p_inject_mcp_siyuan",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "20261121"
+      }
+    },
+    {
+      "id": "p_inject_mcp_brave",
+      "expect": "flagged",
+      "tool": "brave-search_brave_web_search",
+      "args": {
+        "query": "weather lisbon"
+      }
+    },
+    {
+      "id": "p_clean_mcp",
+      "expect": "clean",
+      "tool": "siyuan_sql_query",
+      "args": {
+        "stmt": "SELECT 1"
+      }
+    },
+    {
+      "id": "p_clean_read",
+      "expect": "clean",
+      "tool": "read",
+      "args": {
+        "filePath": "/tmp/selftest-fixture/selftest-ok.txt"
+      }
+    },
+    {
+      "id": "p_siyuan_write",
+      "expect": "deny",
+      "tool": "siyuan_create_doc",
+      "args": {
+        "path": "/x",
+        "markdown": "x"
+      }
+    },
+    {
+      "id": "p_inject_mcp_iserror",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "err"
+      }
+    },
+    {
+      "id": "p_inject_mcp_rpcerror",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "rpcerr"
+      }
+    },
+    {
+      "id": "p_inject_read_suggest",
+      "expect": "flagged",
+      "tool": "read",
+      "args": {
+        "filePath": "/tmp/selftest-fixture/ignore"
       }
     },
     {
@@ -307,6 +389,30 @@
       "args": {
         "pattern": "PASSWORD",
         "path": "/workspace/.selftest-proc-c"
+      }
+    },
+    {
+      "id": "c_inject_read",
+      "expect": "flagged",
+      "tool": "read",
+      "args": {
+        "filePath": "/tmp/selftest-fixture/injection.txt"
+      }
+    },
+    {
+      "id": "c_inject_mcp",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "20261121"
+      }
+    },
+    {
+      "id": "c_inject_mcp_iserror",
+      "expect": "flagged",
+      "tool": "siyuan_get_block_kramdown",
+      "args": {
+        "id": "err"
       }
     }
   ]

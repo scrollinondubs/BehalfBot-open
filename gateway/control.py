@@ -57,6 +57,22 @@ fixed templates with heartbeat names and counts, never model output, gather
 data or log lines. This process cannot enforce that; it enforces length,
 control characters and a rate limit.
 
+INJECTION-SCAN ALERTS (#51, red-team round 7 H3, M5, L5, L6)
+-----------------------------------------------------------
+opencode-serve's injection scanner creates one EMPTY file per flagged or
+withheld tool output in the scan-alerts volume. That directory belongs to
+root, group 1002, mode 1773: serve's uid may create files but cannot list
+the directory, delete a file it cannot name, or chmod it. This process is
+in group 1002, so it can list and remove. It reads nothing from a file,
+its name or its mode; it only COUNTS entries (M5), deletes them and posts
+one fixed line with the count bucketed (1, 2-9, 10+), at most once per
+SCAN_ALERT_COOLDOWN_SECONDS (default and floor 900), on a budget separate
+from ALERTS_PER_HOUR (L5). The pending count survives a restart (L6).
+
+Silencing is itself an alert: a directory it cannot list, an entry it
+cannot remove, or a directory whose owner or mode changed posts a fixed
+"tampered" line on the same cooldown. Flooding is an alert too (10+).
+
 CREDENTIAL EXPIRY
 -----------------
 Each key-holding gateway probes its upstream with its own key and writes a
@@ -74,6 +90,8 @@ EXIT CODES
 import json
 import os
 import re
+import shutil
+import stat
 import sys
 import threading
 import time
@@ -95,6 +113,11 @@ KIND_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 MAX_ALERT_CHARS = 1500
 MAX_FILE_BYTES = 64 * 1024
+MAX_SCAN_ENTRIES = 512
+SCAN_COOLDOWN_FLOOR = 900
+# The volume holds 256 inodes. A directory this full is a model filling it
+# so a scanner alert cannot be written (red-team round 7 R2-3): tampering.
+SCAN_FULL_AT = 192
 
 COMMANDS = {
     "halt": "halt",
@@ -327,6 +350,13 @@ class Control:
         self.cursor = stored.get(room) if isinstance(stored.get(room), str) else None
         self.started = clock()
         self.sent = []  # alert send times, for the rate limit
+        self.scan_state_file = os.path.join(cfg["control_dir"], "scan-alert-state.json")
+        stored, _ = flags.read(self.scan_state_file)
+        self.scan_pending = _nonneg_int(stored.get("pending"))
+        self.scan_high = _nonneg_int(stored.get("high"))
+        self.scan_tamper = stored.get("tamper") is True
+        last = stored.get("last_post")
+        self.scan_last_post = last if isinstance(last, (int, float)) and not isinstance(last, bool) else None
 
     # -- acks ---------------------------------------------------------------
 
@@ -572,6 +602,75 @@ class Control:
             text = text[:MAX_ALERT_CHARS] + " [truncated]"
         return text
 
+    # -- injection-scan alerts (#51) ----------------------------------------
+
+    def drain_scan_alerts(self):
+        """Count and remove what the scanner created; post one fixed line per
+        cooldown. Returns True when a line was posted."""
+        d = self.cfg.get("scan_dir")
+        if not d:
+            return False
+        count, high, tamper = 0, 0, False
+        try:
+            st = os.lstat(d)
+            want = self.cfg.get("scan_expect") or {}
+            if not stat.S_ISDIR(st.st_mode) or ("uid" in want and st.st_uid != want["uid"]) \
+                    or ("mode" in want and stat.S_IMODE(st.st_mode) != want["mode"]):
+                tamper = True
+            names = []
+            with os.scandir(d) as it:
+                for entry in it:
+                    names.append(entry.name)
+                    if len(names) >= MAX_SCAN_ENTRIES:
+                        break
+        except OSError:
+            names, tamper = [], True
+        if len(names) >= SCAN_FULL_AT:
+            tamper = True
+        for name in names:
+            path = os.path.join(d, name)
+            count += 1
+            if name.startswith("h-"):
+                high += 1
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    _force_rmtree(path)
+                else:
+                    os.remove(path)
+            except OSError:
+                pass
+            if os.path.lexists(path):
+                tamper = True
+        if count or tamper:
+            self.scan_pending += count
+            self.scan_high += high
+            self.scan_tamper = self.scan_tamper or tamper
+            self._save_scan_state()
+        if not self.scan_pending and not self.scan_tamper:
+            return False
+        now = self.clock()
+        cooldown = max(SCAN_COOLDOWN_FLOOR, self.cfg.get("scan_cooldown", SCAN_COOLDOWN_FLOOR))
+        if self.scan_last_post is not None and now - self.scan_last_post < cooldown:
+            return False
+        try:
+            # Its own budget (this cooldown), not the shared ALERTS_PER_HOUR one.
+            self.matrix.send_text(self.cfg["alerts_room"], "[Jill] " + scan_alert_text(self.scan_pending, self.scan_tamper, self.scan_high))
+        except MatrixError as exc:
+            log("WARN: scan alert not delivered: %s" % exc)
+            return False
+        self.scan_last_post = now
+        self.scan_pending, self.scan_tamper, self.scan_high = 0, False, 0
+        self._save_scan_state()
+        return True
+
+    def _save_scan_state(self):
+        try:
+            write_json_atomic(self.scan_state_file, {"pending": self.scan_pending, "high": self.scan_high,
+                                                     "tamper": self.scan_tamper,
+                                                     "last_post": self.scan_last_post})
+        except OSError as exc:
+            log("WARN: cannot persist the scan-alert state: %s" % exc)
+
     def _reject(self, path, name):
         log("WARN: malformed spool file %s moved to rejected/" % name)
         try:
@@ -779,6 +878,11 @@ def load_config(env=os.environ):
         "alerts_room": alerts_room,
         "control_dir": env.get("CONTROL_DIR", "/state/control"),
         "spool_dir": env.get("ALERT_SPOOL_DIR", "/state/alerts"),
+        "scan_dir": env.get("SCAN_ALERT_DIR") or None,
+        "scan_cooldown": _int_env(env, "SCAN_ALERT_COOLDOWN_SECONDS", SCAN_COOLDOWN_FLOOR, SCAN_COOLDOWN_FLOOR),
+        # The volume's expected owner and mode (docker-compose.yml); a
+        # change is reported as tampering.
+        "scan_expect": {"uid": 0, "mode": 0o1773} if env.get("SCAN_ALERT_DIR") else {},
         "cred_dir": env.get("CREDENTIAL_STATUS_DIR", "/state/credentials"),
         "cred_expect": [c for c in re.split(r"[,\s]+", env.get("CREDENTIAL_EXPECT", "venice")) if c],
         "cred_expires": parse_expires(env.get("CREDENTIAL_EXPIRES", "")),
@@ -794,6 +898,47 @@ def load_config(env=os.environ):
         "matrix_probe": None,
     }
     return cfg, problems
+
+
+def _bucket(n):
+    return "1" if n == 1 else ("2-9" if n < 10 else "10+")
+
+
+def _nonneg_int(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+
+def _force_rmtree(path):
+    """Remove a tree the model planted, restoring owner permissions first (the
+    entries belong to this uid, so a chmod 000 does not stop the owner)."""
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    for root, dirs, _files in os.walk(path, topdown=True):
+        for name in dirs:
+            sub = os.path.join(root, name)
+            if os.path.islink(sub):
+                continue  # never chmod through a link
+            try:
+                os.chmod(sub, 0o700)
+            except OSError:
+                pass
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def scan_alert_text(pending, tamper, high=0):
+    """Fixed text. The variables are the bucketed count and a coarse
+    severity, HIGH or low (M5; round 7 round 2 asked for the severity)."""
+    parts = []
+    if pending:
+        parts.append("Injection scanner flagged %s item(s) in Jill's tool output since the last report, %s. The "
+                     "content stayed in her session; ask Jill in the encrypted chat room."
+                     % (_bucket(pending), "at least one HIGH" if high else "all low"))
+    if tamper:
+        parts.append("The scanner's alert path was tampered with (full, cannot list, cannot remove, or "
+                     "owner/mode changed), so an alert may have been held back. Check opencode-serve.")
+    return " ".join(parts)
 
 
 def boot(control):
@@ -891,6 +1036,7 @@ def main():
     if cfg["announce"]:
         control.post("Kill switch armed. Say `halt` here; everything else works only in Jill's encrypted chat room.")
     threading.Thread(target=_loop, args=("spool", 10, control.drain_spool), daemon=True).start()
+    threading.Thread(target=_loop, args=("scan-alerts", 10, control.drain_scan_alerts), daemon=True).start()
 
     def credentials():
         control.probe_matrix()
