@@ -47,9 +47,10 @@ are never compared. The following are ignored: messages older than 10
 minutes, edits, a control word inside a sentence, and encrypted events.
 
 **What halt does not stop:** chat with Jill through her bridge (only you
-drive that), and a scheduled run already in progress (it finishes, up to
-about an hour with retries). The halt gate is the dispatcher's. The ack
-says so.
+drive that), and the one scheduled run already in progress (it finishes, up
+to about 20 minutes). The dispatcher checks the flag at the start of every
+tick, before every run and before every retry. The halt gate is the
+dispatcher's. The ack says so.
 
 **Fail-closed rules**
 
@@ -93,6 +94,7 @@ control room) as `[Jill] <text>` and deletes it. Files it cannot parse go to
 | `recovered` | the first success after an `all-failed` |
 | `unarmed` | the kill switch stopped listening (once a day) |
 | `validator` | the Five Failure Modes validator quarantined an artifact (mode only) |
+| `spend-unmeasured` | a successful run reported no tokens and no cost, so the spend caps cannot see it (once a day) |
 
 `jill-control` posts its own alerts too: one at boot ("Kill switch armed"),
 when an auto-lift clears a flag, and for credential stage changes.

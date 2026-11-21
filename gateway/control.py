@@ -91,6 +91,7 @@ DURATION_RE = re.compile(r"^(\d+)([mhd])$", re.IGNORECASE)
 KIND_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")
 MAX_ALERT_CHARS = 1500
+MAX_FILE_BYTES = 64 * 1024
 
 COMMANDS = {
     "halt": "halt",
@@ -337,10 +338,11 @@ class Control:
         if command == "halt":
             flags.write(self.halt_file, True, by, duration, reason)
             lift = "Auto-lift %s." % duration if duration else "No auto-lift - stays halted until you say `resume`."
-            return ("HALTED. Every Jill heartbeat is skipped from the next dispatcher tick, critical ones included.\n"
+            return ("HALTED. No further Jill heartbeat runs, critical ones included. The dispatcher checks "
+                    "before every run and every retry.\n"
                     "%s\n"
-                    "Still possible for a short while: a scheduled run already in progress finishes "
-                    "(up to about an hour with retries).\n"
+                    "Still possible for a short while: the one scheduled run already in progress finishes "
+                    "(up to about 20 minutes).\n"
                     "NOT covered by halt: chat with Jill through her bridge, which only you drive.\n"
                     "Say `resume` to lift, `status` to check." % lift)
         if command == "conserve":
@@ -474,6 +476,8 @@ class Control:
     @staticmethod
     def _spooled_text(path):
         try:
+            if os.path.getsize(path) > MAX_FILE_BYTES:
+                return None
             with open(path, encoding="utf-8") as fh:
                 rec = json.load(fh)
         except (OSError, ValueError):
@@ -510,14 +514,16 @@ class Control:
                 if now - self.started > 2 * probe_every:
                     out[cid] = ("missing", "no probe result from its gateway; is the %s gateway running?" % cid)
                 continue
+            status = rec.get("http_status")
+            status = status if isinstance(status, int) and not isinstance(status, bool) and 0 <= status < 1000 else "?"
             checked = rec.get("checked_at") if isinstance(rec.get("checked_at"), (int, float)) else 0
             last_ok = rec.get("last_ok_at") if isinstance(rec.get("last_ok_at"), (int, float)) else 0
             if rec.get("result") == "rejected":
-                out[cid] = ("rejected", "the upstream refused the key (HTTP %s)" % rec.get("http_status"))
+                out[cid] = ("rejected", "the upstream refused the key (HTTP %s)" % status)
             elif now - checked > 3 * probe_every:
                 out[cid] = ("unknown", "the gateway has not probed for %dh" % ((now - checked) // 3600))
             elif rec.get("result") != "ok" and now - last_ok > 86400:
-                out[cid] = ("unknown", "the probe has not succeeded for over a day (HTTP %s)" % rec.get("http_status"))
+                out[cid] = ("unknown", "the probe has not succeeded for over a day (HTTP %s)" % status)
             else:
                 out[cid] = ("ok", "")
         if self.cfg.get("matrix_probe") is not None:

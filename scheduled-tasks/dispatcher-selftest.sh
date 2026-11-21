@@ -11,6 +11,7 @@
 #   halt         halt.json on: nothing fires, critical included
 #   halt-expired an auto-lift in the past: fires
 #   halt-garbage an unparseable halt.json: nothing fires (fail closed)
+#   halt-midtick halt arriving during a tick: the next heartbeat does not fire
 #   unarmed      CONTROL_REQUIRE_ARMED=1 with no armed.json: nothing fires,
 #                one alert
 #   fire-cap     max_fires_per_day: 1 holds across two ticks, one alert
@@ -20,6 +21,7 @@
 #                daily cap, one alert
 #   all-failed   failures across two heartbeats raise one alarm; the next
 #                success posts a recovery
+#   unmeasured   a run with no usage and no cost raises one alert
 #   content-free no alert carries gather data or model output
 #   state-lock   40 concurrent state writes, none lost
 #   live         (SELFTEST_LIVE=1, in compose) the real control dir is
@@ -30,7 +32,10 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DISPATCHER="$HERE/heartbeat-dispatcher.sh"
-ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dispatcher-selftest.XXXXXX")"
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dispatcher-selftest.XXXXXX")" || {
+    echo "[dispatcher-selftest] FAIL cannot create a scratch directory" >&2
+    exit 1
+}
 CANARY="SELFTEST-PRIVATE-CANARY"
 fail=0
 
@@ -52,6 +57,14 @@ mkdir -p "$ROOT/bin"
 cat > "$ROOT/bin/opencode" <<'SH'
 #!/usr/bin/env bash
 echo x >> "$FAKE_SB/calls"
+if [[ -f "$FAKE_SB/halt-on-call" ]]; then
+    printf '{"enabled": true, "auto_lift_after": null, "reason": "mid-tick"}\n' > "$FAKE_SB/control/halt.json"
+fi
+if [[ -f "$FAKE_SB/nousage" ]]; then
+    printf '%s\n' '{"type":"text","part":{"text":"FAKE-MODEL-OUTPUT"}}'
+    printf '%s\n' '{"type":"step_finish","part":{"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}'
+    exit 0
+fi
 if [[ -f "$FAKE_SB/fail" ]]; then
     echo "fake opencode failure $FAKE_CANARY" >&2
     exit 1
@@ -149,6 +162,19 @@ halt_json '"next tuesday"'
 tick
 [[ "$(calls)" == 0 ]] && ok "unparseable auto_lift_after: stays halted" || bad "unparseable auto_lift_after lifted the halt"
 
+new_sandbox halt-midtick "hb-a|" "hb-b|" "hb-c|"
+touch "$SB/halt-on-call"
+tick
+[[ "$(calls)" == 1 ]] && logged "HALTED mid-tick" \
+    && ok "halt mid-tick: the run in progress finished, the next two heartbeats did not fire" \
+    || bad "halt mid-tick: $(calls) run(s) fired"
+
+new_sandbox halt-retry "hb-a|"
+touch "$SB/halt-on-call" "$SB/fail"
+tick
+[[ "$(calls)" == 1 ]] && logged "retry 2 of hb-a skipped" \
+    && ok "halt during retries: no further attempt" || bad "halt during retries: $(calls) attempt(s)"
+
 # --- unarmed kill switch --------------------------------------------------
 new_sandbox unarmed "hb-a|"
 tick CONTROL_REQUIRE_ARMED=1
@@ -188,6 +214,15 @@ reported=$(jq -s '[.[].reported_cost_usd] | add' "$SB"/state/logs/telemetry/*-us
 [[ "$first" == 1 && "$(calls)" == 1 && "$(alerts spend-cap)" == 1 ]] && logged "SPEND-CAPPED" \
     && ok "daily spend cap: tripped after the first \$1.40 run, nothing more fired, one alert" \
     || bad "daily spend cap: first=$first total=$(calls) alerts=$(alerts spend-cap)"
+
+# --- unmeasured spend -------------------------------------------------------
+new_sandbox unmeasured "hb-a|" "hb-b|"
+touch "$SB/nousage"
+tick
+tick
+[[ "$(alerts spend-unmeasured)" == 1 ]] && logged "reported no token usage" \
+    && ok "unmeasured spend: a run with no usage raised one alert over four runs" \
+    || bad "unmeasured spend: $(alerts spend-unmeasured) alert(s)"
 
 # --- all-runs-failed alarm --------------------------------------------------
 new_sandbox all-failed "hb-a|" "hb-b|"
