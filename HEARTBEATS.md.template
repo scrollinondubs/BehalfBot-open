@@ -26,7 +26,7 @@ Each heartbeat is one `##` heading + a fenced ` ```yaml ` block. The dispatcher 
 | `gather` | yes | Path (relative to the repo root) to a shell script that emits JSON on stdout. Either `{"count": N}` for threshold conditions, or any structured JSON for `ask_model` / `always` |
 | `condition` | yes | One of: `always`, `threshold <field> <op> <value>` (e.g. `threshold count > 0`), `ask_model` (requires Ollama) |
 | `prompt` | yes | Path (relative to the repo root) to a markdown file the model reads on fire |
-| `model` | yes | An OpenCode `provider/model` string (e.g. `venice/zai-org-glm-5-2`, `anthropic/claude-sonnet-4-5`) or a chassis alias: `opus`, `sonnet`, `haiku` (mapped via `HEARTBEAT_MODEL_*` env vars) |
+| `model` | yes | A `venice/<model>` string (e.g. `venice/zai-org-glm-5-2`) or a chassis alias: `opus`, `sonnet`, `haiku` (mapped via `HEARTBEAT_MODEL_*` env vars) |
 | `budget` | yes | Advisory max USD per invocation. OpenCode has no hard budget cap; the dispatcher logs a WARN when the summed run cost exceeds this |
 | `criticality` | yes | `critical` (runs in conservation mode), `normal`, `background` |
 | `cwd` | no | Working directory for the run (passed as `opencode run --dir`). Defaults to the repo root |

@@ -1,0 +1,12 @@
+{
+  "name": "behalfbot-open-mcp-servers",
+  "private": true,
+  "description": "MCP servers installed into the image at build time. Exact versions only; bump deliberately and rebuild.",
+  "dependencies": {
+    "@brave/brave-search-mcp-server": "2.1.4",
+    "@modelcontextprotocol/server-memory": "2.1.0",
+    "@upstash/context7-mcp": "4.5.0",
+    "siyuan-mcp": "1.0.4",
+    "tavily-mcp": "0.2.22"
+  }
+}

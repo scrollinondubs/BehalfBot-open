@@ -42,7 +42,7 @@ All state lives under `BEHALFBOT_STATE_HOME` (defaults to the repo root; point i
 
 | Chassis (`claude -p`) | This port (`opencode run`) |
 |---|---|
-| `--model opus\|sonnet\|haiku` | `-m <provider/model>`; aliases map via `HEARTBEAT_MODEL_OPUS` / `_SONNET` / `_HAIKU` env vars (defaults: `anthropic/claude-opus-4-8`, `anthropic/claude-sonnet-4-5`, `anthropic/claude-haiku-4-5`) |
+| `--model opus\|sonnet\|haiku` | `-m <provider/model>`; aliases map via `HEARTBEAT_MODEL_OPUS` / `_SONNET` / `_HAIKU` env vars (defaults: `venice/zai-org-glm-5-2` for opus and sonnet, `venice/z-ai-glm-5-3-flash` for haiku; any non-`venice/` result is refused) |
 | `--mcp-config .mcp.json` | Not needed - OpenCode loads the `mcp` block from `opencode.json` |
 | `--max-budget-usd N` | No equivalent. `budget:` is advisory: the dispatcher sums `step_finish` costs post-run and logs a WARN on overage |
 | `--dangerously-skip-permissions` | `--auto` (default on, `HEARTBEAT_OPENCODE_AUTO=0` to disable). Safety is enforced by `opencode.json` permission denies plus `.opencode/plugins/guardrails.ts`, which auto-loads and cannot silently unregister |

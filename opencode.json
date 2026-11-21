@@ -1,18 +1,13 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "anthropic/claude-sonnet-4-5",
-  "small_model": "anthropic/claude-haiku-4-5",
+  "model": "venice/zai-org-glm-5-2",
+  "small_model": "venice/z-ai-glm-5-3-flash",
   "instructions": [
     ".opencode/instructions/response-style.md"
   ],
   "autoupdate": false,
   "share": "disabled",
   "provider": {
-    "anthropic": {
-      "options": {
-        "apiKey": "{env:ANTHROPIC_API_KEY}"
-      }
-    },
     "venice": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "Venice AI",
@@ -20,23 +15,23 @@
         "baseURL": "https://api.venice.ai/api/v1",
         "apiKey": "{env:VENICE_API_KEY}"
       },
+      "whitelist": [
+        "zai-org-glm-5-2",
+        "z-ai-glm-5-3-flash",
+        "zai-org-glm-5-1",
+        "kimi-k2-7-code",
+        "deepseek-v4-pro"
+      ],
       "models": {
         "zai-org-glm-5-2": {
           "name": "GLM 5.2"
         },
+        "z-ai-glm-5-3-flash": {
+          "name": "GLM 5.3 Flash"
+        },
         "zai-org-glm-5-1": {},
         "kimi-k2-7-code": {},
         "deepseek-v4-pro": {}
-      }
-    },
-    "openrouter": {
-      "options": {
-        "apiKey": "{env:OPENROUTER_API_KEY}"
-      },
-      "models": {
-        "z-ai/glm-5.2": {},
-        "moonshotai/kimi-k2-thinking": {},
-        "minimax/minimax-m2.5": {}
       }
     }
   },
@@ -76,9 +71,8 @@
     "memory": {
       "type": "local",
       "command": [
-        "npx",
-        "-y",
-        "@modelcontextprotocol/server-memory"
+        "node",
+        "/opt/mcp/node_modules/@modelcontextprotocol/server-memory/dist/index.js"
       ],
       "enabled": true,
       "environment": {
@@ -88,68 +82,21 @@
     "brave-search": {
       "type": "local",
       "command": [
-        "npx",
-        "-y",
-        "@modelcontextprotocol/server-brave-search"
+        "node",
+        "/opt/mcp/node_modules/@brave/brave-search-mcp-server/dist/index.js",
+        "--transport",
+        "stdio"
       ],
       "enabled": true,
       "environment": {
         "BRAVE_API_KEY": "{env:BRAVE_API_KEY}"
       }
     },
-    "github": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "@modelcontextprotocol/server-github"
-      ],
-      "enabled": false,
-      "environment": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "{env:GITHUB_PAT}"
-      }
-    },
-    "tavily": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "tavily-mcp"
-      ],
-      "enabled": false,
-      "environment": {
-        "TAVILY_API_KEY": "{env:TAVILY_API_KEY}"
-      }
-    },
-    "playwright": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "@playwright/mcp@latest",
-        "--user-data-dir",
-        "{env:PLAYWRIGHT_PROFILE_DIR}"
-      ],
-      "enabled": false
-    },
-    "oura": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "@daveremy/oura-mcp"
-      ],
-      "enabled": false,
-      "environment": {
-        "OURA_TOKEN": "{env:OURA_TOKEN}"
-      }
-    },
     "siyuan": {
       "type": "local",
       "command": [
-        "npx",
-        "-y",
-        "siyuan-mcp@1.0.4"
+        "node",
+        "/opt/mcp/node_modules/siyuan-mcp/dist/index.js"
       ],
       "enabled": true,
       "environment": {
@@ -157,79 +104,27 @@
         "SIYUAN_TOKEN": "{env:SIYUAN_TOKEN}"
       }
     },
-    "turso": {
+    "tavily": {
       "type": "local",
       "command": [
-        "npx",
-        "-y",
-        "mcp-turso-cloud"
+        "node",
+        "/opt/mcp/node_modules/tavily-mcp/build/index.js"
       ],
       "enabled": false,
       "environment": {
-        "TURSO_API_TOKEN": "{env:TURSO_API_TOKEN}",
-        "TURSO_ORGANIZATION": "{env:TURSO_ORGANIZATION}",
-        "TURSO_DEFAULT_DATABASE": "{env:TURSO_DEFAULT_DATABASE}"
+        "TAVILY_API_KEY": "{env:TAVILY_API_KEY}"
       }
-    },
-    "loom": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "loom-dl@latest",
-        "--mcp"
-      ],
-      "enabled": false
-    },
-    "amplitude": {
-      "type": "remote",
-      "url": "https://mcp.eu.amplitude.com/mcp",
-      "enabled": false
     },
     "context7": {
       "type": "local",
       "command": [
-        "npx",
-        "-y",
-        "@upstash/context7-mcp@latest"
-      ],
-      "enabled": false
-    },
-    "n8n": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "n8n-mcp"
-      ],
-      "enabled": false,
-      "environment": {
-        "N8N_API_URL": "{env:N8N_API_URL}",
-        "N8N_API_KEY": "{env:N8N_API_KEY}",
-        "MCP_MODE": "stdio",
-        "LOG_LEVEL": "error"
-      }
-    },
-    "remarkable": {
-      "type": "local",
-      "command": [
-        "uvx",
-        "remarkable-mcp"
-      ],
-      "enabled": false,
-      "environment": {
-        "REMARKABLE_TOKEN": "{env:REMARKABLE_TOKEN}",
-        "REMARKABLE_ROOT_PATH": "/Jax"
-      }
-    },
-    "frame0": {
-      "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "frame0-mcp-server"
+        "node",
+        "/opt/mcp/node_modules/@upstash/context7-mcp/dist/index.js"
       ],
       "enabled": false
     }
-  }
+  },
+  "enabled_providers": [
+    "venice"
+  ]
 }

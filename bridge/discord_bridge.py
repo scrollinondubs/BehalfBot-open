@@ -558,6 +558,10 @@ def main() -> int:
         )
     if not PROVIDER_ID or not MODEL_ID:
         problems.append("DEFAULT_MODEL must look like provider/model")
+    elif PROVIDER_ID != "venice":
+        problems.append(
+            "DEFAULT_MODEL must be a venice/ model (BehalfBot-open#46: Venice only)"
+        )
     if problems:
         for p in problems:
             log.error(p)

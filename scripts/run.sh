@@ -3,14 +3,14 @@
 #
 # Usage:
 #   bash scripts/run.sh "prompt text"
-#   bash scripts/run.sh --model openrouter/z-ai/glm-5.2 "prompt text"
+#   bash scripts/run.sh --model venice/kimi-k2-7-code "prompt text"
 #   bash scripts/run.sh --agent software-engineering "prompt text"
 #
 # Emits raw JSON events (one per line) to stdout, same role as
 # `claude -p --output-format json` in the dispatcher.
 #
-# Keys: opencode picks up ANTHROPIC_API_KEY / VENICE_API_KEY /
-# OPENROUTER_API_KEY from the environment or a repo-local .env (gitignored).
+# Key: VENICE_API_KEY from the environment or a repo-local .env (gitignored).
+# Venice is the only enabled provider (opencode.json enabled_providers).
 
 set -euo pipefail
 
@@ -24,8 +24,8 @@ if [[ -f "$REPO_DIR/.env" ]]; then
   set +a
 fi
 
-if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${VENICE_API_KEY:-}" && -z "${OPENROUTER_API_KEY:-}" ]]; then
-  echo "error: no provider key found. Set ANTHROPIC_API_KEY (or VENICE_API_KEY / OPENROUTER_API_KEY) in the environment or $REPO_DIR/.env" >&2
+if [[ -z "${VENICE_API_KEY:-}" ]]; then
+  echo "error: VENICE_API_KEY is not set (environment or $REPO_DIR/.env)" >&2
   exit 1
 fi
 

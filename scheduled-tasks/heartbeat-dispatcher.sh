@@ -21,14 +21,16 @@
 #   - The HEARTBEATS.md `model:` field accepts either a full OpenCode
 #     `provider/model` string (e.g. `venice/zai-org-glm-5-2`) or one of the
 #     chassis aliases `opus` / `sonnet` / `haiku`, mapped via
-#     HEARTBEAT_MODEL_OPUS / HEARTBEAT_MODEL_SONNET / HEARTBEAT_MODEL_HAIKU.
+#     HEARTBEAT_MODEL_OPUS / HEARTBEAT_MODEL_SONNET / HEARTBEAT_MODEL_HAIKU
+#     (defaults: venice/zai-org-glm-5-2, and venice/z-ai-glm-5-3-flash for
+#     haiku). Non-venice results are refused.
 #   - Telemetry is parsed from OpenCode's JSON event stream (`step_finish`
 #     events carry per-step token counts and cost).
 #   - `budget` is ADVISORY: OpenCode has no --max-budget-usd equivalent, so
 #     the dispatcher logs a WARN when a run's summed cost exceeds the budget
 #     instead of hard-capping it mid-run.
-#   - No ANTHROPIC_API_KEY unset dance: OpenCode reads provider keys from the
-#     environment / .env by design (see opencode.json).
+#   - Venice only: resolve_model refuses any model that is not venice/<id>,
+#     and opencode.json sets enabled_providers to ["venice"].
 #
 # Required environment (graceful defaults when unset):
 #   BEHALFBOT_HOME        - repo root holding HEARTBEATS.md, scripts/, prompts.
@@ -206,17 +208,33 @@ increment_fire_count() {
 # --- Model alias resolution ---
 
 # HEARTBEATS.md model: field -> OpenCode provider/model string.
+#
+# Venice only (BehalfBot-open#46). Every alias, every override and every
+# fallback must resolve to venice/<model>; anything else is refused rather
+# than passed through, so a typo or a stale HEARTBEATS.md can never route
+# private material to another provider. opencode.json enforces the same rule
+# with enabled_providers; this is the dispatcher's half of it.
+DEFAULT_HEARTBEAT_MODEL="venice/zai-org-glm-5-2"
+DEFAULT_SMALL_MODEL="venice/z-ai-glm-5-3-flash"
+
 resolve_model() {
-    local m="$1"
+    local m="$1" resolved
     case "$m" in
-        */*) echo "$m" ;;
-        opus)   echo "${HEARTBEAT_MODEL_OPUS:-anthropic/claude-opus-4-8}" ;;
-        sonnet) echo "${HEARTBEAT_MODEL_SONNET:-anthropic/claude-sonnet-4-5}" ;;
-        haiku)  echo "${HEARTBEAT_MODEL_HAIKU:-anthropic/claude-haiku-4-5}" ;;
-        "")     echo "${HEARTBEAT_MODEL_SONNET:-anthropic/claude-sonnet-4-5}" ;;
+        */*)    resolved="$m" ;;
+        opus)   resolved="${HEARTBEAT_MODEL_OPUS:-$DEFAULT_HEARTBEAT_MODEL}" ;;
+        sonnet) resolved="${HEARTBEAT_MODEL_SONNET:-$DEFAULT_HEARTBEAT_MODEL}" ;;
+        haiku)  resolved="${HEARTBEAT_MODEL_HAIKU:-$DEFAULT_SMALL_MODEL}" ;;
+        "")     resolved="${HEARTBEAT_MODEL_SONNET:-$DEFAULT_HEARTBEAT_MODEL}" ;;
         *)
-            log "WARN: unknown model alias '$m', passing through verbatim"
-            echo "$m"
+            log "ERROR: unknown model alias '$m' - refusing (use venice/<model>)"
+            return 1
+            ;;
+    esac
+    case "$resolved" in
+        venice/?*) echo "$resolved" ;;
+        *)
+            log "ERROR: model '$m' resolves to '$resolved', which is not a venice/ model - refusing"
+            return 1
             ;;
     esac
 }
@@ -645,7 +663,10 @@ run_output_validator() {
 
     local validator_events="$LOG_DIR/.validator-events-$$.jsonl"
     local validator_model
-    validator_model=$(resolve_model haiku)
+    if ! validator_model=$(resolve_model haiku); then
+        log "VALIDATOR $name - no venice model for the validator, fail-open"
+        return 0
+    fi
 
     local args=()
     while IFS= read -r line; do args+=("$line"); done < <(opencode_args "$validator_model" "$BEHALFBOT_HOME")
@@ -781,7 +802,10 @@ main() {
             continue
         fi
 
-        model=$(resolve_model "$model")
+        if ! model=$(resolve_model "$model"); then
+            log "SKIP $name - model is not a venice/ model"
+            continue
+        fi
         budget=${budget:-5}
         cwd=${cwd:-$BEHALFBOT_HOME}
         criticality=${criticality:-normal}
