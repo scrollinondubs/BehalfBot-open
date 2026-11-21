@@ -327,7 +327,7 @@ class RoundThreeDelta(unittest.TestCase):
             self.assertEqual(args.mode, mode)
             self.assertEqual(args.out, "/state/eval-out")
         self.assertIsNone(ev.check_live_args(ev.parse_args(ev.options_from_file(os.path.join(here, "live.args")) + [
-            "--repeat", "3", "--image", "sha256:x", "--commit", "abc"])))
+            "--repeat", "3", "--image", "sha256:x", "--commit", "abc", "--run-image", "sha256:y"])))
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "non-root path; AsRoot covers root")
     def test_plant_without_root_is_the_safe_write(self):
@@ -455,7 +455,7 @@ class Gate(unittest.TestCase):
 
 class LiveGuardRails(unittest.TestCase):
     def args(self, *extra):
-        a = ev.parse_args(["--mode", "live", "--image", "sha256:abc", "--commit", "c6ae3ea", *extra])
+        a = ev.parse_args(["--mode", "live", "--image", "sha256:abc", "--commit", "c6ae3ea", "--run-image", "sha256:def", *extra])
         a.upstream = "http://venice-proxy:8080/api/v1"
         if a.repeat is None:
             a.repeat = ev.LIVE_MIN_REPEAT
@@ -467,8 +467,10 @@ class LiveGuardRails(unittest.TestCase):
 
     def test_live_needs_the_digest_and_commit(self):
         a = ev.parse_args(["--mode", "live", "--max-calls", "50", "--out", "/state/eval-out", "--repeat", "3"])
-        a.image, a.commit = "", ""
+        a.image, a.commit, a.run_image = "", "", ""
         self.assertIn("digest", ev.check_live_args(a))
+        a.image, a.commit = "sha256:abc", "c6ae3ea"
+        self.assertIn("eval image", ev.check_live_args(a), "the image the run happens in is recorded too")
 
     def test_live_needs_three_runs(self):
         err = ev.confirm_live(self.args("--out", "/eval-out", "--max-calls", "50", "--repeat", "2"), 5, io.StringIO(), io.StringIO())

@@ -425,8 +425,8 @@ export function isSecretVarName(name: string): boolean {
  */
 const PROC_PATH = /\/pro(?:c\b|[^a-z0-9_]|$)|\/pr(?:o)?['"\\$*?[{]|\/p['"\\$*?[{]/i
 // Relative to / (`cd / && cat proc/1/environ`, `cd proc`, `cd /; cd pr*`):
-// the word proc, or a glob or quote cut from it, as a path start.
-const PROC_RELATIVE = /(?:^|[\s'"=:<>(;&|])(?:\.{1,2}\/)*(?:proc(?:\/|$|[\s;&|)'"])|pr(?:oc?)?['"\\$*?[{])/i
+// proc/ as a path start, `cd proc`, or a glob or quote cut from it.
+const PROC_RELATIVE = /(?:^|[\s'"=:<>(;&|])(?:\.{1,2}\/)*(?:proc\/|pr(?:oc?)?['"\\$*?[{])|\bcd\s+(?:\.{1,2}\/)*['"]?proc(?:$|[\s;&|)'"\/])/i
 const WILD_NAME = /[e?*][n?*][v?*][i?*][r?*][o?*][n?*]|[c?*][m?*][d?*][l?*][i?*][n?*][e?*]/gi
 
 export function procDenied(cmd: string): boolean {

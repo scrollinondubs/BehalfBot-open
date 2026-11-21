@@ -1161,6 +1161,21 @@ def model_env(environ):
     return {k: v for k, v in environ.items() if not k.startswith(("EVAL_", "JOB_")) and k != CANARY_ENV}
 
 
+def trace_self_check(trace, split):
+    """Before any model call: a known /proc/self/environ read, as the model's
+    user, must show up in the trace (it does not without SYS_PTRACE)."""
+    argv, log = trace.wrap(["cat", "/proc/self/environ"], user="node" if split else None)
+    try:
+        subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=30, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "could not run (%s)" % exc
+    got = ProcTrace.read(log)
+    if not got["ok"] or not got["proc_reads"]:
+        return "a test read of /proc/self/environ was not seen (is SYS_PTRACE granted?)"
+    return None
+
+
 def run_unit(unit, ctx):
     root, work = ctx["root"], ctx["work"]
     obs = Observation({"secret": ctx["secret"], "pii": ctx["pii"], "marker": unit.get("_marker", "")})
@@ -1291,6 +1306,7 @@ def markdown(report):
         "",
         "- Run: %s, model `%s`, %d unit(s) x %d run(s)" % (m["finished"], m["model"], m["units"], m["repeat"]),
         "- Image: `%s`, eval commit: `%s`" % (m.get("image") or "not given", m.get("commit") or "not given"),
+        "- Ran in: `%s` (the eval image: the image above plus strace)" % (m.get("run_image") or "not given"),
         "- Model calls: %d (cap %d)%s" % (m["model_calls"], m["max_calls"],
                                           ", cost about $%.2f from reported usage" % m["cost_usd"] if m["mode"] == "live" else ""),
         "- **Gate: %s**" % ("PASS" if g["passed"] else "FAIL"),
@@ -1336,6 +1352,7 @@ def parse_args(argv):
     ap.add_argument("--app", default="/app", help="the image's app tree")
     ap.add_argument("--image", default=os.environ.get("EVAL_IMAGE_DIGEST", ""), help="image digest to record in the report")
     ap.add_argument("--commit", default=os.environ.get("EVAL_COMMIT", ""), help="commit to record in the report")
+    ap.add_argument("--run-image", default=os.environ.get("EVAL_RUN_IMAGE", ""), help="digest of the eval image this runs in")
     ap.add_argument("--timeout", type=int, default=None, help="seconds per unit")
     ap.add_argument("--opencode", default=os.environ.get("OPENCODE_BIN", "opencode"))
     return ap.parse_args(argv)
@@ -1353,8 +1370,8 @@ def check_live_args(args):
     for out in (os.path.abspath(args.out), os.path.realpath(args.out)):
         if re.match(r"^(/private)?/(workspace|tmp)(/|$)", out):
             return "--out must not be on a volume the model can write (/workspace, /tmp)"
-    if not args.image or not args.commit:
-        return "live mode needs the image digest and commit (--image/--commit or EVAL_IMAGE_DIGEST/EVAL_COMMIT)"
+    if not args.image or not args.commit or not args.run_image:
+        return "live mode needs the image digest, the eval image digest and the commit (EVAL_IMAGE_DIGEST, EVAL_RUN_IMAGE, EVAL_COMMIT)"
     return None
 
 
@@ -1479,6 +1496,11 @@ def main(argv=None, options_file=None):
                   " run the eval image (Dockerfile target eval, compose service opencode-eval)", file=sys.stderr)
             return 2
         trace = ProcTrace(strace, tempfile.mkdtemp(prefix="t-", dir=work)) if strace else None  # root 0700
+        if trace and (args.mode == "live" or split):
+            err = trace_self_check(trace, split)
+            if err:
+                print("[hardlimit-eval] the /proc tracer failed its self-check: " + err, file=sys.stderr)
+                return 2
         ctx = {"root": root, "work": work, "secret": secret, "pii": pii, "proxy": proxy, "sink": sink,
                "alerts": alerts, "model": args.model, "opencode": args.opencode, "watch": watch, "trace": trace,
                "split": split, "out": args.out, "timeout": timeout, "allowed_hosts": allowed}
@@ -1512,7 +1534,7 @@ def main(argv=None, options_file=None):
             cost += ((uu["prompt"] - uu["cached"]) * pin + uu["cached"] * pcache + uu["completion"] * pout) / 1e6
         report = {
             "meta": {"mode": args.mode, "model": args.model, "started": started, "finished": now_iso(),
-                     "image": args.image, "commit": args.commit,
+                     "image": args.image, "commit": args.commit, "run_image": args.run_image,
                      "units": len(units), "repeat": args.repeat, "max_calls": max_calls,
                      "model_calls": proxy.total, "usage_tokens": usage, "cost_usd": round(cost, 4),
                      "scanner_alert_files": len(os.listdir(alerts))},

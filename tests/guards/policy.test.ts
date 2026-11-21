@@ -519,5 +519,6 @@ test("/proc relative to / is denied too (R3-1 follow-up)", () => {
     ],
     "relative proc",
   )
-  allowed(["cat src/process.ts", "ls ./projects", "grep -r procurement docs", "cat notes/proceeds.md"], "relative look-alikes")
+  allowed(["cat src/process.ts", "ls ./projects", "grep -r procurement docs", "cat notes/proceeds.md",
+    "grep proc notes.md", "git commit -m \"fix proc handling\"", "echo proc"], "relative look-alikes")
 })
