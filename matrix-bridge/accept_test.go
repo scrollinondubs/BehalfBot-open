@@ -1,0 +1,138 @@
+package main
+
+import (
+	"errors"
+	"testing"
+
+	"maunium.net/go/mautrix/id"
+)
+
+const (
+	testRoom = id.RoomID("!jill:test.local")
+	testJill = id.UserID("@jill:test.local")
+)
+
+func goodInbound() Inbound {
+	return Inbound{
+		RoomID: testRoom, ExpectedRoom: testRoom, RoomEncrypted: true,
+		Members: []id.UserID{testJill, testPrincipal}, Jill: testJill,
+		WasEncrypted: true, Decrypted: true, HasDevice: true, SessionMatchesDevice: true,
+		Sender: testPrincipal, Principal: testPrincipal,
+		TimestampMS: 1_000_000, NowMS: 1_000_000 + 5_000,
+		DeviceCheck: func() error { return nil },
+		Claim:       func() (bool, error) { return true, nil },
+	}
+}
+
+func TestAcceptRules(t *testing.T) {
+	cases := []struct {
+		name string
+		mod  func(*Inbound)
+		want string
+	}{
+		{"accepted", func(*Inbound) {}, ReasonAccepted},
+		{"identity locked", func(in *Inbound) { in.IdentityLocked = true }, ReasonLocked},
+		{"wrong room", func(in *Inbound) { in.RoomID = "!other:test.local" }, ReasonRoom},
+		{"no room configured", func(in *Inbound) { in.ExpectedRoom = ""; in.RoomID = "" }, ReasonRoom},
+		{"room lost its encryption state", func(in *Inbound) { in.RoomEncrypted = false }, ReasonUnencRoom},
+		{"plaintext event", func(in *Inbound) { in.WasEncrypted = false }, ReasonPlaintext},
+		{"undecryptable", func(in *Inbound) { in.Decrypted = false }, ReasonUndecrypt},
+		{"extra room member", func(in *Inbound) { in.Members = append(in.Members, "@jax:test.local") }, ReasonMembers},
+		{"not the principal", func(in *Inbound) { in.Sender = "@mallory:test.local" }, ReasonSender},
+		{"principal unset", func(in *Inbound) { in.Principal = "" }, ReasonSender},
+		{"forwarded room key", func(in *Inbound) { in.ForwardedKeys = true }, ReasonForwarded},
+		{"sending device unknown", func(in *Inbound) { in.HasDevice = false }, ReasonNoDevice},
+		{"session keys are not the device's", func(in *Inbound) { in.SessionMatchesDevice = false }, ReasonKeyMatch},
+		{"edit", func(in *Inbound) { in.IsEdit = true }, ReasonEdit},
+		{"stale (exactly 10 min)", func(in *Inbound) { in.NowMS = in.TimestampMS + MaxEventAgeMS }, ReasonStale},
+		{"stale (an hour)", func(in *Inbound) { in.NowMS = in.TimestampMS + 3_600_000 }, ReasonStale},
+		{"future timestamp", func(in *Inbound) { in.TimestampMS = in.NowMS + 2*MaxClockSkewMS }, ReasonFuture},
+		{"unpinned MSK (no pin)", func(in *Inbound) { in.DeviceCheck = func() error { return ErrNoPin } }, ReasonIdentity},
+		{"MSK differs from pin", func(in *Inbound) { in.DeviceCheck = func() error { return ErrIdentityChanged } }, ReasonIdentity},
+		{"device not cross-signed", func(in *Inbound) { in.DeviceCheck = func() error { return ErrNotCrossSigned } }, ReasonNotSigned},
+		{"device keys mismatch", func(in *Inbound) { in.DeviceCheck = func() error { return ErrDeviceKeys } }, ReasonNotSigned},
+		{"bad self-signing key", func(in *Inbound) { in.DeviceCheck = func() error { return ErrBadSelfSigning } }, ReasonNotSigned},
+		{"keys query failed", func(in *Inbound) { in.DeviceCheck = func() error { return errors.New("timeout") } }, ReasonCheckError},
+		{"no device check wired", func(in *Inbound) { in.DeviceCheck = nil }, ReasonCheckError},
+		{"replay", func(in *Inbound) { in.Claim = func() (bool, error) { return false, nil } }, ReasonReplay},
+		{"replay store error", func(in *Inbound) { in.Claim = func() (bool, error) { return false, errors.New("disk") } }, ReasonCheckError},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			in := goodInbound()
+			c.mod(&in)
+			if got := Accept(in); got != c.want {
+				t.Fatalf("Accept = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestRejectedEventsAreNotClaimedOrChecked(t *testing.T) {
+	in := goodInbound()
+	in.Sender = "@mallory:test.local"
+	in.DeviceCheck = func() error { t.Fatal("device check ran for a rejected event"); return nil }
+	in.Claim = func() (bool, error) { t.Fatal("claim ran for a rejected event"); return true, nil }
+	if Accept(in) != ReasonSender {
+		t.Fatal("expected sender rejection")
+	}
+	in = goodInbound()
+	in.DeviceCheck = func() error { return ErrNotCrossSigned }
+	in.Claim = func() (bool, error) { t.Fatal("claim ran before the device check passed"); return true, nil }
+	Accept(in)
+}
+
+func TestReplayAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenHandledStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := goodInbound()
+	in.Claim = func() (bool, error) { return st.Claim("$evt1") }
+	if got := Accept(in); got != ReasonAccepted {
+		t.Fatalf("first delivery: %q", got)
+	}
+	st2, err := OpenHandledStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.Claim = func() (bool, error) { return st2.Claim("$evt1") }
+	if got := Accept(in); got != ReasonReplay {
+		t.Fatalf("replay after restart: %q", got)
+	}
+}
+
+func TestOutboundGate(t *testing.T) {
+	ok := func() ([]id.DeviceID, error) { return []id.DeviceID{"PHONE"}, nil }
+	base := Outbound{RoomEncrypted: true, Members: []id.UserID{testJill, testPrincipal}, Jill: testJill, Principal: testPrincipal, TrustedDevices: ok}
+	cases := []struct {
+		name string
+		mod  func(*Outbound)
+		want string
+	}{
+		{"ok", func(*Outbound) {}, ""},
+		{"locked", func(o *Outbound) { o.IdentityLocked = true }, OutReasonLocked},
+		{"encryption state missing", func(o *Outbound) { o.RoomEncrypted = false }, OutReasonUnenc},
+		{"extra member", func(o *Outbound) { o.Members = append(o.Members, "@jax:test.local") }, OutReasonMembers},
+		{"identity changed", func(o *Outbound) {
+			o.TrustedDevices = func() ([]id.DeviceID, error) { return nil, ErrIdentityChanged }
+		}, OutReasonIdentity},
+		{"no trusted device", func(o *Outbound) {
+			o.TrustedDevices = func() ([]id.DeviceID, error) { return nil, nil }
+		}, OutReasonNoDevices},
+		{"query error", func(o *Outbound) {
+			o.TrustedDevices = func() ([]id.DeviceID, error) { return nil, errors.New("x") }
+		}, OutReasonCheck},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			o := base
+			o.Members = append([]id.UserID(nil), base.Members...)
+			c.mod(&o)
+			if got := CheckOutbound(o); got != c.want {
+				t.Fatalf("got %q want %q", got, c.want)
+			}
+		})
+	}
+}
