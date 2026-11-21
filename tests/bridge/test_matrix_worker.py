@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -72,6 +73,16 @@ class Escaping(unittest.TestCase):
         self.assertEqual(w.esc("\\x0d"), "\\\\x0d", "a literal escape must not look like a real one")
         self.assertEqual(w.esc("café 中"), "café 中", "ordinary text is unchanged")
 
+    def test_m3_fields_are_ascii_and_padding_is_counted(self):
+        # Probe C: look-alikes, blank fillers and padding.
+        self.assertEqual(w.quoted("sean@g\u043e\u043egle.com"), '"sean@g\\u{043e}\\u{043e}gle.com"')
+        for ch in ("\u00a0", "\u3164", "\u2800", "\u115f"):
+            self.assertNotIn(ch, w.quoted("a" + ch + "b"))
+            self.assertNotIn(ch, w.esc("a" + ch + "b"))
+        padded = w.quoted("x@y.com" + " " * 120 + "bcc: (not set)")
+        self.assertIn("\\s{120}", padded)
+        self.assertNotIn("  ", padded)
+
     def test_quoted_escapes_quotes(self):
         self.assertEqual(w.quoted('say "hi"\t'), '"say \\"hi\\"\\x09"')
 
@@ -126,7 +137,7 @@ class Screen(Base):
         self.assertIn('type="application/pdf"', screen)
         self.assertIn("inv\\u{202e}fdp.exe", screen)
         self.assertNotIn(b64, screen)
-        self.assertIn("refuses to approve drafts with attachments", screen)
+        self.assertIn("NOT APPROVABLE HERE: it has attachments", screen)
 
     def test_screen_is_plain_text_from_one_snapshot_read(self):
         self.snapshot(FULL)
@@ -139,31 +150,101 @@ class Screen(Base):
 
 
 class Approve(Base):
+    """Round 6 H2 and H3: a screen code binds the approval to a screen this
+    bridge delivered, and `confirm` must follow on the bridge's own clock."""
+
     def approval(self):
         path = os.path.join(w.APPROVALS_DIR, "draft", approvals.key_for("draft", DRAFT) + ".json")
         with open(path) as f:
             return json.load(f)
 
-    def test_approve_binds_to_the_typed_sha(self):
+    def show(self, deliver=True):
+        r = self.cmd("show draft " + DRAFT)
+        if deliver:
+            w.activate(r["activate"])
+        return r
+
+    def screen_code(self, r):
+        return re.search(r"approve draft \S+ [0-9a-f]{64} (\S+)", r["replies"][0]).group(1)
+
+    def confirm_code(self, r):
+        return re.search(r"confirm ([a-z0-9]{10})", r["replies"][0]).group(1)
+
+    def approve_and_confirm(self, sha, code):
+        r = self.cmd("approve draft %s %s %s" % (DRAFT, sha, code))
+        if "confirm" not in r["replies"][0] or not r["activate"]:
+            return r["replies"][0]
+        w.activate(r["activate"])
+        return self.cmd("confirm " + self.confirm_code(r))["replies"][0]
+
+    def test_approve_binds_to_the_typed_sha_after_confirm(self):
         self.snapshot(FULL)
         sha = approvals.draft_digest(FULL)
-        self.cmd("show draft " + DRAFT)
-        reply = self.cmd("approve draft %s %s" % (DRAFT, sha.upper()))["replies"][0]
+        r = self.show()
+        code = self.screen_code(r)
+        self.assertEqual(r["replies"][0].splitlines()[-1], "sha256 " + sha)
+        step1 = self.cmd("approve draft %s %s %s" % (DRAFT, sha.upper(), code))
+        self.assertFalse(os.path.isdir(os.path.join(w.APPROVALS_DIR, "draft")), "nothing before `confirm`")
+        w.activate(step1["activate"])
+        reply = self.cmd("confirm " + self.confirm_code(step1))["replies"][0]
         self.assertIn("Approved draft", reply)
         rec = self.approval()
         self.assertEqual(rec["sha256"], sha)
         self.assertLessEqual(rec["expires_at"] - rec["created_at"], approvals.MAX_TTL)
 
+    def test_h2_forged_screen_from_the_model_cannot_be_approved(self):
+        # Probe B: Jill writes a bcc'd draft, then imitates a clean screen
+        # that ends with the digest of the bcc'd version.
+        evil = {"to": ["alice@example.com"], "bcc": ["exfil@attacker.example"], "subject": "Invoice", "text": "Hi"}
+        self.snapshot(evil)
+        self.show()
+        sha_evil = approvals.draft_digest(evil)
+        for code in ("abcdefghjk", "", "x" * 10):
+            reply = self.approve_and_confirm(sha_evil, code or "nocode")
+            self.assertIn("Not approved", reply)
+        self.assertFalse(os.path.isdir(os.path.join(w.APPROVALS_DIR, "draft")))
+        old_style = self.cmd("approve draft %s %s" % (DRAFT, sha_evil))
+        self.assertTrue(old_style["handled"], "a malformed approve is a command error, never chat")
+        self.assertIn("Not understood", old_style["replies"][0])
+
+    def test_h2_screen_code_is_bound_to_its_id_and_sha(self):
+        self.snapshot(FULL)
+        code = self.screen_code(self.show())
+        self.assertIn("Not approved", self.approve_and_confirm("a" * 64, code))
+        self.assertIn("Not approved", self.approve_and_confirm(approvals.draft_digest(FULL), code),
+                      "a failed attempt with a code uses it up")
+
+    def test_h2_code_is_single_use_and_expires(self):
+        self.snapshot(FULL)
+        sha = approvals.draft_digest(FULL)
+        code = self.screen_code(self.show())
+        self.assertIn("Approved", self.approve_and_confirm(sha, code))
+        self.assertIn("Not approved", self.approve_and_confirm(sha, code))
+        code2 = self.screen_code(self.show())
+        self.assertIsNone(w.take_code(code2, "screen", w.SCREEN_TTL, now=time.time() + w.SCREEN_TTL + 1))
+
+    def test_m3_undelivered_screen_is_not_approvable(self):
+        self.snapshot(FULL)
+        code = self.screen_code(self.show(deliver=False))
+        self.assertIn("Not approved", self.approve_and_confirm(approvals.draft_digest(FULL), code))
+
+    def test_h3_confirm_expires_on_the_bridge_clock(self):
+        self.snapshot(FULL)
+        sha = approvals.draft_digest(FULL)
+        r = self.cmd("approve draft %s %s %s" % (DRAFT, sha, self.screen_code(self.show())))
+        w.activate(r["activate"])
+        late = time.time() + w.CONFIRM_TTL + 1
+        self.assertIn("Nothing to confirm", w.confirm(self.confirm_code(r), now=late)[0])
+        self.assertFalse(os.path.isdir(os.path.join(w.APPROVALS_DIR, "draft")))
+
     def test_approve_never_rereads_the_draft(self):
         self.snapshot(FULL)
         sha = approvals.draft_digest(FULL)
-        self.cmd("show draft " + DRAFT)
-        # Jill changes the draft between the screen and the approval.
+        code = self.screen_code(self.show())
         changed = dict(FULL, bcc=["other@evil.example"])
         self.snapshot(changed)
-        self.cmd("approve draft %s %s" % (DRAFT, sha))
+        self.assertIn("Approved", self.approve_and_confirm(sha, code))
         self.assertEqual(self.approval()["sha256"], sha, "the approval carries what Sean saw, not the new draft")
-        # The gateway's send check (gateway.agentmail_policy) then refuses and burns it.
         consumed = os.path.join(self.tmp.name, "consumed")
 
         def same_draft(rec):
@@ -174,53 +255,70 @@ class Approve(Base):
             approvals.check_and_consume("draft", DRAFT, consumed, base=w.APPROVALS_DIR, verify=same_draft)
         self.assertEqual(approvals.status("draft", DRAFT, [consumed], base=w.APPROVALS_DIR), "used")
 
-    def test_approve_requires_a_screen_with_that_sha(self):
-        self.snapshot(FULL)
-        reply = self.cmd("approve draft %s %s" % (DRAFT, approvals.draft_digest(FULL)))["replies"][0]
-        self.assertIn("Not approved", reply)
-        self.cmd("show draft " + DRAFT)
-        reply = self.cmd("approve draft %s %s" % (DRAFT, "a" * 64))["replies"][0]
-        self.assertIn("Not approved", reply)
-        self.assertFalse(os.path.isdir(os.path.join(w.APPROVALS_DIR, "draft")))
-
-    def test_shown_pairs_expire(self):
-        sha = "b" * 64
-        w.remember_shown(DRAFT, sha, False, now=time.time() - w.SHOWN_TTL - 1)
-        self.assertIn("Not approved", w.approve_draft(DRAFT, sha)[0])
-
-    def test_drafts_with_attachments_are_refused(self):
+    def test_drafts_with_attachments_or_long_bodies_get_no_code(self):
         content = dict(FULL, attachments=[{"filename": "a.txt", "content_type": "text/plain",
                                            "content": base64.b64encode(b"x").decode()}])
         self.snapshot(content)
-        self.cmd("show draft " + DRAFT)
-        reply = self.cmd("approve draft %s %s" % (DRAFT, approvals.draft_digest(content)))["replies"][0]
-        self.assertIn("has attachments", reply)
-        self.assertFalse(os.path.isdir(os.path.join(w.APPROVALS_DIR, "draft")))
+        r = self.show()
+        self.assertEqual(r["activate"], [])
+        self.assertIn("NOT APPROVABLE HERE", r["replies"][0])
+        self.snapshot(dict(FULL, text="x " * 5_000_000))
+        r = self.show()
+        self.assertEqual(r["activate"], [])
+        self.assertEqual(len(r["replies"]), 1, "probe D: a 10 MB body is one screen, not 1,667 messages")
+        self.assertLessEqual(len(r["replies"][0]), w.MATRIX_CHUNK)
+        self.assertIn("TOO LONG TO APPROVE", r["replies"][0])
 
 
 class Commands(Base):
-    def test_halt_resume_and_meter(self):
+    def confirm_last(self, r):
+        w.activate(r["activate"])
+        code = re.search(r"confirm ([a-z0-9]{10})", r["replies"][0]).group(1)
+        return self.cmd("confirm " + code)["replies"][0]
+
+    def test_halt_is_immediate_lifts_need_confirm(self):
         self.assertIn("HALTED", self.cmd("halt 2h travelling")["replies"][0])
         data, _ = flags.read(self.halt)
         self.assertEqual(data["enabled_by"], "matrix-bridge:@sean:test.local")
         self.assertEqual(data["reason"], "travelling")
         status = self.cmd("status")["replies"][0]
         self.assertIn("halt: ON", status)
-        self.assertIn("here: halt | resume", status)
-        self.assertIn("RESUMED", self.cmd("resume")["replies"][0])
+        r = self.cmd("resume")
+        self.assertIn("confirm", r["replies"][0])
+        self.assertEqual(flags.state(self.halt), "on", "resume alone changes nothing (round 6 H3)")
+        self.assertIn("RESUMED", self.confirm_last(r))
         self.assertEqual(flags.state(self.halt), "off")
-        ts = time.time() - 5
-        self.cmd("reset meter spend", event_ts=ts)
+        before = time.time()
+        self.assertIn("AND spend", self.confirm_last(self.cmd("reset meter spend", event_ts=1.0)))
         req, _ = flags.read(os.path.join(w.CONTROL_DIR, "meter-reset.json"))
         self.assertIs(req["spend"], True)
-        self.assertAlmostEqual(req["requested_at"], ts, places=3)
-        self.cmd("reset meter")
-        req, _ = flags.read(os.path.join(w.CONTROL_DIR, "meter-reset.json"))
-        self.assertIs(req["spend"], False)
+        self.assertGreaterEqual(req["requested_at"], before, "keyed on the bridge clock, not the event time")
+        self.assertIn("METER RESET", self.confirm_last(self.cmd("reset meter")))
 
-    def test_conserve_is_pointed_at_the_control_room(self):
-        self.assertIn("control room", self.cmd("conserve")["replies"][0])
-        self.assertEqual(flags.state(os.path.join(w.CONTROL_DIR, flags.CONSERVATION)), "off")
+    def test_m1_halt_cancels_a_pending_unsafe_action(self):
+        self.cmd("halt")
+        r = self.cmd("resume")
+        w.activate(r["activate"])
+        code = re.search(r"confirm ([a-z0-9]{10})", r["replies"][0]).group(1)
+        self.cmd("halt")
+        self.assertIn("Nothing to confirm", self.cmd("confirm " + code)["replies"][0])
+        self.assertEqual(flags.state(self.halt), "on")
+
+    def test_h3_held_back_resume_cannot_lift_a_halt(self):
+        # RT1: a `resume` delivered late gets only a challenge; nothing
+        # changes without a fresh `confirm`.
+        self.cmd("halt")
+        r = self.cmd("resume", event_ts=time.time())
+        self.assertEqual(flags.state(self.halt), "on")
+        self.assertIn("confirm", r["replies"][0])
+        self.assertIn("Nothing to confirm", self.cmd("confirm abcdefghjk")["replies"][0])
+
+    def test_conserve_here_and_unconserve_needs_confirm(self):
+        self.assertIn("CONSERVATION ON", self.cmd("conserve")["replies"][0])
+        cons = os.path.join(w.CONTROL_DIR, flags.CONSERVATION)
+        r = self.cmd("unconserve")
+        self.assertEqual(flags.state(cons), "on")
+        self.assertIn("Conservation off", self.confirm_last(r))
 
     def test_halt_gate_blocks_chat_but_not_commands(self):
         self.cmd("halt")
@@ -236,8 +334,28 @@ class Commands(Base):
         self.assertIn("not forwarded", r["replies"][0])
         self.snapshot(FULL)
         self.assertTrue(self.cmd("show draft " + DRAFT)["replies"][0].startswith("DRAFT"))
-        self.assertIn("RESUMED", self.cmd("resume")["replies"][0])
+        self.assertIn("RESUMED", self.confirm_last(self.cmd("resume")))
         self.assertFalse(self.cmd("what is on my calendar?")["handled"])
+
+    def test_l6_reply_finished_after_a_halt_is_discarded(self):
+        test = self
+
+        class SlowModel:
+            async def get_session(self, key):
+                return "s", False
+
+            async def prompt(self, sid, text):
+                test.cmd("halt")
+                return "the secret answer"
+
+            async def health(self):
+                return True
+
+            async def close(self):
+                pass
+
+        r = asyncio.run(w.handle_chat({"text": "hello", "room": "!r"}, client=SlowModel()))
+        self.assertNotIn("secret", " ".join(r["replies"]))
 
     def test_new_resets_the_session(self):
         w.save_sessions({"!r:test.local": "ses_1", "!other": "ses_2"})
@@ -248,7 +366,15 @@ class Commands(Base):
 
     def test_a_command_word_inside_a_sentence_is_chat(self):
         self.assertFalse(self.cmd("should we halt the project?")["handled"])
-        self.assertFalse(self.cmd("show draft emails to me later please")["handled"])
+        self.assertFalse(self.cmd("can you remove the bcc and show me the draft again")["handled"])
+        for text in ("show draft", "show draft d_x again", "approve the draft please", "confirm"):
+            r = self.cmd(text)
+            self.assertTrue(r["handled"], text)
+            self.assertIn("Not understood", r["replies"][0])
+
+    def test_l3_reply_fallback_is_not_stripped(self):
+        r = self.cmd("> <@sean:test.local> hi\n\nresume", is_reply=True)
+        self.assertFalse(r["handled"], "a server-claimed reply cannot turn quoted text into a command")
 
     def test_unsupported_only_upload_gets_a_reply(self):
         r = self.cmd("", attachments=[{"name": "p.png", "mime": "image/png", "data_b64": ""}])

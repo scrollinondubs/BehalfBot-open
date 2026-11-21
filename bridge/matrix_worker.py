@@ -14,17 +14,26 @@ JSON on stdin and JSON on stdout:
                                (sessions, health), with documents extracted
                                from decrypted attachments
 
-Commands, whole message, case-insensitive:
+    matrix_worker.py activate  mark one-time codes usable once the Go bridge
+                               has delivered the messages carrying them
+    matrix_worker.py alert     spool a content-free alert for jill-control
 
-    halt [<dur>] [<reason>]    (mute, silence) same as the control room
-    resume                     (unmute, unhalt) only here: lifts halt and
-                               conservation
-    reset meter                today's Venice request count
-    reset meter spend          and today's spend; only here
+Commands, whole message, case-insensitive. The Go bridge runs them one at a
+time, in the order received:
+
+    halt [<dur>] [<reason>]    (mute, silence) at once; only ever tightens an
+                               existing halt; cancels anything awaiting confirm
+    conserve [<dur>]           at once (heartbeats: critical only)
     status                     both flags
     new                        (/new, /reset, !reset) fresh opencode session
-    show draft <id>            the approval screen (draft_screen)
-    approve draft <id> <sha>   approve exactly the screen you were shown
+    show draft <id>            the approval screen, with a one-time code
+    resume | unconserve | reset meter | reset meter spend
+                               answered with a challenge code
+    approve draft <id> <sha> <code>
+                               code from that screen; answered with a
+                               challenge code
+    confirm <code>             runs the challenged command, within 5 minutes
+                               of this machine's own clock (round 6 H3)
 
 While halted every other message gets a refusal and nothing reaches the
 model. Env: see bridge/WIRING.md.
@@ -38,6 +47,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import stat
 import sys
 import time
@@ -66,7 +76,6 @@ DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "venice/zai-org-glm-5-2")
 HTTP_TIMEOUT = float(os.environ.get("OPENCODE_HTTP_TIMEOUT", "300"))
 MAX_DOC_CHARS = int(os.environ.get("BRIDGE_MAX_DOC_CHARS", "40000"))
 APPROVAL_TTL = int(os.environ.get("DRAFT_APPROVAL_TTL", "900"))
-SHOWN_TTL = 3600
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MATRIX_CHUNK = 6000
 MIN_PDF_TEXT_CHARS = 20
@@ -99,13 +108,10 @@ UNSUPPORTED_ONLY_REPLY = (
 
 HALTED_REPLY = (
     "Jill is halted. That message was not forwarded to the model. "
-    "Say `resume` to lift the halt, or `status` to check."
+    "Say `resume` (then `confirm <code>`) to lift the halt, or `status` to check."
 )
 
 NEW_SESSION = ("new", "/new", "/reset", "!reset")
-CHAT_CONTROL = ("halt", "resume", "reset-meter", "reset-meter-spend", "status", "invalid")
-SHOW_RE = re.compile(r"^show\s+draft\s+(\S+)$", re.IGNORECASE)
-APPROVE_RE = re.compile(r"^approve\s+draft\s+(\S+)\s+([0-9a-fA-F]{64})$", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------
@@ -205,16 +211,30 @@ def chunk_message(text, limit=MATRIX_CHUNK):
 
 
 # --------------------------------------------------------------------------
-# approval screen (red-team round 4, N2)
+# approval screen (red-team rounds 4 N2 and 6 H2, M3)
 # --------------------------------------------------------------------------
 
+# Characters that render as blank or near-blank but are not Unicode spaces
+# or format characters.
+BLANKS = {0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x034F, 0x17B4, 0x17B5}
+SPACE_RUN = re.compile(r" {2,}")
+
+
+def _runs(text):
+    """Make runs of spaces countable: padding cannot push text onto what
+    looks like a new line on a narrow screen."""
+    return SPACE_RUN.sub(lambda m: "\\s{%d}" % len(m.group(0)), text)
+
+
 def esc(s):
-    """Make every invisible or direction-changing character visible.
+    """Escape for body text: every invisible, direction-changing or
+    blank-rendering character becomes visible.
 
     C0, DEL and C1 become \\xNN; Unicode format (bidi overrides, zero-width
-    joiners, BOM), line/paragraph separators, private-use, surrogate and
-    unassigned code points become \\u{NNNN}. The backslash itself is
-    doubled, so an escape in the output is never ambiguous with text that
+    joiners, BOM), every space other than U+0020, line/paragraph separators,
+    private-use, surrogate, unassigned and blank-rendering code points become
+    \\u{NNNN}; runs of two or more spaces become \\s{N}. The backslash itself
+    is doubled, so an escape in the output is never ambiguous with text that
     merely looks like one.
     """
     out = []
@@ -224,17 +244,34 @@ def esc(s):
             out.append("\\\\")
         elif o < 0x20 or 0x7F <= o <= 0x9F:
             out.append("\\x%02x" % o)
-        elif unicodedata.category(ch) in ("Cf", "Zl", "Zp", "Co", "Cs", "Cn"):
+        elif o in BLANKS or (unicodedata.category(ch) in ("Cf", "Zs", "Zl", "Zp", "Co", "Cs", "Cn") and ch != " "):
             out.append("\\u{%04x}" % o)
         else:
             out.append(ch)
-    return "".join(out)
+    return _runs("".join(out))
 
 
-def quoted(value):
+def esc_field(s):
+    """Escape for addresses, subject and headers: ASCII only. Any non-ASCII
+    character (look-alike letters included) becomes \\u{NNNN}."""
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif o < 0x20 or o == 0x7F:
+            out.append("\\x%02x" % o)
+        elif o > 0x7E:
+            out.append("\\u{%04x}" % o)
+        else:
+            out.append(ch)
+    return _runs("".join(out))
+
+
+def quoted(value, field=True):
     if not isinstance(value, str):
-        value = json.dumps(value, sort_keys=True, ensure_ascii=False)
-    return '"%s"' % esc(value).replace('"', '\\"')
+        value = json.dumps(value, sort_keys=True, ensure_ascii=True)
+    return '"%s"' % (esc_field(value) if field else esc(value)).replace('"', '\\"')
 
 
 def _list(value):
@@ -250,15 +287,22 @@ def _addresses(label, content):
     return ["%s:" % label] + ["  - %s" % quoted(v) for v in items]
 
 
+# The longest text or html body the bridge will show in full and approve.
+BODY_CAP = int(os.environ.get("BRIDGE_DRAFT_BODY_CAP", "2000"))
+
+
 def _body(label, content):
     if label not in content:
         return ["%s: (not set)" % label]
     value = content[label]
     if not isinstance(value, str):
         return ["%s: %s" % (label, quoted(value))]
-    lines = value.split("\n")
-    return ["%s (%d chars, %d lines; each line starts with `| `):" % (label, len(value), len(lines))] + [
-        "  | " + esc(line) for line in lines]
+    head = value[:BODY_CAP]
+    out = ["%s (%d chars in total; each line starts with `| `):" % (label, len(value))]
+    out += ["  | " + esc(line) for line in head.split("\n")]
+    if len(value) > BODY_CAP:
+        out.append("  [%d more chars not shown: TOO LONG TO APPROVE HERE]" % (len(value) - BODY_CAP))
+    return out
 
 
 def _attachment_lines(content):
@@ -284,7 +328,7 @@ def _attachment_lines(content):
             if extra in a:
                 out.append("     %s=%s" % (extra, quoted(a[extra])))
         for k in sorted(set(a) - {"filename", "content_type", "content", "content_disposition", "content_id"}):
-            out.append("     %s=%s" % (esc(str(k)), quoted(a[k])))
+            out.append("     %s=%s" % (esc_field(str(k)), quoted(a[k])))
     return out
 
 
@@ -304,17 +348,28 @@ FIELD_RENDERERS = {
 FIELD_ORDER = ("to", "cc", "bcc", "reply_to", "subject", "in_reply_to", "labels", "attachments", "text", "html")
 
 
-def render_draft(draft_id, content):
-    """(screen text, sha256, has_attachments) for one snapshot read.
+def refusal_reason(content):
+    """Why this draft cannot be approved from a Matrix screen, or None."""
+    if content.get("attachments"):
+        return "it has attachments"
+    for k in ("text", "html"):
+        if isinstance(content.get(k), str) and len(content[k]) > BODY_CAP:
+            return "its %s body is longer than %d characters, too long to read on a phone" % (k, BODY_CAP)
+    return None
+
+
+def render_draft(draft_id, content, code=None):
+    """(screen text, sha256, refusal reason or None) for one snapshot read.
 
     The sha256 is approvals.draft_digest of exactly the object rendered: the
-    gateway compares that same digest at send time.
+    gateway compares that same digest at send time. The screen always fits
+    in one Matrix message; a draft whose screen would not is not approvable.
     """
     sha = approvals.draft_digest(content)
     lines = [
         "DRAFT %s" % quoted(draft_id),
         "Source: agentmail-proxy's stored snapshot, which is exactly what a send delivers.",
-        "Escapes: \\xNN control character, \\u{NNNN} invisible or direction-changing character, \\\\ backslash.",
+        "Escapes: \\xNN control, \\u{NNNN} non-ASCII in fields or invisible in bodies, \\s{N} N spaces, \\\\ backslash.",
         "",
     ]
     for field in FIELD_ORDER:
@@ -322,14 +377,19 @@ def render_draft(draft_id, content):
     irt = content.get("in_reply_to")
     lines.append("headers added at send: " + (
         "In-Reply-To: %s, References: %s" % (quoted(irt), quoted(irt)) if irt else "(none)"))
-    has_att = bool(content.get("attachments"))
-    lines.append("")
-    if has_att:
-        lines.append("THIS DRAFT HAS ATTACHMENTS. The bridge refuses to approve drafts with attachments.")
-    else:
-        lines.append("To send exactly this, once: approve draft %s <the sha256 below>" % esc(draft_id))
-    lines.append("sha256 %s" % sha)
-    return "\n".join(lines), sha, has_att
+    refusal = refusal_reason(content)
+    body = "\n".join(lines)
+    room = MATRIX_CHUNK - 400
+    if len(body) > room:
+        body = body[:room] + "\n[SCREEN TRUNCATED: too long to show in one message]"
+        refusal = refusal or "its screen does not fit in one message"
+    tail = []
+    if refusal:
+        tail.append("NOT APPROVABLE HERE: %s." % refusal)
+    elif code:
+        tail.append("To send exactly this, once: approve draft %s %s %s" % (esc_field(draft_id), sha, code))
+    tail.append("sha256 %s" % sha)
+    return body + "\n\n" + "\n".join(tail), sha, refusal
 
 
 def read_snapshot(draft_id):
@@ -356,59 +416,149 @@ def read_snapshot(draft_id):
     return approvals.sendable(rec["content"])
 
 
-def _shown_path():
-    return os.path.join(WORKER_STATE, "shown-drafts.json")
+# --------------------------------------------------------------------------
+# one-time codes (red-team round 6 H2, H3)
+#
+# Two kinds, one store, written only by this worker, which the Go bridge
+# runs one command at a time:
+#   screen   printed on an approval screen; `approve draft <id> <sha> <code>`
+#            is valid only with the code of a screen for that (id, sha)
+#   confirm  printed in reply to a command that lifts a stop, hands back
+#            budget or approves a draft; the command runs only on
+#            `confirm <code>` within CONFIRM_TTL of this machine's clock
+# A code is usable only after the bridge reports the message carrying it
+# was sent (`activate`), once, before it expires. Codes never reach the
+# model: bridge messages are not part of any opencode session.
+# --------------------------------------------------------------------------
+
+SCREEN_TTL = 15 * 60
+CONFIRM_TTL = 5 * 60
+CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+CODE_RE = re.compile(r"^[%s]{10}$" % CODE_ALPHABET)
 
 
-def _load_shown(now):
-    data, ok = flags.read(_shown_path()) if os.path.exists(_shown_path()) else ({}, True)
+def _codes_path():
+    return os.path.join(WORKER_STATE, "codes.json")
+
+
+def _load_codes(now):
+    data, ok = flags.read(_codes_path())
     if not ok:
         data = {}
     return {k: v for k, v in data.items()
-            if isinstance(v, dict) and isinstance(v.get("shown_at"), (int, float)) and now - v["shown_at"] < SHOWN_TTL}
+            if isinstance(v, dict) and isinstance(v.get("created_at"), (int, float))
+            and now - v["created_at"] < SCREEN_TTL}
 
 
-def remember_shown(draft_id, sha, has_att, now=None):
+def _save_codes(codes):
+    if len(codes) > 100:
+        codes = dict(sorted(codes.items(), key=lambda kv: kv[1]["created_at"])[-100:])
+    control.write_json_atomic(_codes_path(), codes)
+
+
+def new_code(kind, now=None, **fields):
     now = time.time() if now is None else now
-    shown = _load_shown(now)
-    shown["%s %s" % (draft_id, sha)] = {"shown_at": now, "attachments": has_att}
-    if len(shown) > 200:
-        shown = dict(sorted(shown.items(), key=lambda kv: kv[1]["shown_at"])[-200:])
-    control.write_json_atomic(_shown_path(), shown)
+    codes = _load_codes(now)
+    code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(10))
+    codes[code] = dict(fields, kind=kind, created_at=now, active=False, used=False)
+    _save_codes(codes)
+    return code
+
+
+def activate(to_activate, now=None):
+    now = time.time() if now is None else now
+    codes = _load_codes(now)
+    for c in to_activate:
+        if c in codes:
+            codes[c]["active"] = True
+    _save_codes(codes)
+
+
+def take_code(code, kind, ttl, now=None):
+    """The record of a live, delivered, unused code of this kind, marked
+    used; None otherwise."""
+    now = time.time() if now is None else now
+    codes = _load_codes(now)
+    rec = codes.get(code)
+    if not rec or rec.get("kind") != kind or not rec.get("active") or rec.get("used") or now - rec["created_at"] > ttl:
+        return None
+    rec["used"] = True
+    _save_codes(codes)
+    return rec
+
+
+def cancel_pending(now=None):
+    """A halt cancels every un-safe action still waiting for `confirm`."""
+    now = time.time() if now is None else now
+    codes = _load_codes(now)
+    for rec in codes.values():
+        if rec.get("kind") == "confirm":
+            rec["used"] = True
+    _save_codes(codes)
 
 
 def show_draft(draft_id):
+    """(replies, codes to activate once the screen is delivered)."""
     if not approvals.DRAFT_ID.match(draft_id):
-        return ["That is not a draft id."]
+        return ["That is not a draft id."], []
     content = read_snapshot(draft_id)
     if content is None:
-        return ["No snapshot of draft %s: only drafts written through agentmail-proxy can be sent." % esc(draft_id)]
-    screen, sha, has_att = render_draft(draft_id, content)
-    remember_shown(draft_id, sha, has_att)
-    chunks = chunk_message(screen)
-    if len(chunks) > 1:
-        chunks = ["[draft %s screen, part %d/%d]\n%s" % (esc(draft_id), i, len(chunks), c)
-                  for i, c in enumerate(chunks, 1)]
-    return chunks
+        return ["No snapshot of draft %s: only drafts written through agentmail-proxy can be sent."
+                % esc_field(draft_id)], []
+    _, sha, refusal = render_draft(draft_id, content)
+    if refusal:
+        return [render_draft(draft_id, content)[0]], []
+    code = new_code("screen", draft_id=draft_id, sha=sha)
+    return [render_draft(draft_id, content, code)[0]], [code]
 
 
-def approve_draft(draft_id, sha, now=None):
-    """Write the approval bound to the TYPED sha256. Never re-reads the draft:
-    the gateway compares this sha with its snapshot at send, so a draft that
-    changed since the screen fails there and burns the approval."""
-    sha = sha.lower()
+CONFIRM_TEXT = {
+    "resume": "lift the halt and conservation",
+    "unconserve": "lift conservation",
+    "reset-meter": "zero today's Venice request count",
+    "reset-meter-spend": "zero today's Venice request count AND dollar spend",
+}
+
+
+def challenge(action, **fields):
+    code = new_code("confirm", action=action, **fields)
+    what = CONFIRM_TEXT.get(action) or "approve draft %s (sha256 %s) for one send" % (
+        esc_field(fields.get("draft_id", "")), fields.get("sha", ""))
+    return ["To %s, send `confirm %s` within %d minutes. Saying `halt` cancels it." % (
+        what, code, CONFIRM_TTL // 60)], [code]
+
+
+def approve_draft(draft_id, sha, code, now=None):
+    """Step 1 of an approval: the screen's code must match this (id, sha).
+    The approval itself waits for `confirm`. Never re-reads the draft: the
+    gateway compares the sha with its snapshot at send."""
+    sha, code = sha.lower(), code.lower()
     if not approvals.DRAFT_ID.match(draft_id):
-        return ["That is not a draft id."]
-    rec = _load_shown(time.time() if now is None else now).get("%s %s" % (draft_id, sha))
+        return ["That is not a draft id."], []
+    rec = take_code(code, "screen", SCREEN_TTL, now)
+    if rec is None or rec.get("draft_id") != draft_id or rec.get("sha") != sha:
+        return ["Not approved: that code is not from a screen this bridge showed you for draft %s with that "
+                "sha256, or it expired (15 minutes) or was used. Say `show draft %s` and approve from that screen."
+                % (esc_field(draft_id), esc_field(draft_id))], []
+    return challenge("approve", draft_id=draft_id, sha=sha)
+
+
+def confirm(code, now=None):
+    rec = take_code(code.lower(), "confirm", CONFIRM_TTL, now)
     if rec is None:
-        return ["Not approved: I have not shown you draft %s with that sha256 in the last hour. "
-                "Say `show draft %s` and approve from that screen." % (esc(draft_id), esc(draft_id))]
-    if rec.get("attachments"):
-        return ["Not approved: that version of draft %s has attachments, and the bridge does not approve "
-                "drafts with attachments. Ask Jill to remove them, or send it yourself." % esc(draft_id)]
-    approvals.write_approval("draft", draft_id, APPROVAL_TTL, {"sha256": sha}, base=APPROVALS_DIR)
-    return ["Approved draft %s, sha256 %s, once, for %d minutes. A send of anything else fails and uses up "
-            "this approval." % (esc(draft_id), sha, APPROVAL_TTL // 60)]
+        return ["Nothing to confirm: that code is unknown, older than %d minutes, already used, or cancelled by a "
+                "halt. Send the command again." % (CONFIRM_TTL // 60)]
+    action = rec.get("action")
+    if action == "approve":
+        approvals.write_approval("draft", rec["draft_id"], APPROVAL_TTL, {"sha256": rec["sha"]}, base=APPROVALS_DIR)
+        return ["Approved draft %s, sha256 %s, once, for %d minutes. A send of anything else fails and uses up "
+                "this approval." % (esc_field(rec["draft_id"]), rec["sha"], APPROVAL_TTL // 60)]
+    try:
+        # A meter reset is keyed on this machine's clock at confirmation,
+        # never on a server timestamp (round 6 H3).
+        return [_control().apply(action, None, None, event_ts=time.time())]
+    except OSError:
+        return ["Could not apply `%s` - writing the flag file failed." % action]
 
 
 # --------------------------------------------------------------------------
@@ -420,7 +570,8 @@ class ChatControl(control.Control):
 
     def describe_state(self):
         flags_text = super().describe_state().split("\n\n")[0]
-        return flags_text + "\n\nhere: halt | resume | status | reset meter | reset meter spend | new | show draft <id>"
+        return flags_text + ("\n\nhere: halt | conserve | status | new | show draft <id> | resume, unconserve, "
+                             "reset meter [spend], approve draft (each needs `confirm <code>`)")
 
 
 def _control():
@@ -433,10 +584,10 @@ def halted():
 
 
 def normalise(req):
-    text = req.get("text") or ""
-    if req.get("is_reply"):
-        text = control.strip_reply_fallback(text)
-    return control.LEADING_MENTION_RE.sub("", text.strip()).strip()
+    # Reply fallbacks are not stripped: whether an event is a reply comes
+    # from the unencrypted wrapper, which the server controls (round 6 L3).
+    # Element X sends no fallback.
+    return control.LEADING_MENTION_RE.sub("", (req.get("text") or "").strip()).strip()
 
 
 def reset_session(room):
@@ -445,42 +596,62 @@ def reset_session(room):
     save_sessions(sessions)
 
 
+SHOW_RE = re.compile(r"^show\s+draft\s+(\S+)$", re.IGNORECASE)
+APPROVE_RE = re.compile(r"^approve\s+draft\s+(\S+)\s+([0-9a-fA-F]{64})\s+(\S+)$", re.IGNORECASE)
+CONFIRM_RE = re.compile(r"^confirm\s+(\S+)$", re.IGNORECASE)
+COMMAND_PREFIX = re.compile(r"^(show\s+draft|approve\b|confirm\b)", re.IGNORECASE)
+IMMEDIATE = ("halt", "conserve", "status")
+NEEDS_CONFIRM = ("resume", "unconserve", "reset-meter", "reset-meter-spend")
+
+
+def handled(replies, codes=()):
+    return {"handled": True, "replies": list(replies), "activate": list(codes)}
+
+
 def handle_command(req):
     text = normalise(req)
     lowered = text.lower()
     if lowered in NEW_SESSION:
         reset_session(req.get("room", ""))
-        return {"handled": True, "replies": ["Session reset. The next message starts a fresh opencode session."]}
+        return handled(["Session reset. The next message starts a fresh opencode session."])
     m = SHOW_RE.match(text)
     if m:
-        return {"handled": True, "replies": show_draft(m.group(1))}
+        return handled(*show_draft(m.group(1)))
     m = APPROVE_RE.match(text)
     if m:
-        return {"handled": True, "replies": approve_draft(m.group(1), m.group(2))}
+        return handled(*approve_draft(m.group(1), m.group(2), m.group(3)))
+    m = CONFIRM_RE.match(text)
+    if m:
+        log.info("confirm (event %s)", req.get("event_id"))
+        return handled(confirm(m.group(1)))
+    if COMMAND_PREFIX.match(text):
+        return handled(["Not understood. Use exactly `show draft <id>`, `approve draft <id> <sha256> <code>` or "
+                        "`confirm <code>`. Nothing was sent to the model."])
     parsed = control.parse_command(text)
     if parsed is not None:
         command, duration, reason = parsed
         if command == "invalid":
-            return {"handled": True, "replies": [reason]}
-        if command not in CHAT_CONTROL:
-            return {"handled": True, "replies": [
-                "`%s` lives in the control room; here you can say halt, resume, status, reset meter, "
-                "reset meter spend, new, show draft, approve draft." % command]}
+            return handled([reason])
         log.info("command %s (event %s)", command, req.get("event_id"))
+        if command in NEEDS_CONFIRM:
+            return handled(*challenge(command))
+        if command not in IMMEDIATE:
+            return handled(["`%s` is not a chat command." % command])
+        if command == "halt":
+            cancel_pending()
         try:
-            reply = _control().apply(command, duration, reason, event_ts=req.get("event_ts"))
+            return handled([_control().apply(command, duration, reason)])
         except OSError:
-            reply = "Could not apply `%s` - writing the flag file failed." % command
-        return {"handled": True, "replies": [reply]}
+            return handled(["Could not apply `%s` - writing the flag file failed." % command])
     if halted():
         log.info("halted: message not forwarded (event %s)", req.get("event_id"))
-        return {"handled": True, "replies": [HALTED_REPLY]}
+        return handled([HALTED_REPLY])
     usable = [a for a in req.get("attachments") or [] if attachment_kind(a.get("mime"), a.get("name"))]
     if not text and not usable:
         if req.get("attachments") or req.get("notes") or req.get("unsupported"):
-            return {"handled": True, "replies": [UNSUPPORTED_ONLY_REPLY] + list(req.get("notes") or [])}
-        return {"handled": True, "replies": []}
-    return {"handled": False, "replies": []}
+            return handled([UNSUPPORTED_ONLY_REPLY] + list(req.get("notes") or []))
+        return handled([])
+    return {"handled": False, "replies": [], "activate": []}
 
 
 # --------------------------------------------------------------------------
@@ -592,19 +763,45 @@ async def handle_chat(req, client=None):
         return {"handled": True, "replies": ["opencode error: {}".format(str(exc)[:300])]}
     finally:
         await client.close()
+    if halted():
+        # A halt that arrived while the model was working: the reply is not
+        # delivered (round 6 L6).
+        return {"handled": True, "replies": ["Halted while that reply was being written; it was discarded."]}
     return {"handled": True, "replies": chunk_message(reply)}
+
+
+def write_alert(kind, text):
+    """Spool one content-free alert for jill-control (the bridge passes fixed
+    texts only)."""
+    if not isinstance(kind, str) or not control.KIND_RE.match(kind) or not isinstance(text, str) or not text:
+        raise SystemExit("bad alert")
+    spool = os.environ.get("ALERT_SPOOL_DIR", "/state/alerts")
+    name = "%d-matrix-bridge-%s.json" % (time.time_ns(), secrets.token_hex(4))
+    tmp = os.path.join(spool, "." + name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump({"kind": kind, "text": text}, f)
+    os.replace(tmp, os.path.join(spool, name))
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    if not argv or argv[0] not in ("command", "chat"):
-        print("usage: matrix_worker.py command|chat < request.json", file=sys.stderr)
+    if not argv or argv[0] not in ("command", "chat", "activate", "alert"):
+        print("usage: matrix_worker.py command|chat|activate|alert < request.json", file=sys.stderr)
         return 64
     req = json.loads(sys.stdin.read() or "{}")
     os.makedirs(WORKER_STATE, exist_ok=True)
-    resp = handle_command(req) if argv[0] == "command" else asyncio.run(handle_chat(req))
+    if argv[0] == "alert":
+        write_alert(req.get("alert_kind"), req.get("text"))
+        resp = {"handled": True, "replies": [], "activate": []}
+    elif argv[0] == "activate":
+        activate([c for c in req.get("activate") or [] if isinstance(c, str) and CODE_RE.match(c)])
+        resp = {"handled": True, "replies": [], "activate": []}
+    elif argv[0] == "command":
+        resp = handle_command(req)
+    else:
+        resp = asyncio.run(handle_chat(req))
     sys.stdout.write(json.dumps(resp))
     return 0
 
