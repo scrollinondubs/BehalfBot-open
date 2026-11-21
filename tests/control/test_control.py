@@ -224,32 +224,6 @@ class KillSwitch(Base):
         self.assertEqual(self.hs.sent, [])
         self.assertNotIn("9223372036854775807", self.ctl.cursor, "must not keep conduwuit's sentinel start")
 
-    def test_halt_status_round_trip_and_resume_is_refused_here(self):
-        self.ctl.poll_room()
-        self.hs.say("halt 30m flying")
-        self.ctl.poll_room()
-        self.assertEqual(flags.state(self.halt), "on")
-        data, _ = flags.read(self.halt)
-        self.assertEqual(data["reason"], "flying")
-        self.assertTrue(data["enabled_by"].endswith(PRINCIPAL))
-        self.assertIn("HALTED", self.hs.sent[-1][1])
-        self.assertIn("NOT covered by halt", self.hs.sent[-1][1])
-        self.hs.say("status")
-        self.ctl.poll_room()
-        self.assertIn("halt: ON", self.hs.sent[-1][1])
-        self.hs.say("conserve")
-        self.hs.say("resume")
-        self.ctl.poll_room()
-        self.assertEqual(flags.state(self.halt), "on", "resume must not lift a halt from the unencrypted room (#50)")
-        self.assertEqual(flags.state(self.cons), "on")
-        self.assertIn("Refused", self.hs.sent[-1][1])
-        self.assertIn("encrypted chat room", self.hs.sent[-1][1])
-        self.assertNotIn("RESUMED", "".join(b for _, b in self.hs.sent))
-        self.hs.say("unconserve")
-        self.ctl.poll_room()
-        self.assertEqual(flags.state(self.cons), "off")
-        self.assertEqual(flags.state(self.halt), "on")
-
     def test_50_host_cli_break_glass_resume(self):
         flags.write(self.halt, True, "t", None, None)
         flags.write(self.cons, True, "t", None, None)
@@ -278,29 +252,6 @@ class KillSwitch(Base):
         self.assertEqual(flags.state(self.halt), "off")
         self.assertEqual(self.hs.sent, [])
 
-    def test_f3_old_halt_and_conserve_are_honoured_in_order(self):
-        self.ctl.poll_room()
-        self.hs.say("conserve", age_s=7200)
-        self.hs.say("halt", age_s=3600)
-        self.ctl.poll_room()
-        self.assertEqual(flags.state(self.halt), "on", "a late halt is still a halt")
-        self.assertEqual(flags.state(self.cons), "on")
-        self.assertIn("CONSERVATION ON", self.hs.sent[0][1])
-        self.assertIn("HALTED", self.hs.sent[1][1])
-
-    def test_f3_old_resume_and_unconserve_are_ignored_with_an_ack(self):
-        flags.write(self.halt, True, "t", None, None)
-        flags.write(self.cons, True, "t", None, None)
-        self.ctl.poll_room()
-        self.hs.say("resume", age_s=3600)
-        self.hs.say("unconserve", age_s=3600)
-        self.hs.say("status", age_s=3600)
-        self.ctl.poll_room()
-        self.assertEqual(flags.state(self.halt), "on")
-        self.assertEqual(flags.state(self.cons), "on")
-        self.assertEqual(len(self.hs.sent), 1, "stale status and stale encrypted-room-only words are silent")
-        self.assertIn("Ignored a `unconserve`", self.hs.sent[0][1])
-
     def test_f3_halt_then_fresh_resume_in_one_batch(self):
         self.ctl.poll_room()
         self.hs.say("halt", age_s=3600)
@@ -319,16 +270,6 @@ class KillSwitch(Base):
     def test_f4_boot_fails_when_the_room_cannot_be_read(self):
         self.ctl.poll_room = lambda: False
         self.assertTrue(any("pagination" in f for f in c.boot(self.ctl)))
-
-    def test_cursor_survives_restart(self):
-        self.ctl.poll_room()
-        self.hs.say("halt")
-        self.ctl.poll_room()
-        self.hs.say("conserve")
-        again = c.Control(self.cfg, c.Matrix(self.hs.url, TOKEN))
-        again.poll_room()
-        self.assertEqual(flags.state(self.cons), "on", "the restarted listener must pick up from its cursor")
-        self.assertEqual(sum("HALTED" in b for _, b in self.hs.sent), 1, "halt must not be replayed")
 
     def test_listen_once_marks_armed_and_lifts_expired(self):
         flags.write(self.halt, True, "t", "2001-01-01T00:00:00Z", None)
@@ -498,24 +439,6 @@ class MeterAlerts(Base):
 
 
 class ResetMeter(Base):
-    def test_n3_reset_meter_writes_a_request_and_acks(self):
-        self.assertEqual(c.parse_command("reset meter")[0], "reset-meter")
-        self.assertIsNone(c.parse_command("reset meter please"))
-        self.ctl.poll_room()
-        self.hs.say("reset meter")
-        self.ctl.poll_room()
-        req, ok = flags.read(os.path.join(self.cfg["control_dir"], "meter-reset.json"))
-        self.assertAlmostEqual(req["requested_at"], time.time(), delta=5)
-        self.assertIn("METER RESET", self.hs.sent[-1][1])
-
-    def test_n3_reset_meter_is_principal_only_and_ages_like_resume(self):
-        self.ctl.poll_room()
-        self.hs.say("reset meter", sender="@mallory:example.org")
-        self.hs.say("reset meter", age_s=3600)
-        self.ctl.poll_room()
-        self.assertFalse(os.path.exists(os.path.join(self.cfg["control_dir"], "meter-reset.json")))
-        self.assertIn("Ignored a `reset meter`", self.hs.sent[-1][1])
-
     def test_n3_request_ceiling_alerts(self):
         d = os.path.join(self.tmp.name, "meter")
         os.makedirs(d)
@@ -532,21 +455,70 @@ class ResetMeter(Base):
         self.assertEqual(flags.state(self.halt), "on")
 
 
-class Round3(Base):
-    def test_r3_3_reset_is_keyed_on_the_event_time_so_replay_is_idempotent(self):
-        self.ctl.poll_room()
-        self.hs.say("reset meter", age_s=30)
-        ev_ts = self.hs.events[-1]["origin_server_ts"] / 1000
-        self.ctl.poll_room()
-        req, _ = flags.read(os.path.join(self.cfg["control_dir"], "meter-reset.json"))
-        self.assertAlmostEqual(req["requested_at"], ev_ts, places=3)
-        self.assertIs(req["spend"], False)
-        again = c.Control(self.cfg, c.Matrix(self.hs.url, TOKEN))
-        again.cursor = None
-        again.apply("reset-meter", None, None, event_ts=ev_ts)
-        req2, _ = flags.read(os.path.join(self.cfg["control_dir"], "meter-reset.json"))
-        self.assertEqual(req2["requested_at"], req["requested_at"], "a replay writes the same key")
+class Round6ControlRoom(Base):
+    """Red-team round 6 H4 (probe A): the unencrypted room only halts."""
 
+    def test_h4_forged_halt_with_duration_cannot_shorten_an_indefinite_halt(self):
+        self.ctl.poll_room()
+        self.hs.say("halt incident")
+        self.ctl.poll_room()
+        data, _ = flags.read(self.halt)
+        self.assertIsNone(data["auto_lift_after"])
+        self.hs.say("halt 1m")
+        self.ctl.poll_room()
+        self.assertIn("takes no duration", self.hs.sent[-1][1])
+        self.assertTrue(flags.is_on(self.halt, now=time.time() + 61), "a forged `halt 1m` must not set an auto-lift")
+        self.assertIsNone(flags.read(self.halt)[0]["auto_lift_after"])
+
+    def test_h4_halt_only_tightens_wherever_it_comes_from(self):
+        self.ctl.apply("halt", None, "incident")
+        self.assertIn("unchanged", self.ctl.apply("halt", c.duration_to_iso(1, "m"), None))
+        self.assertIsNone(flags.read(self.halt)[0]["auto_lift_after"])
+        flags.write(self.halt, False)
+        self.ctl.apply("halt", c.duration_to_iso(2, "h"), None)
+        two_h = flags.parse_iso(flags.read(self.halt)[0]["auto_lift_after"])
+        self.assertIn("unchanged", self.ctl.apply("halt", c.duration_to_iso(1, "m"), None))
+        self.assertEqual(flags.parse_iso(flags.read(self.halt)[0]["auto_lift_after"]), two_h)
+        self.ctl.apply("halt", c.duration_to_iso(3, "h"), None)
+        self.assertGreater(flags.parse_iso(flags.read(self.halt)[0]["auto_lift_after"]), two_h)
+        self.ctl.apply("halt", None, None)
+        self.assertIsNone(flags.read(self.halt)[0]["auto_lift_after"], "no auto-lift beats any auto-lift")
+
+    def test_h4_only_halt_is_accepted_here(self):
+        flags.write(self.halt, True, "t", None, None)
+        flags.write(self.cons, True, "t", None, None)
+        self.ctl.poll_room()
+        for word in ("resume", "unmute", "unconserve", "conservation off", "reset meter", "reset meter spend",
+                     "conserve", "status"):
+            self.hs.say(word)
+        self.ctl.poll_room()
+        self.assertEqual(flags.state(self.halt), "on")
+        self.assertEqual(flags.state(self.cons), "on")
+        self.assertFalse(os.path.exists(os.path.join(self.cfg["control_dir"], "meter-reset.json")))
+        self.assertEqual(len(self.hs.sent), 8)
+        self.assertTrue(all(b.startswith("Refused") for _, b in self.hs.sent))
+
+    def test_h4_stale_halt_still_halts_and_stale_refusals_are_silent(self):
+        self.ctl.poll_room()
+        self.hs.say("resume", age_s=3600)
+        self.hs.say("halt", age_s=3600)
+        self.ctl.poll_room()
+        self.assertEqual(flags.state(self.halt), "on", "a late halt is still a halt")
+        self.assertEqual(len(self.hs.sent), 1)
+        self.assertIn("HALTED", self.hs.sent[0][1])
+
+    def test_cursor_survives_restart(self):
+        self.ctl.poll_room()
+        self.hs.say("halt")
+        self.ctl.poll_room()
+        flags.write(self.halt, False)
+        again = c.Control(self.cfg, c.Matrix(self.hs.url, TOKEN))
+        again.poll_room()
+        self.assertEqual(flags.state(self.halt), "off", "the restarted listener must not replay the halt")
+        self.assertEqual(sum("HALTED" in b for _, b in self.hs.sent), 1)
+
+
+class Round3(Base):
     def test_r3_3_any_ack_failure_still_applies_once_and_moves_on(self):
         self.ctl.poll_room()
         boom = []
