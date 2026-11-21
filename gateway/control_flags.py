@@ -9,8 +9,9 @@ with the same five keys:
 
 Timestamps are "%Y-%m-%dT%H:%M:%SZ" (UTC).
 
-Only the jill-control sidecar writes them (into the control-state volume).
-Every other reader mounts that volume read-only, so reading never rewrites:
+Two processes write them (into the control-state volume): the jill-control
+sidecar, and matrix-bridge for halt/resume/reset meter from Sean's encrypted
+chat room (#50). Every other reader mounts that volume read-only, so reading never rewrites:
 an expired auto-lift reads as "off" and the sidecar clears the file on its
 own loop. The failure direction is fixed: a file that exists but cannot be
 read or parsed, or carries an auto-lift time that cannot be parsed, reads as
@@ -21,6 +22,7 @@ import json
 import os
 import re
 import stat
+import time
 from datetime import datetime, timezone
 
 HALT = "halt.json"
@@ -111,9 +113,13 @@ def write(path, enabled, by=None, auto_lift=None, reason=None):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    now = time.time()
     payload = {
         "enabled": bool(enabled),
-        "enabled_at": utcnow_iso() if enabled else None,
+        "enabled_at": utcnow_iso(datetime.fromtimestamp(now, timezone.utc)) if enabled else None,
+        # Sub-second time of the same moment: a pending confirm issued
+        # before this halt is voided by it (round 6b N4).
+        "enabled_epoch": now if enabled else None,
         "enabled_by": by if enabled else None,
         "auto_lift_after": auto_lift if enabled else None,
         "reason": reason if enabled else None,
@@ -122,7 +128,49 @@ def write(path, enabled, by=None, auto_lift=None, reason=None):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
         fh.write("\n")
+        # On disk before anyone is told it is (round 6b N8): an acked halt
+        # survives a crash or power loss.
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    dfd = os.open(parent or ".", os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def touch(path, now=None):
+    """Record that the flag was asserted again while already on, without
+    changing it: `last_epoch` voids anything issued before this moment
+    (round 6b R3-4). Same atomic, fsynced write as write()."""
+    data, ok = read(path)
+    if not ok or data.get("enabled") is not True:
+        return
+    data["last_epoch"] = time.time() if now is None else now
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def last_asserted(path):
+    """Epoch seconds of the latest time this flag was set or re-asserted, or
+    None when unknown."""
+    data, ok = read(path)
+    if not ok:
+        return None
+    times = [v for v in (data.get("enabled_epoch"), data.get("last_epoch"))
+             if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return max(times) if times else None
 
 
 def lift_expired(path, now=None):

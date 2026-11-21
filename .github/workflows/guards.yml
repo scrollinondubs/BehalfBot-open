@@ -4,7 +4,8 @@ name: Guards
 # ever made required deadlocks unrelated PRs.
 #
 # Two jobs, proving different things:
-#   unit      the deny rules themselves (fast, no Docker)
+#   unit      the deny rules, gateway and control policy, the Matrix bridge's
+#             acceptance rule (fast, no Docker)
 #   selftest  the built image: guard files read-only, plugin actually loaded
 #             by OpenCode, denials firing in the parent session AND in a
 #             subagent, against a scripted local model. No keys, no network
@@ -22,8 +23,8 @@ jobs:
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
       - name: Guard policy unit tests
@@ -34,15 +35,69 @@ jobs:
         run: python3 -m unittest discover -s tests/gateway -v
       - name: Kill switch, alert spool, credential expiry (jill-control vs a fake homeserver)
         run: python3 -m unittest discover -s tests/control -v
+      - name: Matrix bridge worker (commands, halt gate, approval screen, approve binding)
+        run: python3 -m unittest discover -s tests/bridge -v
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: matrix-bridge/go.mod
+          cache-dependency-path: matrix-bridge/go.sum
+      - name: Matrix bridge acceptance rule and pinned trust chain (pure Go, goolm, no cgo)
+        working-directory: matrix-bridge
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          go mod verify
+          go vet -tags goolm ./...
+          go test -tags goolm -count=1 -v ./...
       - name: Dispatcher controls (halt, caps, spend cap, all-failed alarm, state lock; heartbeats ship off)
         run: bash scheduled-tasks/dispatcher-selftest.sh
+
+  # The Matrix bridge end to end, against a throwaway continuwuity started
+  # by the script (removed on exit): setup with SAS verification, an
+  # encrypted round trip through the real worker to a stub opencode,
+  # show/approve draft, a replay, and an unverified device dropped.
+  matrix-bridge-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: matrix-bridge/go.mod
+          cache-dependency-path: matrix-bridge/go.sum
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Worker dependencies (hash-pinned, as in the image)
+        run: "pip install --require-hashes --no-deps --only-binary=:all: -r bridge/requirements.lock"
+      - name: End-to-end against a throwaway homeserver
+        run: bash selftest/matrix-bridge-e2e.sh
 
   selftest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build image
         run: docker build -t behalfbot-open:ci .
+      - name: Matrix bridge worker isolation (round 6 M4)
+        # As compose runs it: root with only SETUID/SETGID, no new privileges,
+        # read-only root. The worker uid must not be able to list or read the
+        # bridge state; the chat uid must not be able to write approvals, flags
+        # or alerts; the bridge must refuse to run as root without them (N5).
+        run: |
+          docker run --rm --network none --read-only --user 0:0 --cap-drop ALL \
+            --cap-add SETUID --cap-add SETGID --security-opt no-new-privileges \
+            --tmpfs /tmp -v /state/matrix-bridge -v /state/matrix-worker -v /state/matrix-chat \
+            -v /state/approvals -v /state/control -v /state/alerts \
+            -e BRIDGE_WORKER_UID=1000 -e BRIDGE_WORKER_GID=1000 \
+            -e BRIDGE_CHAT_UID=1001 -e BRIDGE_CHAT_GID=1001 \
+            -e MATRIX_PRINCIPAL=@s:test.local -e 'MATRIX_JILL_ROOM=!r:test.local' \
+            behalfbot-open:ci /opt/jill/bin/matrix-bridge isolation-check
+          if docker run --rm --network none --read-only --user 0:0 --cap-drop ALL \
+            --cap-add SETUID --cap-add SETGID --tmpfs /tmp -v /state/matrix-bridge \
+            -e MATRIX_PRINCIPAL=@s:test.local -e 'MATRIX_JILL_ROOM=!r:test.local' \
+            behalfbot-open:ci /opt/jill/bin/matrix-bridge isolation-check; then
+            echo "the bridge ran as root with no worker uid"; exit 1
+          fi
       - name: Boot self-test (serve's uid and caps, read-only rootfs, no network)
         run: |
           docker run --rm --network none --read-only --cap-drop ALL \

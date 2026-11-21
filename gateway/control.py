@@ -22,19 +22,22 @@ dispatcher is down, which is when it matters.
 KILL SWITCH (ported from chassis matrix-control-listener.py, 5713efb +
 130db62; lexicon and acks from discord-control-listener.py, 47a13d6)
 -------------------------------------------------------------------
-Whole-message words from the principal in the control room:
+The control room is unencrypted on a homeserver Jill does not control, so
+its admin can forge anything posted there. It therefore accepts exactly one
+whole-message word from the principal (round 6 H4):
 
-    halt [<dur>] [<reason>]   aliases mute, silence. Every heartbeat skipped
-                              from the next dispatcher tick, critical ones
+    halt [<reason>]           aliases mute, silence. Indefinite: a duration
+                              is refused here. Every heartbeat skipped from
+                              the next dispatcher tick, critical ones
                               included.
-    resume                    aliases unmute, unhalt. Clears halt AND
-                              conservation.
-    conserve [<dur>] [...]    aliases throttle, "conservation on". Only
-                              `critical` heartbeats run.
-    unconserve                alias "conservation off".
-    status                    Reports both flags. Changes nothing.
 
-<dur> is <n>m / <n>h / <n>d and becomes auto_lift_after.
+Everything else (resume, conserve, unconserve, status, reset meter [spend])
+is refused with an ack. They work in Jill's end-to-end encrypted chat room
+through the Matrix bridge (matrix-bridge/), and lifts there need a
+`confirm <code>`. The host break-glass is `control.py resume`.
+
+A halt only ever tightens (Control.apply): it never shortens or lifts an
+existing one, wherever it comes from.
 
 Event rules: m.room.message / m.text only; sender must equal
 MATRIX_PRINCIPAL exactly (display names are never compared); events older
@@ -116,6 +119,10 @@ RENAG_STAGES = ("unknown", "missing", "rate_limited", "exhausted", "rejected", "
 # Red-team F3: a halt or conserve is honoured whatever its age (a late stop
 # is still a stop); only the commands that LIFT a stop, and status, expire.
 AGE_LIMITED = ("resume", "unconserve", "status", "reset-meter", "reset-meter-spend")
+# Commands that lift a stop or hand back budget, accepted only from the
+# encrypted chat room (bridge/matrix_worker.py): a homeserver admin can
+# forge anything posted in this unencrypted room.
+ENCRYPTED_ROOM_ONLY = ("resume", "reset-meter-spend", "reset-meter", "unconserve", "conserve", "status")
 
 
 def log(msg):
@@ -340,23 +347,49 @@ class Control:
             return " - ".join(bits)
 
         return "\n".join([line("halt", self.halt_file), line("conservation", self.conservation_file), "",
-                          "halt | resume | conserve | unconserve | status | reset meter"])
+                          "here: halt (no duration)",
+                          "encrypted chat room: everything else"])
+
+    def _tightened_lift(self, path, duration):
+        """The auto-lift a new halt or conserve may write, or False to keep
+        the flag as it is. A stop only tightens: no auto-lift beats any
+        auto-lift, and a later lift beats an earlier one (round 6 H4)."""
+        if flags.state(path) != "on":
+            return duration
+        data, ok = flags.read(path)
+        current = data.get("auto_lift_after") if ok else None
+        if not ok or current is None:
+            return False
+        if duration is None:
+            return None
+        cur_epoch, new_epoch = flags.parse_iso(current), flags.parse_iso(duration)
+        if cur_epoch is None or new_epoch is None or new_epoch <= cur_epoch:
+            return False
+        return duration
 
     def apply(self, command, duration, reason, event_ts=None):
         by = "%s:%s" % (self.SOURCE, self.cfg["principal"])
         if command == "status":
             return self.describe_state()
         if command == "halt":
-            flags.write(self.halt_file, True, by, duration, reason)
-            lift = "Auto-lift %s." % duration if duration else "No auto-lift - stays halted until you say `resume`."
+            lift_at = self._tightened_lift(self.halt_file, duration)
+            if lift_at is False:
+                # Still a halt: it voids pending confirms (round 6b R3-4).
+                flags.touch(self.halt_file)
+                return "Already halted until at least then; the halt is unchanged.\n" + self.describe_state()
+            flags.write(self.halt_file, True, by, lift_at, reason)
+            lift = "Auto-lift %s." % lift_at if lift_at else "No auto-lift - stays halted until you say `resume`."
             return ("HALTED. venice-proxy now refuses every model call, chat included, so a run in progress "
                     "fails at its next model step. Heartbeats (if enabled) are skipped too.\n"
                     "%s\n"
                     "NOT covered by halt: a tool call already executing finishes; this room keeps listening.\n"
-                    "Say `resume` to lift, `status` to check." % lift)
+                    "Say `resume` in Jill's encrypted chat room to lift (it asks for a `confirm`)." % lift)
         if command == "conserve":
-            flags.write(self.conservation_file, True, by, duration, reason)
-            lift = "Auto-lift %s." % duration if duration else "No auto-lift - stays on until you say `resume`."
+            lift_at = self._tightened_lift(self.conservation_file, duration)
+            if lift_at is False:
+                return "Conservation is already on until at least then; unchanged."
+            flags.write(self.conservation_file, True, by, lift_at, reason)
+            lift = "Auto-lift %s." % lift_at if lift_at else "No auto-lift - stays on until you say `unconserve`."
             return ("CONSERVATION ON. Heartbeats marked `normal` and `background` are skipped from the next "
                     "tick; `critical` ones still run.\n%s\nIf you want everything to stop, say `halt`." % lift)
         if command in ("reset-meter", "reset-meter-spend"):
@@ -428,6 +461,15 @@ class Control:
                                                                ", stale" if why == "stale" else ""))
             if command == "invalid":
                 text = reason
+            elif command != "halt":
+                if why == "stale":
+                    continue
+                text = ("Refused: `%s` is accepted only in Jill's end-to-end encrypted chat room. This room is not "
+                        "encrypted, so the homeserver could forge it. Only `halt` works here. Nothing changed." % (
+                            command.replace("-", " ")))
+            elif duration is not None:
+                text = ("Refused: a halt here takes no duration, because a forged one could set an auto-lift. "
+                        "Send `halt` alone. Nothing changed.")
             elif why == "stale" and command in AGE_LIMITED:
                 if command == "status":
                     continue
@@ -804,7 +846,23 @@ def _loop(name, interval, fn):
         time.sleep(interval)
 
 
+def break_glass_resume(control_dir):
+    """Host-only resume, for when the encrypted chat bridge cannot do it
+    (locked, down, or Sean has no verified device). Reaching it needs a
+    shell on Jill's host with access to her Docker, which neither Jill nor
+    the homeserver has:
+        docker compose exec jill-control python3 /app/gateway/control.py resume
+    """
+    cfg = {"control_dir": control_dir, "control_room": "", "principal": "host-cli"}
+    text = Control(cfg, None).apply("resume", None, None)
+    log("BREAK-GLASS resume from the host CLI: halt and conservation cleared")
+    return text
+
+
 def main():
+    if sys.argv[1:] == ["resume"]:
+        print(break_glass_resume(os.environ.get("CONTROL_DIR", "/state/control")))
+        return 0
     cfg, problems = load_config()
     if problems:
         log("ERROR: the Matrix kill switch is UNARMED. Jill cannot be stopped from Matrix.")
@@ -831,7 +889,7 @@ def main():
         fh.write("armed\n")
     log("boot self-test passed: token valid, rooms joined and unencrypted, control room readable. ARMED.")
     if cfg["announce"]:
-        control.post("Kill switch armed. Say `status`, `halt` or `resume` here.")
+        control.post("Kill switch armed. Say `halt` here; everything else works only in Jill's encrypted chat room.")
     threading.Thread(target=_loop, args=("spool", 10, control.drain_spool), daemon=True).start()
 
     def credentials():

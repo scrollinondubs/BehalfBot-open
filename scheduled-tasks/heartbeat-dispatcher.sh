@@ -53,9 +53,6 @@
 #                             unreachable the dispatcher fails open (fires the
 #                             model on ask_model conditions).
 #   OLLAMA_MODEL            - Ollama model for ask_model (default gemma2)
-#   DISCORD_WEBHOOK_URL     - notifications for heartbeats that emit
-#                             `notify: true` in their output
-#   DISCORD_OPS_WEBHOOK_URL - output-validator quarantine alerts
 #   DRY_RUN                 - "true" logs the FIRE and skips the invocation
 #
 # Control (Jill v2 C, BehalfBot-open#49; see docs/control.md):
@@ -734,31 +731,15 @@ invoke_opencode() {
     return $exit_code
 }
 
-# --- Discord Notifications ---
-
-send_discord_notification() {
-    local heartbeat_name="$1" summary="$2" output_file="$3"
-
-    if [[ -z "${DISCORD_WEBHOOK_URL:-}" ]]; then
-        log "WARN: DISCORD_WEBHOOK_URL not set, skipping notification"
-        return
-    fi
-
-    local payload
-    payload=$(jq -n \
-        --arg name "$heartbeat_name" \
-        --arg summary "$summary" \
-        --arg file "$(basename "$output_file")" \
-        --arg instance "${INSTANCE_NAME:-BehalfBot-open}" \
-        '{
-            content: ("🤖 **" + $instance + " | " + $name + "**\n" + $summary + "\n> " + $file)
-        }')
-
-    curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
-        -H "Content-Type: application/json" \
-        -d "$payload" >> "$LOG_FILE" 2>&1 \
-        || log "WARN: Discord notification failed for $heartbeat_name"
-}
+# --- Notifications ---
+#
+# A heartbeat whose output starts with `notify: true` raises an alert
+# through the Matrix alerts path (alert_ops). That room is not end-to-end
+# encrypted, so the alert carries the heartbeat and output file names only,
+# never the model-written summary: read the output on Jill's side. The bit
+# itself is model-controlled, so it is rate-limited per heartbeat
+# (NOTIFY_MIN_INTERVAL_SECONDS, default 6h): Jill cannot signal through the
+# timing of alerts more often than that (red-team round 6 L2).
 
 check_and_notify() {
     local name="$1" output_file="$2"
@@ -767,22 +748,24 @@ check_and_notify() {
         return
     fi
 
-    local summary
-    summary=$(head -20 "$output_file" | grep '^summary: *' | sed 's/^summary: *//' | head -1)
-    if [[ -z "$summary" ]]; then
-        summary="Heartbeat completed with actions taken."
+    local now last
+    now=$(date +%s)
+    last=$(get_state "$name" "last_notify_at")
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < ${NOTIFY_MIN_INTERVAL_SECONDS:-21600} )); then
+        log "NOTIFY $name suppressed (rate limit)"
+        return
     fi
-
-    log "NOTIFY $name - $summary"
-    send_discord_notification "$name" "$summary" "$output_file"
+    set_state "$name" "last_notify_at" "$now"
+    log "NOTIFY $name"
+    alert_ops "notify" "Heartbeat $name finished and asked for your attention (output $(basename "$output_file"))."
 }
 
 # --- Post-Output Validator (Five Failure Modes check) ---
 #
 # For heartbeats with `output_validator: true`, run a small-model Five Failure
 # Modes check against the output before it is "published". On pass: artifact
-# stays. On fail: artifact quarantined (.quarantined suffix), ops webhook
-# alerted. If the validator itself fails, fail-open.
+# stays. On fail: artifact quarantined (.quarantined suffix) and a Matrix
+# alert raised. If the validator itself fails, fail-open.
 
 VALIDATOR_PROMPT='You are a code and content quality gate. Given the artifact text below, run the Five Failure Modes check and emit a single JSON object on stdout (no other text):
 
@@ -908,9 +891,8 @@ run_output_validator() {
 # homeserver Jill does not own. So every caller passes a fixed template with
 # heartbeat names, counts and dollar figures only: never model output,
 # gather data, prompt text or log lines. Delivery: a JSON file in
-# ALERT_SPOOL_DIR (jill-control drains it), and the Discord ops webhook as
-# well when one is configured. With neither, the alert is logged and
-# dropped, loudly.
+# ALERT_SPOOL_DIR (jill-control drains it). Without a spool the alert is
+# logged and dropped, loudly.
 alert_ops() {
     local kind="$1" msg="$2" delivered=0
     if [[ -n "$ALERT_SPOOL_DIR" ]]; then
@@ -925,17 +907,8 @@ alert_ops() {
             log "WARN: could not write alert to spool $ALERT_SPOOL_DIR"
         fi
     fi
-    if [[ -n "${DISCORD_OPS_WEBHOOK_URL:-}" ]]; then
-        if curl -sf -X POST "$DISCORD_OPS_WEBHOOK_URL" \
-                -H "Content-Type: application/json" \
-                -d "$(jq -n --arg content "$msg" '{content: $content}')" >> "$LOG_FILE" 2>&1; then
-            delivered=1
-        else
-            log "WARN: ops webhook POST failed"
-        fi
-    fi
     if [[ $delivered -eq 0 ]]; then
-        log "WARN: no alert path (ALERT_SPOOL_DIR and DISCORD_OPS_WEBHOOK_URL unset), dropped: $kind"
+        log "WARN: no alert path (ALERT_SPOOL_DIR unset or unwritable), dropped: $kind"
     fi
     return 0
 }
@@ -1498,7 +1471,7 @@ ${gathered_data}
             continue
         fi
 
-        # Discord notification signal in output
+        # `notify: true` in the output raises a content-free Matrix alert
         check_and_notify "$name" "$output_file"
     done
 

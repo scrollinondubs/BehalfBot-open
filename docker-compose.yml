@@ -1,6 +1,7 @@
 # BehalfBot-open compose stack - the containerized open-weight lane (Jill).
 #
-#   Discord -> discord-bridge -> opencode-serve (compose network) -> Venice GLM-5.2
+#   Sean (Element X) -> Matrix, end-to-end encrypted -> matrix-bridge
+#     -> api-proxy -> opencode-serve -> venice-proxy -> Venice GLM-5.2
 #
 # Isolation posture (issue #9): no /Users mounts, no Docker socket, no host
 # home, non-root user, private compose network. As of 2026-07-27 there is NO
@@ -22,8 +23,8 @@
 # arbitrary shell commands - a confused deputy that defeats any trust boundary
 # built on top of it, since Jill holds the private-side credentials.
 #
-# Nothing functional needed the publish: discord-bridge reaches serve over the
-# compose network at http://opencode-serve:4747, and the healthcheck runs
+# Nothing functional needed the publish: the bridge reaches serve over the
+# compose network (through api-proxy), and the healthcheck runs
 # inside the container against 127.0.0.1:4747. Only ad-hoc host smoke tests
 # used it, and those can use `docker compose exec opencode-serve` instead.
 #
@@ -51,13 +52,14 @@
 #             listens for halt/resume from Sean, posts alerts and watches
 #             credential expiry. It is not on jill-internal and listens on
 #             no port. It shares only volumes, none of which serve mounts:
-#             control-state (it writes; venice-proxy and dispatcher read),
+#             control-state (it and matrix-bridge write; venice-proxy
+#             and dispatcher read),
 #             alert-spool (dispatcher writes, it posts), cred-<gateway>
 #             (each gateway writes its own probe result, it reads) and
 #             venice-meter (venice-proxy writes, it reads). venice-proxy
 #             refuses every model call while halted. docs/control.md.
 #
-#   Discord -> bridge -> api-proxy -> opencode-serve -> venice-proxy -> Venice
+#   Matrix (E2EE) -> matrix-bridge -> api-proxy -> opencode-serve -> venice-proxy -> Venice
 #                                                    -> agentmail-proxy -> AgentMail
 #                                                    -> siyuan-proxy -> SiYuan
 #                                                    -> brave-proxy -> brave-mcp -> Brave
@@ -68,9 +70,16 @@
 # container gets only what it needs. The API password is a random string
 # generated at install (see .env.example).
 #
-# BRIDGE_DRY_RUN defaults to 1 (bridge validates config + resolves serve,
-# never opens a Discord gateway session - the host bridge holds the single
-# Jill token). docker/cutover.sh flips it to 0 in .env at cutover time.
+# CHAT (#50): matrix-bridge holds Jill's Matrix device keys, cross-signing
+# state, access token and the pin of Sean's master key, all in the
+# matrix-bridge-state volume, mounted into no other service (bar its
+# one-off setup command). The homeserver
+# is administered by someone else (Jax), so the bridge trusts it for
+# nothing: it acts only on messages that decrypt, come from Sean, and come
+# from a device cross-signed by the master key pinned at setup, and it
+# encrypts only to those devices. No server-side key backup. Setup is
+# interactive and once: `docker compose run --rm matrix-bridge-setup`
+# (bridge/WIRING.md).
 
 services:
   # --- network namespace owner and firewall for opencode-serve ---------------
@@ -318,31 +327,60 @@ services:
     <<: *gateway
 
   # --- trusted callers: hold the API password and write approvals ----------
-  discord-bridge:
+  matrix-bridge:
     build: .
     image: behalfbot-open:latest
-    container_name: behalfbot-discord-bridge
-    command: ["python3", "bridge/discord_bridge.py"]
+    container_name: behalfbot-matrix-bridge
+    command: ["/opt/jill/bin/matrix-bridge", "run"]
     working_dir: /app
-    environment:
-      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:?set DISCORD_BOT_TOKEN in .env}
-      JAX_OPEN_CHANNEL_ID: ${JAX_OPEN_CHANNEL_ID:?set JAX_OPEN_CHANNEL_ID in .env}
-      PRINCIPAL_USER_ID: ${PRINCIPAL_USER_ID:?set PRINCIPAL_USER_ID in .env}
+    # Round 6 M4. The bridge runs as root with every capability dropped but
+    # SETUID/SETGID, which it needs for one thing: starting the Python worker
+    # as node (1000). The kernel switches the child's uid before exec; with
+    # no capabilities left, the worker cannot switch back. Bridge state is
+    # root 0700, so the worker cannot read the token, pickle key or crypto
+    # store. `matrix-bridge isolation-check` proves it (CI runs it).
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID]
+    mem_limit: 512m
+    pids_limit: 128
+    environment: &matrix-bridge-env
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-http://host.docker.internal:8008}
+      MATRIX_PRINCIPAL: ${MATRIX_PRINCIPAL:?set MATRIX_PRINCIPAL in .env (bridge/WIRING.md)}
+      MATRIX_JILL_ROOM: ${MATRIX_JILL_ROOM:?set MATRIX_JILL_ROOM in .env (bridge/WIRING.md)}
+      MATRIX_JILL_USER: ${MATRIX_JILL_USER:-}
+      MATRIX_BRIDGE_STATE: /state/matrix-bridge
+      BRIDGE_READY_FILE: /tmp/bridge-ready
+      # Python worker (bridge/matrix_worker.py), a child of the Go binary,
+      # run as this uid/gid and kept out of /state/matrix-bridge
+      BRIDGE_WORKER_UID: "1000"
+      BRIDGE_WORKER_GID: "1000"
+      WORKER_STATE_DIR: /state/matrix-worker
+      # The chat step (PDF parsing, model replies) runs as a third uid that
+      # cannot write approvals, the halt or meter flags, or the alert spool,
+      # nor read the worker's codes (round 6b N6).
+      BRIDGE_CHAT_UID: "1001"
+      BRIDGE_CHAT_GID: "1001"
+      BRIDGE_SESSIONS_FILE: /state/matrix-chat/sessions.json
       DEFAULT_MODEL: ${DEFAULT_MODEL:-venice/zai-org-glm-5-2}
       OPENCODE_SERVER_URL: http://api-proxy:4748
       OPENCODE_SERVER_PASSWORD: ${OPENCODE_SERVER_PASSWORD:?set OPENCODE_SERVER_PASSWORD in .env}
-      BRIDGE_SESSIONS_FILE: /state/bridge/sessions.json
-      BRIDGE_DRY_RUN: ${BRIDGE_DRY_RUN:-1}
-      # Sean's approvals land here (the Matrix wiring is package D). Until
-      # then: docker compose exec discord-bridge python3 /app/gateway/approvals.py ...
+      # halt / resume / reset meter from the encrypted room write here
+      CONTROL_DIR: /state/control
+      # identity-change and room-change alerts; jill-control posts them
+      ALERT_SPOOL_DIR: /state/alerts
+      # Sean's approvals land here; `show draft` reads the snapshot that
+      # agentmail-proxy will send, read-only, with no network path to it
       APPROVALS_DIR: /state/approvals
+      SNAPSHOT_DIR: /state/agentmail-gw/drafts
       CONSUMED_DIRS: /state/agentmail-gw/consumed:/state/fetch-gw/consumed
     volumes:
-      - bridge-state:/state/bridge
+      - matrix-bridge-state:/state/matrix-bridge
+      - matrix-worker-state:/state/matrix-worker
+      - matrix-chat-state:/state/matrix-chat
+      - control-state:/state/control
+      - alert-spool:/state/alerts
       - approvals:/state/approvals
-      # read-only: `approvals.py list` shows used approvals, and
-      # `approvals.py digest <id>` shows Sean exactly what a send delivers,
-      # with no network path to the gateways
       - agentmail-state:/state/agentmail-gw:ro
       - fetch-state:/state/fetch-gw:ro
     depends_on:
@@ -350,8 +388,44 @@ services:
         condition: service_healthy
     networks: [jill-control, jill-callers]
     read_only: true
-    cap_drop: [ALL]
+    tmpfs: [/tmp]
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      # Written after the first successful sync with the crypto store loaded.
+      test: ["CMD", "test", "-f", "/tmp/bridge-ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+
+  # Interactive, once (and again only to re-pin Sean's identity):
+  #   docker compose run --rm matrix-bridge-setup
+  # Prompts for Jill's password and prints her recovery key to the terminal
+  # only. Logging is off for this service so the recovery key never reaches
+  # a Docker log.
+  matrix-bridge-setup:
+    image: behalfbot-open:latest
+    container_name: behalfbot-matrix-bridge-setup
+    profiles: [setup]
+    command: ["/opt/jill/bin/matrix-bridge", "setup"]
+    environment:
+      <<: *matrix-bridge-env
+      MATRIX_JILL_USER: ${MATRIX_JILL_USER:?set MATRIX_JILL_USER in .env (bridge/WIRING.md)}
+    volumes:
+      - matrix-bridge-state:/state/matrix-bridge
+    networks: [jill-callers]
+    stdin_open: true
+    tty: true
+    logging:
+      driver: none
+    read_only: true
+    tmpfs: [/tmp]
+    user: "0:0"
+    cap_drop: [ALL]
+    mem_limit: 512m
+    pids_limit: 128
     security_opt:
       - no-new-privileges:true
 
@@ -386,9 +460,6 @@ services:
       HEARTBEAT_MODEL_SONNET: ${HEARTBEAT_MODEL_SONNET:-}
       HEARTBEAT_MODEL_HAIKU: ${HEARTBEAT_MODEL_HAIKU:-}
       OLLAMA_URL: ${OLLAMA_URL:-}
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
-      DISCORD_OPS_WEBHOOK_URL: ${DISCORD_OPS_WEBHOOK_URL:-}
-      INSTANCE_NAME: ${INSTANCE_NAME:-}
       # Control (#49, docs/control.md). The flags are read-only here.
       CONTROL_DIR: /state/control
       CONTROL_REQUIRE_ARMED: "1"
@@ -433,8 +504,9 @@ networks:
   # Ordinary outbound network for the gateways.
   jill-egress:
     driver: bridge
-  # Outbound for the bridge (Discord), dispatcher (webhooks) and jill-control
-  # (Matrix), kept apart from the gateways, which parse model-controlled input.
+  # Outbound for matrix-bridge and jill-control (Matrix) and the dispatcher,
+  # kept apart from the gateways, which parse model-controlled
+  # input.
   jill-callers:
     driver: bridge
   # brave-proxy <-> brave-mcp only; opencode-serve is not on it.
@@ -445,13 +517,17 @@ volumes:
   workspace:        # Jill's working files
   opencode-data:    # opencode serve data dir: sessions, history
   serve-data:       # memory MCP jsonl
-  bridge-state:     # bridge channel -> session map
+  matrix-bridge-state: # Jill's Matrix device keys, cross-signing state, access token, the pin
+                       # of Sean's master key, handled event ids, opencode session map.
+                       # Mounted ONLY into matrix-bridge and matrix-bridge-setup. root 0700.
+  matrix-worker-state: # the worker's one-time codes (node 0700)
+  matrix-chat-state:   # the chat step's opencode session map (uid 1001)
   dispatcher-state: # heartbeat state, logs, telemetry, briefings
-  approvals:        # Sean's one-shot approvals (bridge/dispatcher write, gateways read)
+  approvals:        # Sean's one-shot approvals (matrix-bridge/dispatcher write, gateways read)
   agentmail-state:  # draft snapshots (what a send delivers), consumed approvals
   fetch-state:      # consumed URL approvals, URL requests
-  control-state:    # halt.json, conservation-mode.json, armed.json, cursors (jill-control writes)
-  alert-spool:      # content-free alerts from the dispatcher, drained by jill-control
+  control-state:    # halt.json, conservation-mode.json, armed.json, cursors (jill-control and matrix-bridge write)
+  alert-spool:      # content-free alerts from the dispatcher and matrix-bridge, drained by jill-control
   cred-venice:      # status-only credential probe result, venice-proxy writes
   cred-agentmail:   # ... agentmail-proxy writes
   cred-siyuan:      # ... siyuan-proxy writes

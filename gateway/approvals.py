@@ -11,16 +11,16 @@ Two kinds, same store:
 
 Who can do what (docker-compose.yml):
 
-  approvals dir   written ONLY by the bridge and the dispatcher (where Sean's
-                  "approve draft <id>" / "approve url <url>" from Matrix will
-                  land, package D) and by this CLI run inside them; mounted
+  approvals dir   written ONLY by matrix-bridge (Sean's "approve draft <id>
+                  <sha256>" from the encrypted chat room, #50), the
+                  dispatcher, and this CLI run inside them; mounted
                   read-only into agentmail-proxy and fetch-gateway; not
                   mounted into opencode-serve at all
   consumed dir    each gateway's own state volume; a consumption marker is
                   created with O_EXCL BEFORE the request goes upstream, so one
                   approval is one use, and a crash fails closed
 
-CLI (testing, and the manual path until the Matrix bridge lands):
+CLI (testing, and a manual fallback to the Matrix bridge):
 
   approvals.py approve-draft <draft_id> --sha256 <digest> [--ttl 900]
   CONSUMED_DIRS=/state/agentmail-consumed:/state/fetch-consumed approvals.py list
